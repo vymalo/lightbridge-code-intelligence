@@ -1,0 +1,19 @@
+# Cargo workspace for the Lightbridge Rust services and automation.
+# The control plane is the standalone, portable backend (HTTP control + auth surface);
+# `xtask` is the build/CI automation entrypoint invoked from the justfile.
+[workspace]
+resolver = "2"
+members = ["services/control-plane", "xtask"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/vymalo/lightbridge-code-intelligence"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

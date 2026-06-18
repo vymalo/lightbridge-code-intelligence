@@ -1,0 +1,41 @@
+# Local development dependencies for Lightbridge.
+# Brought up with `just up` (docker compose up -d). Not for production — see docs/kubernetes-deployment.md.
+name: lightbridge
+
+services:
+  postgres:
+    # Postgres + pgvector in one image (semantic chunk store and control-plane metadata).
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: lightbridge
+      POSTGRES_PASSWORD: lightbridge
+      POSTGRES_DB: lightbridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lightbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    # Structural code graph.
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/lightbridge
+    ports:
+      - "7474:7474" # HTTP browser
+      - "7687:7687" # Bolt
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  neo4jdata:
