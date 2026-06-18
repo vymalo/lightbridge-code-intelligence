@@ -1,0 +1,8 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "services/*"
+
+# sharp is Next.js's optional image-optimization native dep; not needed for this skeleton.
+allowBuilds:
+  sharp: false

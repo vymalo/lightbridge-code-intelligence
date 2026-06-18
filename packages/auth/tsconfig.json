@@ -1,0 +1,10 @@
+{
+  "extends": "@lightbridge/tsconfig/base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": ["node"],
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

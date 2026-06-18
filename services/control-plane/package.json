@@ -1,0 +1,12 @@
+{
+  "name": "@lightbridge/control-plane",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Thin wrapper so Turborepo can orchestrate the Rust control plane alongside JS packages.",
+  "scripts": {
+    "build": "cargo build -p control-plane",
+    "lint": "cargo clippy -p control-plane --all-targets -- -D warnings",
+    "test": "cargo nextest run -p control-plane || cargo test -p control-plane",
+    "dev": "cargo run -p control-plane"
+  }
+}

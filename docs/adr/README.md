@@ -1,0 +1,35 @@
+# Architecture Decision Records
+
+This directory records the significant architectural decisions for Lightbridge Code Intelligence,
+using the [MADR](https://adr.github.io/madr/) format.
+
+## Process
+
+- An ADR captures **one** decision: its context, the chosen option, and the consequences.
+- ADRs are **immutable once accepted**. We do **not** edit the substance of an accepted ADR.
+  If a decision changes, write a **new** ADR that **supersedes** the old one, and update the
+  superseded ADR's status to `Superseded by ADR-NNNN`.
+- Status values: `Proposed`, `Accepted`, `Rejected`, `Deprecated`, `Superseded by ADR-NNNN`.
+- New ADRs start from [the template](0000-adr-template.md) and are numbered sequentially with a
+  kebab-case title, e.g. `0014-some-decision.md`.
+- Substantial proposals are often socialized first as an [RFC](../rfc/README.md); an accepted RFC
+  typically yields one or more ADRs.
+
+## Index
+
+| # | Title | Status |
+|---|---|---|
+| [0000](0000-adr-template.md) | ADR template | — |
+| [0001](0001-use-github-app.md) | Use a GitHub App (not a PAT-backed bot) | Accepted |
+| [0002](0002-rust-control-plane-trust-boundary.md) | The Rust control plane owns the trust boundary | Accepted |
+| [0003](0003-dual-retrieval-neo4j-pgvector.md) | Dual retrieval: Neo4j + pgvector are complementary | Accepted |
+| [0004](0004-one-k8s-job-per-task.md) | One Kubernetes Job per task for execution isolation | Accepted |
+| [0005](0005-cratestack-schema-first-control-plane.md) | Adopt cratestack (schema-first Rust) for the control plane | Accepted |
+| [0006](0006-nextjs-app-router-web-ui.md) | Next.js (App Router) for the web UI | Accepted |
+| [0007](0007-better-auth-rust-backend-plugin.md) | better-auth for web auth via a rust-backend plugin | Accepted |
+| [0008](0008-adopt-ai-governance-framework.md) | Adopt the ADORSYS-GIS AI Governance framework | Accepted |
+| [0009](0009-pnpm-turborepo-monorepo.md) | pnpm + Turborepo monorepo layout | Accepted |
+| [0010](0010-graphify-treesitter-indexing-baseline.md) | Graphify + tree-sitter as the indexing baseline | Accepted |
+| [0011](0011-engineering-practices-xp-lean-devops.md) | Engineering practices: XP + Lean + DevOps + shift-left | Accepted |
+| [0012](0012-rfc-process-alongside-adrs.md) | RFC process alongside ADRs | Accepted |
+| [0013](0013-local-dev-and-build-tooling.md) | Local dev & build tooling (just, xtask, compose, nextest, wiremock) | Accepted |

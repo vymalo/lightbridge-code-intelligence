@@ -1,0 +1,23 @@
+{
+  "name": "@lightbridge/auth",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client-plugin.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "echo \"@lightbridge/auth: no tests yet\""
+  },
+  "dependencies": {
+    "better-auth": "^1.6.19"
+  },
+  "devDependencies": {
+    "@lightbridge/tsconfig": "workspace:*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
