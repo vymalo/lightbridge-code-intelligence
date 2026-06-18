@@ -1,0 +1,13 @@
+# Keep the Docker build context small and reproducible. Manifests + sources are copied
+# explicitly by the Dockerfiles; build artifacts and deps are rebuilt inside the image.
+**/node_modules
+target
+**/.next
+**/.turbo
+.git
+.github
+.claude
+docs
+**/*.md
+**/.env*
+!**/.env.example
