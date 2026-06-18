@@ -32,8 +32,11 @@ jobs:
     # No-op in repos that haven't set the audience var yet (so the synced file
     # never red-fails an unprepared repo); set OPENCODE_GATEWAY_AUDIENCE to enable.
     if: ${{ vars.OPENCODE_GATEWAY_AUDIENCE != '' }}
-    # ADORSYS-GIS/ai-governance — pin to a release SHA in real repos.
-    uses: ADORSYS-GIS/ai-governance/.github/workflows/opencode-review.yml@main
+    # Pinned to an immutable SHA (not @main): this job runs with id-token: write and repo
+    # write permissions, so a mutable ref would let any future upstream change run in this
+    # repo's PR/issue context. ADORSYS-GIS/ai-governance opencode-review.yml @ 2026-06-17.
+    # Bump this SHA deliberately when adopting a newer reviewer.
+    uses: ADORSYS-GIS/ai-governance/.github/workflows/opencode-review.yml@c2c7501b1d6afe3fb2739a7bd7b9fa9792632dd8
     permissions:
       id-token: write # mint the GHA OIDC token (gateway auth)
       contents: write # checkout + the action's git ops

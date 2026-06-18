@@ -33,20 +33,25 @@ export const rustBackendPlugin = (options: RustBackendOptions) => {
         { method: "POST" },
         async (ctx) => {
           const body = (ctx.body ?? {}) as { email?: string; password?: string };
+          // Strip trailing slashes so we never build `…//auth/verify`.
+          const baseUrl = options.backendUrl.replace(/\/+$/, "");
 
-          const res = await fetch(`${options.backendUrl}/auth/verify`, {
+          const res = await fetch(`${baseUrl}/auth/verify`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ email: body.email, password: body.password }),
           }).catch(() => null);
 
           if (!res) {
-            return ctx.json({ ok: false, reason: "auth backend unavailable" });
+            return ctx.json({ ok: false, reason: "auth backend unavailable" }, { status: 503 });
           }
 
           const data = (await res.json().catch(() => null)) as VerifyResponse | null;
           // TODO(ADR-0007): on data.ok, create a better-auth session and set the cookie.
-          return ctx.json(data ?? { ok: false, reason: "invalid backend response" });
+          // Propagate the backend's status so callers can distinguish failures from successes.
+          return ctx.json(data ?? { ok: false, reason: "invalid backend response" }, {
+            status: res.ok ? 200 : res.status,
+          });
         },
       ),
     },

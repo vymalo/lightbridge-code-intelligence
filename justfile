@@ -2,7 +2,8 @@
 # `just` is the single human-facing entrypoint; heavier Rust automation lives in `cargo xtask`.
 # Quality recipes are meant to be run locally BEFORE pushing (shift-left).
 
-set shell := ["zsh", "-cu"]
+# Recipes use just's default `sh` shell so the entrypoint works on minimal environments
+# (no zsh required). Keep recipe bodies POSIX-compatible.
 
 # List available recipes.
 default:
@@ -41,10 +42,10 @@ lint:
     pnpm lint
     cargo clippy --all-targets -- -D warnings
 
-# Run all tests (JS via Turborepo, Rust via cargo-nextest).
+# Run all tests (JS via Turborepo, Rust via cargo-nextest, falling back to cargo test).
 test:
     pnpm test
-    cargo nextest run
+    @if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run; else cargo test; fi
 
 # The full local CI gate (delegates the Rust side to cargo xtask).
 ci:

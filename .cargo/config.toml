@@ -1,0 +1,4 @@
+# Enables `cargo xtask ...` (the cargo-xtask pattern) without a separate installed subcommand.
+# `just ci` relies on this alias.
+[alias]
+xtask = "run --package xtask --"

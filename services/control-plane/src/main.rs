@@ -10,10 +10,12 @@ mod types;
 mod webhook;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use tracing_subscriber::EnvFilter;
 
@@ -39,15 +41,27 @@ impl AppState {
 
 fn app(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(health))
-        .route("/readyz", get(health))
+        .route("/healthz", get(liveness))
+        .route("/readyz", get(readiness))
         .route("/github/webhook", post(webhook::github_webhook))
         .route("/auth/verify", post(auth::verify))
         .with_state(state)
 }
 
-async fn health() -> &'static str {
+async fn liveness() -> &'static str {
     "ok"
+}
+
+/// Readiness fails closed when required configuration is missing, so a misconfigured pod
+/// (e.g. no `GITHUB_WEBHOOK_SECRET`) is not handed traffic it would silently drop.
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    if state.github_webhook_secret.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github webhook secret not configured",
+        );
+    }
+    (StatusCode::OK, "ok")
 }
 
 #[tokio::main]
@@ -60,12 +74,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let state = AppState::from_env();
-    let addr: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()?;
+    // Bind the raw string so hostnames (e.g. `localhost:8080`) resolve via `ToSocketAddrs`,
+    // not only literal IP addresses.
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "control-plane listening");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!(addr = %addr, "control-plane listening");
     axum::serve(listener, app(state)).await?;
     Ok(())
 }
