@@ -20,9 +20,12 @@ Small, obvious, or easily reversible decisions can skip the RFC and go straight 
 
 ## Lifecycle
 
-```
-Draft ──▶ Proposed ──▶ Accepted ──▶ (yields one or more ADRs)
-                   └─▶ Rejected
+```mermaid
+flowchart LR
+    Draft --> Proposed
+    Proposed --> Accepted
+    Proposed --> Rejected
+    Accepted --> ADRs["Yields one or more ADRs"]
 ```
 
 - **Draft** — author is still writing; not yet ready for wide review.

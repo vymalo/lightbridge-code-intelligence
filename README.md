@@ -12,25 +12,19 @@ writes back.
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
-│   GitHub App    │────▶│   Rust Control Plane  │────▶│   Kubernetes     │
-│   (Webhooks)    │◀────│   (Trust Boundary)   │◀────│   (Isolated Jobs)│
-└─────────────────┘     └──────────────────────┘     └──────────────────┘
-         ▲                          │
-         │              ┌───────────┼───────────┐
-   ┌───────────┐        ▼           ▼           ▼
-   │ Next.js   │  ┌──────────┐ ┌──────────┐ ┌──────────┐
-   │ web + auth│  │ Graphify │ │  Neo4j   │ │ pgvector │
-   └───────────┘  │ (Parser) │ │ (Graph)  │ │(Vectors) │
-                  └──────────┘ └──────────┘ └──────────┘
-                        │                        │
-                        └──────────┬─────────────┘
-                                   ▼
-                        ┌──────────────────┐
-                        │  OpenCode Agent   │
-                        │(ACP/MCP Reasoning)│
-                        └──────────────────┘
+```mermaid
+flowchart TD
+    WEB["Next.js web + auth<br/>(better-auth)"] -->|authN via /auth/verify| CP
+    GH["GitHub App<br/>(webhooks)"] -->|webhook| CP["Rust Control Plane<br/>(trust boundary)"]
+    CP -->|validated write-back| GH
+    CP -->|create Job| K8S["Kubernetes<br/>(isolated Jobs)"]
+    CP --> GRAPHIFY["Graphify<br/>(parser / indexer)"]
+    GRAPHIFY --> NEO["Neo4j<br/>(graph / structure)"]
+    GRAPHIFY --> VEC["pgvector<br/>(semantics)"]
+    K8S --> AGENT["OpenCode Agent<br/>(ACP / MCP reasoning)"]
+    NEO -->|MCP retrieval| AGENT
+    VEC -->|MCP retrieval| AGENT
+    AGENT -->|structured result| CP
 ```
 
 See [docs/architecture.md](docs/architecture.md) for diagrams and the full picture, including the
