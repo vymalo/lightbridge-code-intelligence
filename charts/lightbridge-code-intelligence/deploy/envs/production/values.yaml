@@ -12,5 +12,5 @@ lci:
       containers:
         main:
           image:
-            tag: sha-ee61347
+            tag: sha-5c3fbfd
             repository: ghcr.io/vymalo/lightbridge-web
