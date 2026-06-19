@@ -38,15 +38,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    async fn from_env() -> Self {
-        Self {
+    async fn from_env() -> anyhow::Result<Self> {
+        let db = db::connect_from_env().await?;
+        Ok(Self {
             github_webhook_secret: Arc::new(
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
             ),
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
             jwt: jwt::from_env(),
-            db: db::connect_from_env().await,
-        }
+            db,
+        })
     }
 }
 
@@ -106,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let state = AppState::from_env().await;
+    let state = AppState::from_env().await?;
     // Bind the raw string so hostnames (e.g. `localhost:8080`) resolve via `ToSocketAddrs`,
     // not only literal IP addresses.
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

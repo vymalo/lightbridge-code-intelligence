@@ -32,11 +32,20 @@ pub async fn github_webhook(
     }
     let event = header(&headers, "x-github-event");
 
+    // Parse the payload up front: reject non-JSON bodies (never persist `null`), and have the
+    // parsed value ready for the upcoming task-routing logic.
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "webhook payload is not valid JSON");
+            return (StatusCode::BAD_REQUEST, "invalid json payload");
+        }
+    };
+
     // Dedup (and persist, when a database is configured). `is_new` is false for a replayed
     // delivery id — GitHub retries, so this is the exactly-once guard.
     let is_new = match &state.db {
         Some(pool) => {
-            let payload = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
             match crate::db::record_delivery(pool, &delivery_id, &event, &payload).await {
                 Ok(is_new) => is_new,
                 Err(error) => {
