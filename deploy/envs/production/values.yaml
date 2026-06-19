@@ -16,10 +16,10 @@ lci:
         main:
           image:
             repository: ghcr.io/vymalo/lightbridge-control-plane
-            tag: "sha-3cbaef9"
+            tag: "sha-187a018"
     web:
       containers:
         main:
           image:
             repository: ghcr.io/vymalo/lightbridge-web
-            tag: "sha-3cbaef9"
+            tag: "sha-187a018"
