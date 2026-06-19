@@ -7,14 +7,15 @@
 //! trust boundary — it mints the token and (in a later slice) validates findings and writes to
 //! GitHub (ADR-0002, docs/opencode-acp-mcp.md).
 //!
-//! Slice 1 wired the lifecycle end-to-end with a stubbed work step (clone + report). Slice 2 adds
-//! the pgvector indexer: tree-sitter chunking + OpenAI-compatible embeddings → control-plane API.
+//! The lifecycle: clone → semantic index (tree-sitter → pgvector, slice 2) → structural index
+//! (Graphify → Neo4j, slice 3) → review (OpenCode over the MCP tools, slice 5) → report. Indexing is
+//! required; the structural graph and the review are best-effort and non-fatal.
 
 use agent_runner::client::ControlPlaneClient;
 use agent_runner::clone;
-use agent_runner::config::{EmbeddingsConfig, RunnerConfig};
+use agent_runner::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
 use agent_runner::embeddings::EmbeddingsClient;
-use agent_runner::indexer;
+use agent_runner::{indexer, review};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -54,7 +55,18 @@ async fn main() -> std::process::ExitCode {
         &embeddings_config.model,
     );
 
-    match run(&config, &client, &embedder).await {
+    // Review is optional (no `LLM_MODEL` → indexing-only). But if it's half-configured, surface it.
+    let review_config = match ReviewConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            let detail = error.to_string();
+            tracing::error!(%detail, "invalid review (LLM) configuration");
+            report(&client, &config, "failed", Some(&detail)).await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    match run(&config, &client, &embedder, review_config.as_ref()).await {
         Ok(summary) => {
             tracing::info!(task_id = %config.task_id, summary, "task succeeded");
             report(&client, &config, "succeeded", None).await;
@@ -74,6 +86,7 @@ async fn run(
     config: &RunnerConfig,
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
+    review_config: Option<&ReviewConfig>,
 ) -> anyhow::Result<String> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
     // re-affirms it from the pod and is a no-op if already set).
@@ -104,8 +117,29 @@ async fn run(
         }
     };
 
+    // ── Review: OpenCode over the MCP tools (epic #5, slice 5, ADR-0021) ─────────────────────
+    // Runs only when the LLM is configured. The findings are logged + counted here; validation and
+    // GitHub write-back are slice 6, so a review failure is non-fatal (indexing already landed).
+    let review_summary = match review_config {
+        Some(review) => match review::run_review(&checkout, review, &context.command).await {
+            Ok(result) => {
+                tracing::info!(
+                    findings = result.findings.len(),
+                    summary = result.summary,
+                    "review complete"
+                );
+                format!("{} findings", result.findings.len())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "review failed (non-fatal)");
+                "review failed".to_string()
+            }
+        },
+        None => "review disabled".to_string(),
+    };
+
     Ok(format!(
-        "indexed {}/{} at {} — {chunk_count} chunks, {graph_summary}",
+        "indexed {}/{} at {} — {chunk_count} chunks, {graph_summary}; {review_summary}",
         context.owner,
         context.name,
         context

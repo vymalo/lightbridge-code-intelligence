@@ -52,6 +52,38 @@ impl EmbeddingsConfig {
     }
 }
 
+/// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
+/// gateway in prod; ADR-0021). Like embeddings, **no default model** so a misconfigured Job fails
+/// loudly. Optional as a whole: absent `LLM_MODEL`, the runner skips the review step (indexing-only).
+#[derive(Debug, Clone)]
+pub struct ReviewConfig {
+    /// Base URL of the OpenAI-compatible chat endpoint (the `provider.options.baseURL` opencode uses).
+    pub base_url: String,
+    /// API key for the gateway.
+    pub api_key: String,
+    /// Chat model id, referenced by opencode as `eaig/<model>`.
+    pub model: String,
+}
+
+impl ReviewConfig {
+    /// Returns `None` when `LLM_MODEL` is unset (review disabled), `Err` when it's set but the
+    /// base URL / key are missing (a misconfiguration we want to surface, not silently skip).
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        if std::env::var("LLM_MODEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            base_url: require("LLM_BASE_URL")?,
+            api_key: require("LLM_API_KEY")?,
+            model: require("LLM_MODEL")?,
+        }))
+    }
+}
+
 fn require(name: &str) -> anyhow::Result<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),

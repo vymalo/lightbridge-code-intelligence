@@ -6,3 +6,4 @@ pub mod clone;
 pub mod config;
 pub mod embeddings;
 pub mod indexer;
+pub mod review;
