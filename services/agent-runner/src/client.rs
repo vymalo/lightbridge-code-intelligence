@@ -83,7 +83,7 @@ pub struct GraphBatch {
 }
 
 /// A semantic-search hit (mirrors `db::CodeChunkHit`). Returned by `search`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChunkHit {
     pub file_path: String,
     pub language: String,
@@ -96,7 +96,7 @@ pub struct ChunkHit {
 }
 
 /// A structural-graph symbol (mirrors `neo4j::SymbolHit`). Returned by the graph queries.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SymbolHit {
     pub node_id: String,
     pub label: String,
