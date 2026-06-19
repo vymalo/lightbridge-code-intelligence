@@ -10,8 +10,9 @@
   },
   "dependencies": {
     "@lightbridge/auth": "workspace:*",
-    "better-auth": "^1.6.19",
+    "jose": "^5.9.6",
     "next": "^15.0.0",
+    "openid-client": "^6.1.7",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

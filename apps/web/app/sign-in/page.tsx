@@ -1,47 +1,15 @@
-"use client";
-
-import { type FormEvent, useState } from "react";
-
+/** Authentication is delegated to Keycloak (OIDC). This page just kicks off the redirect flow. */
 export default function SignInPage() {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [result, setResult] = useState("");
-
-  async function onSubmit(event: FormEvent) {
-    event.preventDefault();
-    setResult("…");
-    const res = await fetch("/api/auth/rust-backend/sign-in", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    const data = await res.json().catch(() => ({}));
-    setResult(`${res.status}: ${JSON.stringify(data)}`);
-  }
-
   return (
     <main>
       <h1>Sign in</h1>
       <p>
-        Credentials are verified by the standalone Rust backend (authN). Sessions are not yet wired
-        — see ADR-0007.
+        Authentication is handled by Keycloak (OIDC). You'll be redirected to sign in, then returned
+        here — the app manages no credentials of its own (see ADR-0014).
       </p>
-      <form className="row" onSubmit={onSubmit}>
-        <input
-          type="email"
-          placeholder="email"
-          value={email}
-          onChange={(event) => setEmail(event.target.value)}
-        />
-        <input
-          type="password"
-          placeholder="password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-        />
-        <button type="submit">Sign in</button>
-      </form>
-      {result ? <pre className="card">{result}</pre> : null}
+      <p>
+        <a href="/api/auth/login">Continue with Keycloak →</a>
+      </p>
     </main>
   );
 }
