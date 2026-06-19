@@ -4,9 +4,12 @@
 //! pool is optional: absent `DATABASE_URL` the control plane runs in a degraded, in-memory mode
 //! (dev) and readiness reports it.
 
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Connect to `DATABASE_URL` and run migrations. Returns `Ok(None)` when the URL is unset (dev).
 /// **Fails fast** (`Err`) when the URL is set but the database is unreachable or migrations fail —
@@ -57,4 +60,100 @@ pub async fn record_delivery(
 /// Liveness of the connection pool (used by readiness).
 pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT 1").execute(pool).await.map(|_| ())
+}
+
+/// A task row as stored — one task run for the dashboard (ADR-0016). Serialized directly to the
+/// `/tasks` API (timestamps as RFC 3339).
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct TaskRow {
+    pub id: Uuid,
+    pub repository_id: i64,
+    pub installation_id: i64,
+    pub github_delivery_id: String,
+    pub target_type: String,
+    pub target_id: i64,
+    pub command_text: String,
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+    pub status: String,
+    pub priority: i32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+}
+
+/// Fields needed to create a task from a webhook event (status starts at `received`).
+pub struct NewTask {
+    pub repository_id: i64,
+    pub installation_id: i64,
+    pub github_delivery_id: String,
+    pub target_type: String,
+    pub target_id: i64,
+    pub command_text: String,
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+}
+
+/// Insert or update a repository by its GitHub id; returns the local `repositories.id`.
+pub async fn upsert_repository(
+    pool: &PgPool,
+    github_repo_id: i64,
+    owner: &str,
+    name: &str,
+    default_branch: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO repositories (github_repo_id, owner, name, default_branch) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (github_repo_id) DO UPDATE \
+           SET owner = EXCLUDED.owner, name = EXCLUDED.name, default_branch = EXCLUDED.default_branch \
+         RETURNING id",
+    )
+    .bind(github_repo_id)
+    .bind(owner)
+    .bind(name)
+    .bind(default_branch)
+    .fetch_one(pool)
+    .await
+}
+
+/// Create a task; returns its generated id.
+pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
+         target_id, command_text, base_sha, head_sha, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'received')",
+    )
+    .bind(id)
+    .bind(task.repository_id)
+    .bind(task.installation_id)
+    .bind(&task.github_delivery_id)
+    .bind(&task.target_type)
+    .bind(task.target_id)
+    .bind(&task.command_text)
+    .bind(&task.base_sha)
+    .bind(&task.head_sha)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Most recent tasks first (the dashboard run list).
+pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
+    sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks ORDER BY created_at DESC LIMIT $1")
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// A single task by id.
+pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
+    sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }

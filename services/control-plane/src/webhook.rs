@@ -66,8 +66,73 @@ pub async fn github_webhook(
 
     tracing::info!(delivery_id, event, "accepted webhook");
 
-    // TODO: route the persisted delivery to task creation (docs/github-app-and-control-plane.md).
+    // Route actionable events to a task. For now: a pull_request opened/synchronize/reopened
+    // becomes a review task. Other events are persisted only. (issue_comment commands: follow-up.)
+    if let Some(pool) = &state.db {
+        if event == "pull_request" {
+            create_pr_task(pool, &payload, &delivery_id).await;
+        }
+    }
+
     (StatusCode::ACCEPTED, "accepted")
+}
+
+/// Create a review task from a `pull_request` webhook (best-effort; logs and skips on malformed
+/// payloads — the delivery is already persisted, so nothing is lost).
+async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delivery_id: &str) {
+    let action = payload["action"].as_str().unwrap_or_default();
+    if !matches!(action, "opened" | "synchronize" | "reopened") {
+        return;
+    }
+    let repo = &payload["repository"];
+    let (
+        Some(github_repo_id),
+        Some(owner),
+        Some(name),
+        Some(default_branch),
+        Some(installation_id),
+    ) = (
+        repo["id"].as_i64(),
+        repo["owner"]["login"].as_str(),
+        repo["name"].as_str(),
+        repo["default_branch"].as_str(),
+        payload["installation"]["id"].as_i64(),
+    )
+    else {
+        tracing::warn!(
+            delivery_id,
+            "pull_request payload missing fields; skipping task"
+        );
+        return;
+    };
+
+    let repository_id =
+        match crate::db::upsert_repository(pool, github_repo_id, owner, name, default_branch).await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(%error, delivery_id, "failed to upsert repository");
+                return;
+            }
+        };
+
+    let pr = &payload["pull_request"];
+    let task = crate::db::NewTask {
+        repository_id,
+        installation_id,
+        github_delivery_id: delivery_id.to_string(),
+        target_type: "pull_request".to_string(),
+        target_id: pr["number"].as_i64().unwrap_or_default(),
+        command_text: "review".to_string(),
+        base_sha: pr["base"]["sha"].as_str().map(str::to_string),
+        head_sha: pr["head"]["sha"].as_str().map(str::to_string),
+    };
+    match crate::db::create_task(pool, &task).await {
+        Ok(task_id) => {
+            tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task")
+        }
+        Err(error) => tracing::error!(%error, delivery_id, "failed to create task"),
+    }
 }
 
 fn header(headers: &HeaderMap, name: &str) -> String {

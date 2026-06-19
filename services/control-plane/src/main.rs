@@ -7,7 +7,9 @@
 //! (cratestack codegen deferred — ADR-0005).
 
 mod db;
+mod github;
 mod jwt;
+mod tasks;
 mod types;
 mod webhook;
 
@@ -35,6 +37,8 @@ pub struct AppState {
     pub jwt: Option<Arc<JwtValidator>>,
     /// Postgres pool. `None` when `DATABASE_URL` is unset (dev) or the connection failed.
     pub db: Option<PgPool>,
+    /// GitHub App auth (App JWT → installation tokens). `None` when the App env is unset.
+    pub github: Option<github::GithubApp>,
 }
 
 impl AppState {
@@ -47,6 +51,7 @@ impl AppState {
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
             jwt: jwt::from_env(),
             db,
+            github: github::GithubApp::from_env(),
         })
     }
 }
@@ -57,6 +62,8 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readiness))
         .route("/github/webhook", post(webhook::github_webhook))
         .route("/me", get(jwt::me))
+        .route("/tasks", get(tasks::list))
+        .route("/tasks/{id}", get(tasks::get))
         .with_state(state)
 }
 
