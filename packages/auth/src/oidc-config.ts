@@ -34,3 +34,17 @@ export function oidcClientConfigFromEnv(): OidcClientConfig {
     scope: process.env.OIDC_SCOPE ?? "openid profile email",
   };
 }
+
+/**
+ * The web app's public origin (e.g. `https://code-intelligence.ai.camer.digital`), derived from
+ * `OIDC_REDIRECT_URI`. Use this for app-relative redirects instead of the request URL: behind an
+ * ingress, `req.url`'s host is the pod's internal bind address (`0.0.0.0:3000`), which would send
+ * users to an unreachable URL and break the OIDC `redirect_uri` match. Edge-safe (env only).
+ */
+export function appBaseUrl(): string {
+  const source = process.env.OIDC_REDIRECT_URI ?? process.env.OIDC_POST_LOGOUT_REDIRECT_URI;
+  if (!source) {
+    throw new Error("OIDC_REDIRECT_URI (or OIDC_POST_LOGOUT_REDIRECT_URI) must be set");
+  }
+  return new URL(source).origin;
+}
