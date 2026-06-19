@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_signature_is_rejected() {
-        let token = mint("test-key-1", ISSUER, AUDIENCE, now() + 3600);
+        let mut token = mint("test-key-1", ISSUER, AUDIENCE, now() + 3600);
         // Flip the FIRST character of the signature segment. Unlike the last
         // base64url char (which encodes only 2 significant bits of the final
         // signature byte and so often round-trips to identical bytes), the
@@ -337,9 +337,8 @@ mod tests {
         // actually changes.
         let sig_start = token.rfind('.').expect("JWT has three segments") + 1;
         let first = token.as_bytes()[sig_start] as char;
-        let replacement = if first == 'A' { 'B' } else { 'A' };
-        let mut token = token;
-        token.replace_range(sig_start..sig_start + 1, &replacement.to_string());
+        let replacement = if first == 'A' { "B" } else { "A" };
+        token.replace_range(sig_start..sig_start + 1, replacement);
         assert!(matches!(
             validator().validate(&token).await,
             Err(AuthError::InvalidToken)
