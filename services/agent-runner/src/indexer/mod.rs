@@ -4,6 +4,7 @@
 //! internal API — the runner has no direct DB access). See docs/indexing-and-storage.md.
 
 pub mod chunker;
+pub mod graph;
 pub mod language;
 
 use std::path::Path;

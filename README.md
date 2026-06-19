@@ -42,7 +42,7 @@ flowchart TD
     subgraph job["Kubernetes Job (ephemeral, per task)"]
         RUNNER["agent-runner<br/>clone · index · reason"]
         TS["tree-sitter chunker"]
-        GFY["Graphify (planned)"]
+        GFY["Graphify"]
     end
 
     VEC[("pgvector<br/>semantic")]
@@ -105,7 +105,7 @@ flowchart LR
 | What it emits | embedding-sized chunks with stable source ranges | nodes (symbols, files) + edges (defines, calls, imports) |
 | Why this tool | purpose-built, lightweight, in-process Rust we control; chunk boundaries are a *chunking* concern | specialised multi-modal graph extractor; relationships are a *graph* concern |
 | Can the other store answer it? | ❌ a graph can't rank by semantic similarity | ❌ vector search can't enumerate exact callers |
-| Status | ✅ built (slice 2) | 🔜 slice 3 |
+| Status | ✅ built (slice 2) | ✅ built (slice 3) |
 
 Both run in the **same runner Job over the same checkout** — one indexes for *fuzzy* retrieval, the
 other for *exact* retrieval. The reasoning agent (slice 5) then queries each store via MCP for the
