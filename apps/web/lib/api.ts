@@ -40,27 +40,26 @@ function classify(status: number): "unauthenticated" | "unavailable" | "error" {
 
 /** `GET /tasks` — the run list (most recent first). */
 export async function listTasks(): Promise<ApiResult<Task[]>> {
-  let res: Response | null;
   try {
-    res = await authedFetch("/tasks");
+    const res = await authedFetch("/tasks");
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    // Inside the try: a non-JSON body / dropped connection makes res.json() throw too.
+    return { ok: true, data: (await res.json()) as Task[] };
   } catch {
     return { ok: false, reason: "unavailable" };
   }
-  if (!res) return { ok: false, reason: "unauthenticated" };
-  if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
-  return { ok: true, data: (await res.json()) as Task[] };
 }
 
 /** `GET /tasks/{id}` — a single run, or `null` data on 404. */
 export async function getTask(id: string): Promise<ApiResult<Task | null>> {
-  let res: Response | null;
   try {
-    res = await authedFetch(`/tasks/${encodeURIComponent(id)}`);
+    const res = await authedFetch(`/tasks/${encodeURIComponent(id)}`);
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (res.status === 404) return { ok: true, data: null };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as Task };
   } catch {
     return { ok: false, reason: "unavailable" };
   }
-  if (!res) return { ok: false, reason: "unauthenticated" };
-  if (res.status === 404) return { ok: true, data: null };
-  if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
-  return { ok: true, data: (await res.json()) as Task };
 }

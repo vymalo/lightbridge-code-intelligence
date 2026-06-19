@@ -84,17 +84,25 @@ const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
   ["second", 1],
 ];
 
+// Reuse one formatter instance — constructing `Intl.*Format` is expensive and these run per row.
+const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat("en", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
 /** "3 minutes ago" from an ISO timestamp, relative to `now` (defaults to current time). */
 export function relativeTime(iso: string, now: number = Date.now()): string {
-  const seconds = Math.round((new Date(iso).getTime() - now) / 1000);
+  const time = new Date(iso).getTime();
+  if (Number.isNaN(time)) return "unknown time";
+  const seconds = Math.round((time - now) / 1000);
   const abs = Math.abs(seconds);
-  const fmt = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
   for (const [unit, secondsInUnit] of RELATIVE_UNITS) {
     if (abs >= secondsInUnit || unit === "second") {
-      return fmt.format(Math.round(seconds / secondsInUnit), unit);
+      return RELATIVE_TIME_FORMATTER.format(Math.round(seconds / secondsInUnit), unit);
     }
   }
-  return fmt.format(0, "second");
+  return RELATIVE_TIME_FORMATTER.format(0, "second");
 }
 
 /** Run duration `started→completed` (or `started→now` if still running), formatted compactly. */
@@ -102,6 +110,7 @@ export function duration(task: Task, now: number = Date.now()): string | null {
   if (!task.started_at) return null;
   const start = new Date(task.started_at).getTime();
   const end = task.completed_at ? new Date(task.completed_at).getTime() : now;
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
   const seconds = Math.max(0, Math.round((end - start) / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
@@ -113,8 +122,7 @@ export function duration(task: Task, now: number = Date.now()): string | null {
 
 /** Absolute timestamp for tooltips / detail rows. */
 export function absoluteTime(iso: string): string {
-  return new Date(iso).toLocaleString("en", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return ABSOLUTE_TIME_FORMATTER.format(date);
 }

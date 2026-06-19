@@ -16,8 +16,12 @@ import {
 
 export const dynamic = "force-dynamic";
 
+// Task ids are UUIDs; reject malformed paths up front so we don't round-trip to the control plane.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export default async function RunDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  if (!UUID_RE.test(id)) notFound();
   const result = await getTask(id);
 
   if (!result.ok) {
