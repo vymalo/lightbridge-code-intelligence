@@ -21,8 +21,9 @@ indexing baseline but didn't pin *how* Graphify is integrated. Two facts forced 
    Python CLI that extracts an AST→graph over **36 languages**, fully **headless with no API key**
    (`graphify extract <dir> --no-cluster`), emitting `graphify-out/graph.json` (nodes with
    `source_file` + start line; edges with `relation` ∈ {`contains`, `method`, `calls`, …}). It has
-   **no embeddings / pgvector** capability, and the current release has **no direct Neo4j push** —
-   it just produces `graph.json`.
+   **no embeddings / pgvector** capability. It *can* push the graph to Neo4j itself
+   (`graphify export neo4j --push bolt://… --user … --password …` / `NEO4J_PASSWORD`), but using that
+   would require the **runner** to hold Neo4j credentials — which we deliberately avoid (see Decision).
 
 ## Decision
 
@@ -40,6 +41,19 @@ spawns it and the control plane owns the Neo4j write.**
   path stays with our tree-sitter chunker. The two indexers map cleanly onto dual retrieval:
   tree-sitter chunker → pgvector (semantic), Graphify → Neo4j (structural).
 
+We **do not** use Graphify's own `export neo4j --push`, even though it exists, for two reasons:
+
+1. **Trust boundary (ADR-0002).** The runner is an untrusted per-task Job (it clones arbitrary
+   repos). Our datastores — Postgres/pgvector *and* Neo4j — are written **only** by the control
+   plane; the Job never holds Postgres or Neo4j credentials. `index_graph` is the graph-side twin of
+   the chunk path (`index_checkout`): the runner produces data, the control plane writes the store.
+   A direct push would put `NEO4J_PASSWORD` in the Job — the exact long-lived-secret-in-an-untrusted-
+   Job anti-pattern we are hardening elsewhere (cf. `AGENT_RUNNER_TOKEN`).
+2. **Graphify stays swappable.** Owning the ingestion and the Neo4j schema (scoped by
+   `(repository_id, commit_sha)`, synthetic nodes filtered) keeps Graphify behind a thin seam —
+   "runner emits graph data → control plane writes Neo4j." Replacing or dropping Graphify later (e.g.
+   for our own extractor) never touches the control-plane write or the graph schema.
+
 ## Consequences
 
 **Good**
@@ -53,8 +67,8 @@ spawns it and the control plane owns the Neo4j write.**
 - The runner image is larger (Python runtime + 36 grammar wheels). Accepted — the goal is broad
   language support in one image.
 - We depend on Graphify's `graph.json` schema; pinned to `0.8.44` and guarded by a parser unit test
-  on a captured sample. A future Graphify that pushes to Neo4j directly could simplify this, but we
-  keep the write in the control plane regardless (trust boundary).
+  on a captured sample. We could shed code by letting Graphify push to Neo4j itself, but we keep the
+  write in the control plane regardless (trust boundary; keeps Graphify swappable — see Decision).
 - Graph edges are AST-approximate (no semantic resolver). Acceptable as the baseline (ADR-0010);
   Graphify's `--mode deep` LLM inference is deliberately **off**.
 
@@ -64,4 +78,6 @@ spawns it and the control plane owns the Neo4j write.**
   and more maintenance.
 - **Have Graphify also feed pgvector** — impossible; it produces no embeddings and its nodes carry
   no end-range/body to embed.
-- **Let the runner write Neo4j directly** — would put Neo4j credentials in the untrusted Job.
+- **Let the runner push to Neo4j directly** (Graphify's `export neo4j --push`) — simpler, but puts
+  Neo4j credentials in the untrusted Job and couples us to Graphify's schema. Rejected on both counts
+  (see Decision).
