@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Lightbridge agent runner: the per-task Kubernetes Job that clones, indexes, and reviews a repo."
+# With the extra MCP-server bins below, `cargo run -p agent-runner` is ambiguous; pin the runner as
+# the default target so the package.json `dev` script (and `turbo`) keep working.
+default-run = "agent-runner"
 
 [[bin]]
 name = "agent-runner"
