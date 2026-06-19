@@ -14,6 +14,7 @@ mod jwt;
 mod k8s;
 mod metrics;
 mod neo4j;
+mod review;
 mod tasks;
 mod types;
 mod webhook;
@@ -174,6 +175,8 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
         )
+        // The structured review → validated GitHub PR review (slice 6).
+        .route("/internal/tasks/{id}/review", post(internal::post_review))
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }

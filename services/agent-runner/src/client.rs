@@ -162,6 +162,27 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /internal/tasks/{id}/review` — submit the structured review; the control plane
+    /// validates it against the PR diff and posts it (slice 6).
+    pub async fn submit_review(
+        &self,
+        task_id: Uuid,
+        review: &crate::review::ReviewResult,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/review", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(review)
+            .send()
+            .await
+            .context("submitting review")?
+            .error_for_status()
+            .context("control plane rejected the review")?;
+        Ok(())
+    }
+
     /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (Graphify → Neo4j).
     pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
         use anyhow::Context;
