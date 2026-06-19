@@ -28,6 +28,9 @@ pub struct KubeLauncher {
     /// Shared bearer the runner presents to that internal API (ADR-0017). Injected into the Job so
     /// the runner can authenticate; empty when unset (the internal API is then disabled anyway).
     runner_token: String,
+    /// Secret (in the agents namespace) holding the internal CA (`ca.crt`) the runner must trust to
+    /// reach the eaig gateway's HTTPS embeddings endpoint. `None` → no CA volume mounted.
+    ca_secret: Option<String>,
 }
 
 impl KubeLauncher {
@@ -45,12 +48,16 @@ impl KubeLauncher {
         let control_plane_url = std::env::var("CONTROL_PLANE_INTERNAL_URL")
             .unwrap_or_else(|_| "http://lightbridge-ci-control-plane:8080".to_string());
         let runner_token = std::env::var("AGENT_RUNNER_TOKEN").unwrap_or_default();
+        let ca_secret = std::env::var("AGENT_CA_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
         Ok(Self {
             jobs: Api::namespaced(client, &namespace),
             image,
             service_account,
             control_plane_url,
             runner_token,
+            ca_secret,
         })
     }
 }
@@ -64,6 +71,7 @@ impl TaskLauncher for KubeLauncher {
             &self.service_account,
             &self.control_plane_url,
             &self.runner_token,
+            self.ca_secret.as_deref(),
             task,
         );
         let job: Job = serde_json::from_value(manifest)?;
@@ -96,6 +104,7 @@ fn job_manifest(
     service_account: &str,
     control_plane_url: &str,
     runner_token: &str,
+    ca_secret: Option<&str>,
     task: &ClaimedTask,
 ) -> Value {
     // Pass the claimed task's context so the runner knows what to act on (target + SHAs) and how to
@@ -137,6 +146,19 @@ fn job_manifest(
         env.push(json!({ "name": "HEAD_SHA", "value": head_sha }));
     }
 
+    // Internal CA: when configured, mount the gateway's CA and point the embeddings client at it so
+    // it can verify the HTTPS eaig endpoint (ADR-0018; the gateway's cert is from a private issuer).
+    let (volumes, volume_mounts) = match ca_secret {
+        Some(secret) => {
+            env.push(json!({ "name": "EMBEDDINGS_CA_CERT", "value": "/etc/internal-ca/ca.crt" }));
+            (
+                json!([{ "name": "internal-ca", "secret": { "secretName": secret } }]),
+                json!([{ "name": "internal-ca", "mountPath": "/etc/internal-ca", "readOnly": true }]),
+            )
+        }
+        None => (json!([]), json!([])),
+    };
+
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -164,10 +186,12 @@ fn job_manifest(
                 "spec": {
                     "serviceAccountName": service_account,
                     "restartPolicy": "Never",
+                    "volumes": volumes,
                     "containers": [{
                         "name": "runner",
                         "image": image,
                         "env": env,
+                        "volumeMounts": volume_mounts,
                     }]
                 }
             }
@@ -211,6 +235,7 @@ mod tests {
             "sa",
             "http://cp:8080",
             "runner-secret",
+            Some("lightbridge-agent-ca"),
             &task,
         );
 
@@ -264,6 +289,27 @@ mod tests {
             secret_key("LLM_MODEL"),
             Some(("llm-model".to_string(), Some(true))),
             "review LLM is optional so the Job starts without it"
+        );
+
+        // The internal CA is mounted and the embeddings client is pointed at it.
+        assert_eq!(
+            value_of("EMBEDDINGS_CA_CERT").as_deref(),
+            Some("/etc/internal-ca/ca.crt")
+        );
+        let mount = container
+            .volume_mounts
+            .as_ref()
+            .and_then(|m| m.iter().find(|m| m.name == "internal-ca"))
+            .expect("internal-ca volumeMount");
+        assert_eq!(mount.mount_path, "/etc/internal-ca");
+        let vol = pod
+            .volumes
+            .as_ref()
+            .and_then(|v| v.iter().find(|v| v.name == "internal-ca"))
+            .expect("internal-ca volume");
+        assert_eq!(
+            vol.secret.as_ref().and_then(|s| s.secret_name.as_deref()),
+            Some("lightbridge-agent-ca")
         );
     }
 }
