@@ -181,7 +181,19 @@ spec:
 | Helm | Packaging, reusable chart values, release workflow | Use for app distribution |
 | Kustomize | Environment overlays and patching | Use for repo-local overlays |
 
-Deployment manifests live under `deploy/` (planned).
+Deployment manifests live under `deploy/` (planned). Replica counts are set in the external
+`ADORSYS-GIS/ai-helm` GitOps chart; `deploy/envs/production/values.yaml` only pins image tags.
+
+## Scaling and replica model
+
+The web app runs multiple replicas; the control plane currently runs one. That is a correctness
+constraint, not a capacity choice — the webhook handler holds delivery dedup in process memory, so a
+second replica would process duplicate deliveries.
+[RFC-0001](rfc/0001-horizontally-scalable-control-plane.md) proposes removing that state (durable
+dedup in Postgres), splitting the binary into stateless roles (`serve` / `dispatcher` /
+`scheduler`), and distributing work through a Postgres-backed queue, so the control plane can scale
+horizontally like the web app. The `dispatcher` still creates one Kubernetes Job per task per
+[ADR-0004](adr/0004-one-k8s-job-per-task.md); it does not run task work itself.
 
 ## Local cluster (TENTATIVE: multipass + k3s)
 

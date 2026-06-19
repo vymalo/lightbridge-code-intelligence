@@ -102,6 +102,11 @@ CREATE INDEX tasks_created_at_idx ON tasks(created_at DESC);
 > server, clients, and policies from that file (codegen wiring deferred), and why hand-written
 > types in `services/control-plane/src/types.rs` mirror it in the meantime.
 
+> [RFC-0001](rfc/0001-horizontally-scalable-control-plane.md) proposes using the `tasks` table as a
+> Postgres-backed work queue (`SELECT … FOR UPDATE SKIP LOCKED`) and adds queue columns
+> (`attempts`, `run_after`, lease fields) plus a task-idempotency unique index — the mechanism that
+> lets the control plane run more than one replica.
+
 ## Rust structs
 
 ```rust
