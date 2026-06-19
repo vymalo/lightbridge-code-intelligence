@@ -120,6 +120,15 @@ fn job_manifest(
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-api-key" } } }),
         json!({ "name": "EMBEDDINGS_MODEL",
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-model" } } }),
+        // Review LLM config (ADR-0021). `optional: true`: absent these keys, the secretKeyRef
+        // resolves to unset (not a pod start failure), so `LLM_MODEL` is unset and the runner skips
+        // the review step (indexing-only). The operator enables review by populating these keys.
+        json!({ "name": "LLM_BASE_URL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-base-url", "optional": true } } }),
+        json!({ "name": "LLM_API_KEY",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-api-key", "optional": true } } }),
+        json!({ "name": "LLM_MODEL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-model", "optional": true } } }),
     ];
     if let Some(base_sha) = &task.base_sha {
         env.push(json!({ "name": "BASE_SHA", "value": base_sha }));
@@ -237,6 +246,24 @@ mod tests {
         assert_eq!(
             value_of("AGENT_RUNNER_TOKEN").as_deref(),
             Some("runner-secret")
+        );
+
+        // Embeddings (required) + LLM (optional) config are injected from the agent secret.
+        let env_ref = |name: &str| env.iter().find(|e| e.name == name);
+        let secret_key = |name: &str| -> Option<(String, Option<bool>)> {
+            let e = env_ref(name)?;
+            let sel = e.value_from.as_ref()?.secret_key_ref.as_ref()?;
+            Some((sel.key.clone(), sel.optional))
+        };
+        assert_eq!(
+            secret_key("EMBEDDINGS_MODEL"),
+            Some(("embeddings-model".to_string(), None)),
+            "embeddings is required (not optional)"
+        );
+        assert_eq!(
+            secret_key("LLM_MODEL"),
+            Some(("llm-model".to_string(), Some(true))),
+            "review LLM is optional so the Job starts without it"
         );
     }
 }
