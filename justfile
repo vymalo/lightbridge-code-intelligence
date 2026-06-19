@@ -23,8 +23,11 @@ dev:
     pnpm dev
 
 # Run the control plane (standalone Rust backend) only.
+# ALLOW_NO_DB=1 lets dev run degraded without a database (in-memory dedup, single-replica). In
+# production DATABASE_URL is set instead; a pod missing it fails readiness on purpose, rather than
+# silently dedup'ing per-replica in memory (RFC-0001 Phase 0). Export DATABASE_URL to use Postgres.
 dev-backend:
-    cargo run -p control-plane
+    ALLOW_NO_DB=1 cargo run -p control-plane
 
 # Run the web app only.
 dev-web:

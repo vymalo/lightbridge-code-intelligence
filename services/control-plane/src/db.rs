@@ -157,3 +157,44 @@ pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::
         .fetch_optional(pool)
         .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Integration tests: `#[sqlx::test]` provisions a fresh database, runs the migrations, and hands
+    // us a pool. Requires a reachable Postgres via `DATABASE_URL` (see `compose.yaml`); skipped when
+    // none is configured (CI builds images but runs no Rust test job today).
+
+    /// The dedup contract that lets the control plane run multiple replicas: the `delivery_id`
+    /// PRIMARY KEY + `ON CONFLICT DO NOTHING` means a replayed GitHub delivery is detected as a
+    /// duplicate (GitHub delivers at least once), and the row is written exactly once.
+    #[sqlx::test]
+    async fn record_delivery_dedupes_on_delivery_id(pool: PgPool) {
+        let payload = json!({ "action": "opened" });
+
+        let first = record_delivery(&pool, "delivery-abc", "pull_request", &payload)
+            .await
+            .unwrap();
+        assert!(first, "first delivery is new");
+
+        let replay = record_delivery(&pool, "delivery-abc", "pull_request", &payload)
+            .await
+            .unwrap();
+        assert!(!replay, "replayed delivery id is a duplicate");
+
+        let other = record_delivery(&pool, "delivery-xyz", "push", &payload)
+            .await
+            .unwrap();
+        assert!(other, "a different delivery id is independent");
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM github_deliveries WHERE delivery_id = $1")
+                .bind("delivery-abc")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "the replayed delivery is stored exactly once");
+    }
+}
