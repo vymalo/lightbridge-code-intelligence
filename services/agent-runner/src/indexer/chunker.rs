@@ -47,7 +47,9 @@ pub fn chunk_file(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
 fn ts_language(lang: &str) -> Option<Language> {
     match lang {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "typescript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        // Use the dedicated TypeScript grammar so TS-only syntax (generics, interfaces,
+        // decorators) parses correctly. JavaScript grammar is kept for plain JS files.
+        "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
         _ => None,
@@ -104,10 +106,26 @@ fn collect_items(
                     end_line,
                     content: content.to_string(),
                 });
-            } else {
-                // Large node: recurse into its children instead of emitting the whole node as one
-                // chunk. This handles big `impl` blocks by extracting each method separately.
+                // Also recurse so methods inside a small impl / class are independently indexed.
                 collect_items(&child, bytes, file_path, source, language, out);
+            } else {
+                // Large node: try to extract interesting children (e.g. methods inside a big impl).
+                let before = out.len();
+                collect_items(&child, bytes, file_path, source, language, out);
+                if out.len() == before {
+                    // No interesting sub-nodes (e.g. a 200-line function with no nested fns).
+                    // Emit it as a single chunk rather than silently dropping it; the embedding
+                    // API will truncate if the content exceeds the model's context window.
+                    out.push(Chunk {
+                        file_path: file_path.to_string(),
+                        language: language.to_string(),
+                        chunk_type: chunk_type.to_string(),
+                        symbol_name,
+                        start_line,
+                        end_line,
+                        content: content.to_string(),
+                    });
+                }
             }
         } else {
             // Not an interesting node itself — still descend to find nested interesting nodes.

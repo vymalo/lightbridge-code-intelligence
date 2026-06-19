@@ -35,15 +35,19 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token);
+
     let embeddings_config = match EmbeddingsConfig::from_env() {
         Ok(cfg) => cfg,
         Err(error) => {
-            tracing::error!(%error, "invalid embeddings configuration");
+            // The task is already `running` at this point; report failed so the dispatcher
+            // doesn't wait for a lease timeout before it can reschedule.
+            let detail = error.to_string();
+            tracing::error!(%detail, "invalid embeddings configuration");
+            report(&client, &config, "failed", Some(&detail)).await;
             return std::process::ExitCode::FAILURE;
         }
     };
-
-    let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token);
     let embedder = EmbeddingsClient::new(
         &embeddings_config.base_url,
         &embeddings_config.api_key,

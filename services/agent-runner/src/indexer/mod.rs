@@ -148,6 +148,12 @@ async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
                     .to_string_lossy()
                     .replace('\\', "/");
 
+                // Guard large files before allocating memory for them.
+                const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+                if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+                    continue;
+                }
+
                 let source = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
                     Err(_) => continue, // binary or unreadable
