@@ -220,11 +220,11 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(lci_dispatch_claim_seconds_bucket[$__rate_interval])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(lci_dispatch_launch_seconds_bucket[$__rate_interval])) by (le))",
           "refId": "A"
         }
       ],
-      "title": "Claim \u2192 dispatch p95",
+      "title": "Job launch p95",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"

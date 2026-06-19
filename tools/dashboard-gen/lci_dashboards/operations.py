@@ -90,12 +90,12 @@ def dashboard_builder() -> dashboard.Dashboard:
     )
     claim_latency = (
         timeseries.Panel()
-        .title("Claim → dispatch p95")
+        .title("Job launch p95")
         .datasource(PROMETHEUS)
         .unit("s")
         .with_target(
             promql(
-                "histogram_quantile(0.95, sum(rate(lci_dispatch_claim_seconds_bucket"
+                "histogram_quantile(0.95, sum(rate(lci_dispatch_launch_seconds_bucket"
                 "[$__rate_interval])) by (le))"
             )
         )

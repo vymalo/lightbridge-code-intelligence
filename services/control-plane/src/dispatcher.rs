@@ -66,7 +66,7 @@ async fn dispatch<L: TaskLauncher>(pool: &PgPool, launcher: &L, task: &db::Claim
     match launcher.launch(task).await {
         Ok(job_name) => {
             crate::metrics::dispatch_outcome("launched");
-            crate::metrics::dispatch_claim_seconds(started.elapsed().as_secs_f64());
+            crate::metrics::dispatch_launch_seconds(started.elapsed().as_secs_f64());
             match db::set_task_job(pool, task.id, &job_name).await {
                 Ok(()) => tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job"),
                 Err(error) => {

@@ -23,18 +23,22 @@ pub fn install() -> PrometheusHandle {
 // --- Instrumentation helpers (keep metric names in one place; see the Operations dashboard) ---
 
 /// An HTTP request: count by method/route/status, latency by method/route.
-pub fn http_request(method: &str, path: &str, status: &str, seconds: f64) {
+///
+/// `method` and `status` are `&'static str` (callers use a static match) so label values are
+/// zero-allocation. `path` is the matched route template and is allocated once here.
+pub fn http_request(method: &'static str, path: &str, status: &'static str, seconds: f64) {
+    let path_owned = path.to_string();
     counter!(
         "http_requests_total",
-        "method" => method.to_string(),
-        "path" => path.to_string(),
-        "status" => status.to_string(),
+        "method" => method,
+        "path" => path_owned.clone(),
+        "status" => status,
     )
     .increment(1);
     histogram!(
         "http_request_duration_seconds",
-        "method" => method.to_string(),
-        "path" => path.to_string(),
+        "method" => method,
+        "path" => path_owned,
     )
     .record(seconds);
 }
@@ -56,14 +60,15 @@ pub fn task_created() {
     counter!("lci_tasks_created_total").increment(1);
 }
 
-/// A dispatch attempt outcome: `launched` or `failed`.
-pub fn dispatch_outcome(outcome: &str) {
-    counter!("lci_dispatch_jobs_total", "outcome" => outcome.to_string()).increment(1);
+/// A dispatch attempt outcome: `launched` or `failed`. Callers pass string literals so this is
+/// zero-allocation.
+pub fn dispatch_outcome(outcome: &'static str) {
+    counter!("lci_dispatch_jobs_total", "outcome" => outcome).increment(1);
 }
 
-/// Seconds spent claiming + launching a task's Job.
-pub fn dispatch_claim_seconds(seconds: f64) {
-    histogram!("lci_dispatch_claim_seconds").record(seconds);
+/// Seconds spent launching the Kubernetes Job for a claimed task.
+pub fn dispatch_launch_seconds(seconds: f64) {
+    histogram!("lci_dispatch_launch_seconds").record(seconds);
 }
 
 #[cfg(test)]

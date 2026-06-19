@@ -41,7 +41,7 @@ def main() -> None:
     for name, factory in sorted(DASHBOARDS.items()):
         model = factory().build()
         rendered = json.dumps(model, cls=JSONEncoder, indent=2, sort_keys=True) + "\n"
-        (OUT_DIR / f"{name}.json").write_text(rendered)
+        (OUT_DIR / f"{name}.json").write_text(rendered, encoding="utf-8")
         print(f"wrote {name}.json")
 
 

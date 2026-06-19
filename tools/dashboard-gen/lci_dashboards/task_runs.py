@@ -29,11 +29,15 @@ def dashboard_builder() -> dashboard.Dashboard:
         dashboard.QueryVariable("repo")
         .label("Repository")
         .datasource(POSTGRES)
-        # Empty value == "All"; the sentinel row sorts first.
+        # Empty value == "All"; explicit ord weight guarantees the sentinel is always first even
+        # when repository names start with a letter before 'A'.
         .query(
-            "SELECT 'All' AS __text, '' AS __value "
-            "UNION ALL SELECT owner || '/' || name, owner || '/' || name FROM repositories "
-            "ORDER BY 1"
+            "SELECT __text, __value FROM ("
+            "  SELECT 'All' AS __text, '' AS __value, 0 AS ord "
+            "  UNION ALL "
+            "  SELECT owner || '/' || name AS __text, owner || '/' || name AS __value, 1 AS ord "
+            "  FROM repositories"
+            ") t ORDER BY ord, __text"
         )
     )
     task_id_var = (
