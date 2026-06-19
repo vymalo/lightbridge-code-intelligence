@@ -1,57 +1,163 @@
+@import "tailwindcss";
+
+/*
+ * Web console design language — ADR-0015.
+ * Monochrome neutral base; color reserved for semantic status only. Depth via thin borders and
+ * tonal shifts, not shadows. Light default + full dark mode from one token set (prefers-color-scheme).
+ */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-foreground: var(--surface-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-ring: var(--ring);
+
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, monospace;
+
+  --radius-card: 8px;
+}
+
 :root {
-  color-scheme: light dark;
+  /* Light — near-white canvas, slightly raised surfaces, ink-not-black text. */
+  --background: oklch(0.99 0 0);
+  --foreground: oklch(0.21 0.01 260);
+  --surface: oklch(1 0 0);
+  --surface-foreground: oklch(0.21 0.01 260);
+  --muted: oklch(0.96 0.005 260);
+  --muted-foreground: oklch(0.52 0.01 260);
+  --border: oklch(0.92 0.004 260);
+  --border-strong: oklch(0.86 0.006 260);
+  --accent: oklch(0.55 0.16 264);
+  --accent-foreground: oklch(0.99 0 0);
+  --ring: oklch(0.55 0.16 264);
+
+  /* Semantic status accents (foreground ink + subtle tinted fill for pills). */
+  --status-pending: oklch(0.52 0.01 260);
+  --status-pending-fill: oklch(0.95 0.005 260);
+  --status-active: oklch(0.55 0.16 264);
+  --status-active-fill: oklch(0.95 0.03 264);
+  --status-success: oklch(0.52 0.13 155);
+  --status-success-fill: oklch(0.95 0.04 155);
+  --status-error: oklch(0.55 0.2 25);
+  --status-error-fill: oklch(0.95 0.04 25);
+  --status-warn: oklch(0.6 0.13 75);
+  --status-warn-fill: oklch(0.95 0.05 85);
+  --status-muted: oklch(0.6 0.01 260);
+  --status-muted-fill: oklch(0.95 0.004 260);
 }
 
-* {
-  box-sizing: border-box;
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark — the references skew dark and our users live in dark IDEs. */
+    --background: oklch(0.17 0.005 260);
+    --foreground: oklch(0.93 0.005 260);
+    --surface: oklch(0.2 0.006 260);
+    --surface-foreground: oklch(0.93 0.005 260);
+    --muted: oklch(0.24 0.006 260);
+    --muted-foreground: oklch(0.66 0.01 260);
+    --border: oklch(0.28 0.007 260);
+    --border-strong: oklch(0.34 0.008 260);
+    --accent: oklch(0.7 0.14 264);
+    --accent-foreground: oklch(0.17 0.005 260);
+    --ring: oklch(0.7 0.14 264);
+
+    --status-pending: oklch(0.7 0.01 260);
+    --status-pending-fill: oklch(0.27 0.006 260);
+    --status-active: oklch(0.72 0.13 264);
+    --status-active-fill: oklch(0.3 0.05 264);
+    --status-success: oklch(0.75 0.14 155);
+    --status-success-fill: oklch(0.3 0.05 155);
+    --status-error: oklch(0.7 0.16 25);
+    --status-error-fill: oklch(0.31 0.07 25);
+    --status-warn: oklch(0.78 0.13 80);
+    --status-warn-fill: oklch(0.32 0.06 80);
+    --status-muted: oklch(0.6 0.008 260);
+    --status-muted-fill: oklch(0.26 0.006 260);
+  }
 }
 
-body {
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  line-height: 1.55;
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  html {
+    color-scheme: light dark;
+  }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
 }
 
-main {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 3rem 1.5rem;
+/*
+ * Status pills (ADR-0016 status model). One class per visual variant; the component picks the
+ * variant from TaskStatus. Capsule shape, tinted fill + status ink, hairline ring.
+ */
+@layer components {
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border-radius: 9999px;
+    padding: 0.125rem 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    white-space: nowrap;
+  }
+  .status-pill::before {
+    content: "";
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 9999px;
+    background: currentColor;
+    flex: none;
+  }
+  .status-pending {
+    color: var(--status-pending);
+    background: var(--status-pending-fill);
+  }
+  .status-active {
+    color: var(--status-active);
+    background: var(--status-active-fill);
+  }
+  .status-active::before {
+    animation: status-pulse 1.6s ease-in-out infinite;
+  }
+  .status-success {
+    color: var(--status-success);
+    background: var(--status-success-fill);
+  }
+  .status-error {
+    color: var(--status-error);
+    background: var(--status-error-fill);
+  }
+  .status-warn {
+    color: var(--status-warn);
+    background: var(--status-warn-fill);
+  }
+  .status-muted {
+    color: var(--status-muted);
+    background: var(--status-muted-fill);
+  }
 }
 
-h1 {
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-a {
-  color: inherit;
-  text-underline-offset: 3px;
-}
-
-.card {
-  border: 1px solid color-mix(in srgb, currentColor 15%, transparent);
-  border-radius: 12px;
-  padding: 1rem 1.25rem;
-  overflow-x: auto;
-}
-
-.row {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  max-width: 320px;
-  margin-top: 1rem;
-}
-
-input,
-button {
-  font: inherit;
-  padding: 0.5rem 0.75rem;
-  border-radius: 8px;
-  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-  background: transparent;
-}
-
-button {
-  cursor: pointer;
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }
