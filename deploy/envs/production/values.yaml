@@ -17,6 +17,15 @@ lci:
           image:
             repository: ghcr.io/vymalo/lightbridge-control-plane
             tag: "sha-d6d965d"
+    # The dispatcher runs the SAME image as the control plane (one binary, role-selected). It must
+    # track the same tag — image-updater's `disp` alias owns this, seeded here so it never lags on
+    # the chart's stale default (which predates the dispatcher role).
+    dispatcher:
+      containers:
+        main:
+          image:
+            repository: ghcr.io/vymalo/lightbridge-control-plane
+            tag: "sha-d6d965d"
     web:
       containers:
         main:
