@@ -4,11 +4,16 @@
 use std::process::Command;
 
 fn main() -> anyhow::Result<()> {
-    let task = std::env::args().nth(1).unwrap_or_else(|| "help".to_string());
+    let task = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "help".to_string());
     match task.as_str() {
         "ci" => ci(),
         "fmt" => run("cargo", &["fmt", "--all"]),
-        "lint" => run("cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]),
+        "lint" => run(
+            "cargo",
+            &["clippy", "--all-targets", "--", "-D", "warnings"],
+        ),
         "test" => test(),
         _ => {
             eprintln!("usage: cargo xtask <ci|fmt|lint|test>");
@@ -19,7 +24,10 @@ fn main() -> anyhow::Result<()> {
 
 fn ci() -> anyhow::Result<()> {
     run("cargo", &["fmt", "--all", "--", "--check"])?;
-    run("cargo", &["clippy", "--all-targets", "--", "-D", "warnings"])?;
+    run(
+        "cargo",
+        &["clippy", "--all-targets", "--", "-D", "warnings"],
+    )?;
     test()
 }
 
