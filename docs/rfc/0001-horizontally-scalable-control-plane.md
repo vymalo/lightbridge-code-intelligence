@@ -85,7 +85,8 @@ The two flows the design must support:
   Postgres (durable dedup), creates the task row, and returns `202`. The `dispatcher` later picks
   the task up and spawns its Job.
 - **Pull → queue → dispatch.** The `scheduler` periodically enqueues sync/reindex tasks (the
-  "app pulls GitHub" path). They flow through the same `tasks` queue and the same dispatcher.
+  "app pulls GitHub" path) with `source = 'schedule'` and no delivery id. They flow through the same
+  `tasks` queue and the same dispatcher (see the schema note on `github_delivery_id` below).
 
 Why this shape: returning `202` immediately and doing the heavy work out-of-band is the standard,
 correct way to absorb GitHub's bursty at-least-once deliveries. Because *enqueue is just an
@@ -139,16 +140,39 @@ Proposed additive columns on `tasks` (mirrored in
 |---|---|
 | `attempts int NOT NULL DEFAULT 0` | retry accounting |
 | `run_after timestamptz NOT NULL DEFAULT now()` | delay + exponential backoff |
-| `lease_owner text` / `lease_expires_at timestamptz` | claim a task for dispatch; reaped on expiry |
+| `run_epoch int NOT NULL DEFAULT 0` | re-run discriminator (see idempotency index below) |
+| `source text NOT NULL DEFAULT 'webhook'` | task origin: `webhook` or `schedule` |
+| `job_name text` | name of the dispatched Kubernetes Job; lets the reaper check liveness |
+| `lease_owner text` / `lease_expires_at timestamptz` | claim a task for dispatch; renewed by heartbeat, reaped on expiry (see Reaper) |
+
+The `tasks` schema also needs one **modification**: `github_delivery_id` becomes **nullable**.
+Today it is a `NOT NULL` foreign key to `github_deliveries`, which is right for webhook-originated
+tasks but blocks the pull path — scheduler-produced sync/reindex tasks have no `X-GitHub-Delivery`
+to reference. Making it nullable (with origin carried in `source`) lets both flows share one queue
+without inventing synthetic delivery rows.
 
 Plus a unique index enforcing "at most one task per normalized command + target + head SHA"
-([idempotency model](../github-app-and-control-plane.md#idempotency-model)). Explicit re-run
-commands are allowed to create a new version, so the key includes a re-run discriminator rather than
-being globally unique on the natural key:
+([idempotency model](../github-app-and-control-plane.md#idempotency-model)). Two wrinkles the index
+must handle:
+
+- **Nullable `head_sha`.** Postgres treats `NULL`s as distinct in a unique index by default, so a
+  plain index would let duplicate tasks slip through whenever the head SHA is unknown. Use
+  `NULLS NOT DISTINCT` (Postgres 15+) so the guard holds for null SHAs too.
+- **Explicit re-runs.** Re-run commands are allowed to create a new version, so the key carries a
+  `run_epoch` discriminator rather than being globally unique on the natural key.
 
 ```sql
 CREATE UNIQUE INDEX tasks_idempotency_idx
-  ON tasks (repository_id, target_type, target_id, command_text, head_sha, run_epoch);
+  ON tasks (repository_id, target_type, target_id, command_text, head_sha, run_epoch)
+  NULLS NOT DISTINCT;  -- Postgres 15+; pre-15: COALESCE(head_sha, '') in the key or a partial index
+```
+
+A matching partial index keeps the `SKIP LOCKED` dequeue from degrading to a table scan as the
+table grows:
+
+```sql
+CREATE INDEX tasks_queue_idx ON tasks (priority DESC, created_at)
+  WHERE status = 'queued';
 ```
 
 Dispatcher dequeue — the whole concurrency story is one query; `SKIP LOCKED` guarantees that
@@ -157,7 +181,7 @@ multiple dispatcher replicas never claim the same row:
 ```sql
 UPDATE tasks
 SET status = 'running', attempts = attempts + 1,
-    lease_owner = $1, lease_expires_at = now() + interval '5 minutes', started_at = now()
+    lease_owner = $1, lease_expires_at = now() + interval '1 minute', started_at = now()
 WHERE id = (
   SELECT id FROM tasks
   WHERE status = 'queued' AND run_after <= now()
@@ -165,19 +189,29 @@ WHERE id = (
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
-RETURNING *;
+RETURNING *;  -- short *claim* lease; only covers Job creation, then renewed by heartbeat (see below)
 ```
 
 To avoid busy-polling, dispatchers `LISTEN` on a channel that `serve`/`scheduler` `NOTIFY` on
 enqueue, with a short poll (1–5s) as a fallback so a missed notification never strands work. On
-claim, the dispatcher creates the Job (ADR-0004) and transitions the task through the existing
-`Running → PostingResult → Succeeded/Failed/TimedOut` states as the Job reports back.
+claim, the dispatcher creates the Job (ADR-0004), records `job_name` on the task, and transitions it
+through the existing `Running → PostingResult → Succeeded/Failed/TimedOut` states as the Job reports
+back.
+
+Lease and reaping — **the Kubernetes Job is the source of truth for liveness, not a timer.** The
+claim lease above is deliberately short: it only covers the window in which the dispatcher is
+creating the Job. Once the Job exists, the dispatcher **renews the lease by heartbeat** for as long
+as the Job is alive, so the lease never has to be pre-sized to a task's worst-case runtime (an
+indexer Job may run up to `activeDeadlineSeconds` = 3600s). The **reaper** (scheduler) returns a task
+to `queued` only when **both** conditions hold: `lease_expires_at` has passed **and** no live Job
+named `job_name` exists. That liveness check is what prevents a still-running task from being
+prematurely reclaimed and a second Job being spawned for it — preserving the one-Job-per-task
+invariant of [ADR-0004](../adr/0004-one-k8s-job-per-task.md). The same check covers dead dispatchers
+(claimed but never created a Job — lease expires, no Job → requeue), lost `NOTIFY`s, and orphaned
+Jobs, and is what makes a lost message self-healing.
 
 Retry/failure: on a recoverable failure set `status = 'queued'`, `run_after = now() + backoff`
-until `attempts >= max`, then `failed`. The **reaper** (scheduler) returns tasks whose
-`lease_expires_at` has passed — or whose Job has vanished — to `queued`. That single mechanism
-covers dead dispatchers, lost `NOTIFY`s, and orphaned Jobs; it is also what makes a lost message
-self-healing.
+until `attempts >= max`, then `failed`.
 
 ### Roles as one binary
 
@@ -247,12 +281,16 @@ be raised; workers/dispatchers can later get an HPA on queue depth (`COUNT(*) WH
 
 ## Unresolved questions
 
-- Exact shape of the re-run discriminator (`run_epoch` vs. a monotonic `version`) for the task
-  idempotency index, and how explicit re-run commands set it.
+- Whether `run_epoch` is the right re-run discriminator vs. a monotonic `version`, and how explicit
+  re-run commands set it.
 - Whether the `dispatcher` runs as 1 replica (simplest) or N from the start — `SKIP LOCKED` makes N
   safe, but Job-creation concurrency limits need a global cap (DB-counted vs. Redis-counted).
 - Whether the `scheduler` begins as a single-replica Deployment, a k8s `CronJob`, or a leader-leased
   role — to be resolved in Phase 2.
-- Lease duration / backoff constants and the reaper interval — to be tuned during implementation.
+- Claim-lease duration, heartbeat-renewal interval, backoff constants, and the reaper interval — to
+  be tuned during implementation. (The Job-liveness check, not these timers, is what guarantees
+  one Job per task.)
+- Whether the reaper checks Job liveness via the Kubernetes API directly or via a Job-status field
+  the dispatcher mirrors into Postgres.
 - Whether Redis is needed at all before real GitHub rate-limit pressure is observed (Phase 3 may be
   deferred).
