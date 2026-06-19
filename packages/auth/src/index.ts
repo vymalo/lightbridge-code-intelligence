@@ -1,6 +1,6 @@
 export type { SessionClaims } from "./claims";
 export type { OidcClientConfig } from "./oidc-config";
-export { oidcClientConfigFromEnv } from "./oidc-config";
+export { appBaseUrl, oidcClientConfigFromEnv } from "./oidc-config";
 export {
   type CookieOptions,
   cookieOptions,
