@@ -23,6 +23,8 @@ pub async fn github_webhook(
 ) -> impl IntoResponse {
     let signature = header(&headers, "x-hub-signature-256");
     if !verify_signature(state.github_webhook_secret.as_bytes(), &body, &signature) {
+        crate::metrics::webhook_signature_failure();
+        tracing::warn!("invalid webhook signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature");
     }
 
@@ -61,9 +63,12 @@ pub async fn github_webhook(
             .insert(delivery_id.clone()),
     };
     if !is_new {
+        crate::metrics::webhook_duplicate();
+        tracing::info!(delivery_id, "duplicate delivery");
         return (StatusCode::ACCEPTED, "duplicate delivery");
     }
 
+    crate::metrics::webhook_delivery(&event);
     tracing::info!(delivery_id, event, "accepted webhook");
 
     // Route actionable events to a task. For now: a pull_request opened/synchronize/reopened
@@ -129,6 +134,7 @@ async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delive
     };
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
+            crate::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task")
         }
         Ok(None) => {

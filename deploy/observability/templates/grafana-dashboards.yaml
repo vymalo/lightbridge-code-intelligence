@@ -1,0 +1,37 @@
+{{- /*
+One GrafanaDashboard per committed dashboards/<name>.json. The dashboard JSON carries ${DS_*}
+datasource placeholders; spec.datasources maps each to a real datasource so the operator resolves
+them at import. Edit the Python generator (tools/dashboard-gen), not these JSON files.
+*/}}
+{{- range $path, $bytes := .Files.Glob "dashboards/*.json" }}
+{{- $base := trimSuffix ".json" (base $path) }}
+{{- $enabled := index $.Values.dashboards $base }}
+{{- if or (kindIs "invalid" $enabled) $enabled }}
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: lci-{{ $base }}
+  labels:
+    app.kubernetes.io/name: lightbridge
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+spec:
+  resyncPeriod: {{ $.Values.resyncPeriod | quote }}
+  folderRef: {{ $.Values.folder.name | quote }}
+  instanceSelector:
+    matchLabels:
+      {{- range $k, $v := $.Values.instanceSelector.matchLabels }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
+  datasources:
+    - inputName: "DS_POSTGRES"
+      datasourceName: {{ $.Values.datasources.postgres | quote }}
+    - inputName: "DS_LOKI"
+      datasourceName: {{ $.Values.datasources.loki | quote }}
+    - inputName: "DS_PROMETHEUS"
+      datasourceName: {{ $.Values.datasources.prometheus | quote }}
+  json: |
+{{ $bytes | toString | indent 4 }}
+{{- end }}
+{{- end }}

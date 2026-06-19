@@ -12,18 +12,22 @@ mod github;
 mod internal;
 mod jwt;
 mod k8s;
+mod metrics;
 mod tasks;
 mod types;
 mod webhook;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
@@ -50,10 +54,13 @@ pub struct AppState {
     /// routes (they fail closed with 503) — the control plane injects the same value into each
     /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
     pub runner_token: Option<Arc<String>>,
+    /// Prometheus render handle backing `/metrics` (scraped by Alloy for the Operations dashboard).
+    pub metrics: PrometheusHandle,
 }
 
 impl AppState {
     async fn from_env() -> anyhow::Result<Self> {
+        let metrics = metrics::install();
         let db = db::connect_from_env().await?;
         let allow_no_db = env_flag("ALLOW_NO_DB");
         if db.is_none() {
@@ -81,6 +88,7 @@ impl AppState {
                 .ok()
                 .filter(|token| !token.is_empty())
                 .map(Arc::new),
+            metrics,
         })
     }
 }
@@ -123,6 +131,7 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
+        .route("/metrics", get(metrics_endpoint))
         .route("/github/webhook", post(webhook::github_webhook))
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))
@@ -131,11 +140,63 @@ fn app(state: AppState) -> Router {
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
         .route("/internal/tasks/{id}/status", post(internal::set_status))
+        .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }
 
 async fn liveness() -> &'static str {
     "ok"
+}
+
+/// Prometheus text exposition for Alloy to scrape.
+async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(),
+    )
+}
+
+/// Middleware: record request count + latency by method, matched route, and status. Uses the
+/// matched route (not the raw path) to keep label cardinality bounded.
+///
+/// Method and status are resolved to `&'static str` via a match so label allocation per request is
+/// limited to a single `path.to_string()` inside `metrics::http_request`.
+async fn track_http_metrics(req: Request, next: Next) -> Response {
+    let method = match *req.method() {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::CONNECT => "CONNECT",
+        axum::http::Method::TRACE => "TRACE",
+        _ => "UNKNOWN",
+    };
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let status = match response.status().as_u16() {
+        200 => "200",
+        201 => "201",
+        204 => "204",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        422 => "422",
+        500 => "500",
+        503 => "503",
+        _ => "other",
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::http_request(method, &path, status, elapsed);
+    response
 }
 
 /// Readiness fails closed when required configuration is missing or a dependency is unreachable, so
@@ -231,10 +292,41 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         .db
         .clone()
         .ok_or_else(|| anyhow::anyhow!("dispatcher requires DATABASE_URL"))?;
+    // The dispatcher has no main HTTP server, so stand up a tiny one just for /metrics (+ health)
+    // so Alloy can scrape it like the serve pods.
+    spawn_metrics_server(state.metrics.clone());
     let launcher = k8s::KubeLauncher::from_env().await?;
     // The pod name is a natural, unique lease owner; fall back to a generic label off-cluster.
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "dispatcher".to_string());
     dispatcher::run(pool, launcher, owner).await
+}
+
+/// Serve `/metrics` (+ `/healthz`) on `METRICS_ADDR` for roles without a main HTTP server.
+fn spawn_metrics_server(handle: PrometheusHandle) {
+    let addr = std::env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    tokio::spawn(async move {
+        let router = Router::new().route("/healthz", get(liveness)).route(
+            "/metrics",
+            get(move || {
+                let handle = handle.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                        handle.render(),
+                    )
+                }
+            }),
+        );
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                tracing::info!(addr = %addr, "dispatcher metrics listening");
+                if let Err(error) = axum::serve(listener, router).await {
+                    tracing::error!(%error, "metrics server stopped");
+                }
+            }
+            Err(error) => tracing::error!(%error, addr = %addr, "failed to bind metrics server"),
+        }
+    });
 }
 
 #[cfg(test)]

@@ -1,0 +1,55 @@
+# Lightbridge observability chart values.
+#
+# Everything environment-specific lives here. The placeholders marked CHANGEME must be set to match
+# your cluster before the dashboards bind to Grafana and resolve their datasources.
+
+# Labels that select the target Grafana instance. Copy these from a working GrafanaDashboard in your
+# cluster (e.g. the `alloy-collector` dashboard) so these CRs bind to the same Grafana.
+# CHANGEME
+instanceSelector:
+  matchLabels:
+    dashboards: "grafana"
+
+# The GrafanaFolder all dashboards are filed under.
+folder:
+  # CR name (referenced by dashboards via folderRef) and the title shown in Grafana.
+  name: lightbridge
+  title: "Lightbridge Code Intelligence"
+
+# How often the operator re-applies the dashboards (drift correction).
+resyncPeriod: 10m
+
+# Names of the Grafana datasources the dashboards resolve to. The operator substitutes the
+# ${DS_*} placeholders baked into the dashboard JSON with these datasources' UIDs.
+datasources:
+  # CHANGEME — name of your read-replica Postgres datasource (created below if create=true).
+  postgres: lci-postgres
+  # CHANGEME — name of your existing Loki datasource.
+  loki: loki
+  # CHANGEME — name of your existing Prometheus/Mimir datasource (Operations dashboard).
+  prometheus: prometheus
+
+# Optional: have this chart create the read-only Postgres GrafanaDatasource (read replica).
+# Set create=false if you manage the datasource elsewhere (then only `datasources.postgres` matters).
+postgresDatasource:
+  create: true
+  name: lci-postgres
+  # CHANGEME — read-replica connection.
+  host: "lightbridge-postgres-ro.lightbridge.svc.cluster.local:5432"
+  database: lightbridge
+  user: grafana_ro
+  sslmode: require
+  # Postgres server version as Grafana expects it (e.g. 1500 for 15, 1700 for 17).
+  postgresVersion: 1700
+  # The read-only password is pulled from this Secret (not stored in the chart).
+  passwordSecret:
+    name: lci-grafana-postgres
+    key: password
+
+# Per-dashboard toggles (all on by default). Keys match dashboards/<key>.json.
+dashboards:
+  overview: true
+  task-runs: true
+  repositories: true
+  ingress-dispatcher: true
+  operations: true

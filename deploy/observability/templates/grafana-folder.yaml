@@ -1,0 +1,15 @@
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaFolder
+metadata:
+  name: {{ .Values.folder.name }}
+  labels:
+    app.kubernetes.io/name: lightbridge
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  title: {{ .Values.folder.title | quote }}
+  instanceSelector:
+    matchLabels:
+      {{- range $k, $v := .Values.instanceSelector.matchLabels }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
