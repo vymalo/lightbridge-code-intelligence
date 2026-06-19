@@ -453,6 +453,93 @@ pub async fn graph_query(
     }
 }
 
+/// `POST /internal/tasks/{id}/review` — validate the runner's structured review and post it to the
+/// PR (epic #5, slice 6). The control plane owns GitHub write access (ADR-0002): it resolves the PR
+/// from the task, mints the installation token, fetches the diff to validate which finding lines are
+/// commentable, and posts a single PR review (inline comments + a body for the rest).
+pub async fn post_review(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(submission): Json<crate::review::ReviewSubmission>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(app) = state.github.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
+    };
+
+    let context = match crate::db::get_task_context(pool, id).await {
+        Ok(Some(context)) => context,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for review failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    // Reviews only apply to pull requests; anything else is a no-op (not an error).
+    if context.target_type != "pull_request" {
+        return (StatusCode::NO_CONTENT, "not a pull request").into_response();
+    }
+    let pr = context.target_id;
+
+    let token = match app.installation_token(context.installation_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "mint installation token failed");
+            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
+        }
+    };
+
+    // Validate finding lines against the PR diff: only diff lines are commentable inline.
+    let commentable = match app
+        .list_pr_files(&token, &context.owner, &context.name, pr)
+        .await
+    {
+        Ok(files) => files
+            .into_iter()
+            .filter_map(|f| {
+                f.patch
+                    .map(|p| (f.filename, crate::review::commentable_lines(&p)))
+            })
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "fetching PR files failed");
+            return (StatusCode::BAD_GATEWAY, "could not fetch PR files").into_response();
+        }
+    };
+
+    let validated = crate::review::validate(submission.findings, &commentable);
+    let body = crate::review::render_body(&submission.summary, &validated.deferred);
+    let comments: Vec<crate::github::ReviewComment> = validated
+        .inline
+        .iter()
+        .map(|c| crate::github::ReviewComment {
+            path: c.path.clone(),
+            line: c.line,
+            side: "RIGHT",
+            body: c.body.clone(),
+        })
+        .collect();
+
+    let (inline_n, deferred_n) = (comments.len(), validated.deferred.len());
+    match app
+        .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, "review posted");
+            Json(serde_json::json!({ "inline": inline_n, "deferred": deferred_n })).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "posting PR review failed");
+            (StatusCode::BAD_GATEWAY, "could not post review").into_response()
+        }
+    }
+}
+
 /// The runner's status report. `detail` is optional free text for diagnostics (not persisted yet).
 #[derive(Debug, Deserialize)]
 pub struct StatusUpdate {

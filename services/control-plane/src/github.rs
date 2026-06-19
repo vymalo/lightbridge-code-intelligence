@@ -87,6 +87,88 @@ impl GithubApp {
             .token;
         Ok(token)
     }
+
+    /// Fetch a PR's changed files with their unified-diff patches (first page, up to 100 files —
+    /// enough for typical PRs; pagination is a follow-up). Used to validate which finding lines are
+    /// commentable (see `review::commentable_lines`).
+    pub async fn list_pr_files(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        pr: i64,
+    ) -> anyhow::Result<Vec<PrFile>> {
+        use anyhow::Context;
+        let files = self
+            .http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/files?per_page=100"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("requesting PR files")?
+            .error_for_status()
+            .context("github rejected the PR-files request")?
+            .json::<Vec<PrFile>>()
+            .await
+            .context("parsing PR files")?;
+        Ok(files)
+    }
+
+    /// Post a PR review (`event: COMMENT`) with a body and optional inline comments. GitHub rejects
+    /// the whole review if any comment's line isn't in the diff, so the caller must pre-validate.
+    pub async fn create_pr_review(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewComment],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let payload = serde_json::json!({
+            "body": body,
+            "event": "COMMENT",
+            "comments": comments,
+        });
+        self.http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+            .context("posting PR review")?
+            .error_for_status()
+            .context("github rejected the PR review")?;
+        Ok(())
+    }
+}
+
+/// A changed file in a PR, as returned by the PR-files API. `patch` is absent for binary/huge files.
+#[derive(Debug, Deserialize)]
+pub struct PrFile {
+    pub filename: String,
+    #[serde(default)]
+    pub patch: Option<String>,
+}
+
+/// An inline comment in the GitHub "create review" payload (RIGHT = the new file side).
+#[derive(Debug, Serialize)]
+pub struct ReviewComment {
+    pub path: String,
+    pub line: u32,
+    pub side: &'static str,
+    pub body: String,
 }
 
 #[cfg(test)]

@@ -117,9 +117,9 @@ async fn run(
         }
     };
 
-    // ── Review: OpenCode over the MCP tools (epic #5, slice 5, ADR-0021) ─────────────────────
-    // Runs only when the LLM is configured. The findings are logged + counted here; validation and
-    // GitHub write-back are slice 6, so a review failure is non-fatal (indexing already landed).
+    // ── Review: OpenCode over the MCP tools → validated GitHub write-back ────────────────────
+    // (slice 5 produces the review, slice 6 submits it; the control plane validates against the PR
+    // diff and posts). Runs only when the LLM is configured; non-fatal (indexing already landed).
     let review_summary = match review_config {
         Some(review) => match review::run_review(&checkout, review, &context.command).await {
             Ok(result) => {
@@ -128,7 +128,15 @@ async fn run(
                     summary = result.summary,
                     "review complete"
                 );
-                format!("{} findings", result.findings.len())
+                // Submit for validation + write-back (slice 6). Non-fatal: a post failure (e.g.
+                // GitHub hiccup) shouldn't fail a task whose indexing + review already succeeded.
+                match client.submit_review(config.task_id, &result).await {
+                    Ok(()) => format!("{} findings posted", result.findings.len()),
+                    Err(error) => {
+                        tracing::warn!(%error, "submitting review failed (non-fatal)");
+                        format!("{} findings (post failed)", result.findings.len())
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "review failed (non-fatal)");
