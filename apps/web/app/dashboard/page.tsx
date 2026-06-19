@@ -1,26 +1,90 @@
-import { SESSION_COOKIE, verifyAccessToken, verifyConfigFromEnv } from "@lightbridge/auth";
-import { cookies } from "next/headers";
+import Link from "next/link";
+import { RunRow } from "@/components/run-row";
+import { ApiErrorLine, EmptyState } from "@/components/states";
+import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { listTasks } from "@/lib/api";
+import { type StatusVariant, statusVisual } from "@/lib/tasks";
 
-// `middleware.ts` already gates this route; we re-read the cookie here to display the user.
-export default async function Dashboard() {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  const claims = token ? await verifyAccessToken(token, verifyConfigFromEnv()) : null;
+// Task state changes server-side; always render fresh.
+export const dynamic = "force-dynamic";
+
+const SUMMARY: { variant: StatusVariant; label: string }[] = [
+  { variant: "active", label: "Running" },
+  { variant: "pending", label: "Pending" },
+  { variant: "success", label: "Succeeded" },
+  { variant: "error", label: "Failed" },
+];
+
+export default async function Overview() {
+  const result = await listTasks();
+  const now = Date.now();
 
   return (
-    <main>
-      <h1>Dashboard</h1>
-      {claims ? (
-        <>
-          <p>Signed in as {claims.email ?? claims.preferred_username ?? claims.sub}.</p>
-          <p>
-            <a href="/api/auth/logout">Sign out</a>
-          </p>
-        </>
-      ) : (
-        <p>
-          Not signed in. <a href="/sign-in">Sign in</a>.
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-lg font-medium tracking-tight">Overview</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Task runs across your connected repositories.
         </p>
+      </div>
+
+      {!result.ok ? (
+        <Card>
+          <ApiErrorLine result={result} />
+        </Card>
+      ) : result.data.length === 0 ? (
+        <EmptyState
+          title="No task runs yet"
+          action={
+            <a
+              className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
+              href="https://github.com/apps"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Install the GitHub App
+            </a>
+          }
+        >
+          Once the Lightbridge GitHub App is installed on a repository, opening or updating a pull
+          request will create a review run here.
+        </EmptyState>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {SUMMARY.map(({ variant, label }) => {
+              const count = result.data.filter(
+                (t) => statusVisual(t.status).variant === variant,
+              ).length;
+              return (
+                <Card key={variant}>
+                  <CardBody>
+                    <div className="text-2xl font-semibold tabular-nums">{count}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">{label}</div>
+                  </CardBody>
+                </Card>
+              );
+            })}
+          </div>
+
+          <Card>
+            <CardHeader className="flex items-center justify-between">
+              <CardTitle>Recent runs</CardTitle>
+              <Link
+                href="/dashboard/runs"
+                className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+              >
+                View all
+              </Link>
+            </CardHeader>
+            <div className="divide-y divide-border">
+              {result.data.slice(0, 8).map((task) => (
+                <RunRow key={task.id} task={task} now={now} />
+              ))}
+            </div>
+          </Card>
+        </>
       )}
-    </main>
+    </div>
   );
 }

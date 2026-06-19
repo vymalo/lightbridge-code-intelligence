@@ -63,7 +63,9 @@ pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// A task row as stored — one task run for the dashboard (ADR-0016). Serialized directly to the
-/// `/tasks` API (timestamps as RFC 3339).
+/// `/tasks` API (timestamps as RFC 3339). The `repo_*` fields are joined from `repositories` so the
+/// dashboard can show a human repo name + branch without a second round-trip (LEFT JOIN, so they're
+/// `None` for the rare orphaned row).
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TaskRow {
     pub id: Uuid,
@@ -83,7 +85,16 @@ pub struct TaskRow {
     pub started_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
+    pub repo_owner: Option<String>,
+    pub repo_name: Option<String>,
+    pub repo_default_branch: Option<String>,
 }
+
+/// `SELECT` projection shared by the list and detail queries: every `tasks` column plus the joined
+/// repository identity, aliased to the `repo_*` fields of [`TaskRow`].
+const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
+     r.default_branch AS repo_default_branch \
+     FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
 
 /// Fields needed to create a task from a webhook event (status starts at `received`).
 pub struct NewTask {
@@ -144,7 +155,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Er
 
 /// Most recent tasks first (the dashboard run list).
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
-    sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks ORDER BY created_at DESC LIMIT $1")
+    let sql = format!("{TASK_SELECT} ORDER BY t.created_at DESC LIMIT $1");
+    sqlx::query_as::<_, TaskRow>(&sql)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -152,7 +164,8 @@ pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx:
 
 /// A single task by id.
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
-    sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks WHERE id = $1")
+    let sql = format!("{TASK_SELECT} WHERE t.id = $1");
+    sqlx::query_as::<_, TaskRow>(&sql)
         .bind(id)
         .fetch_optional(pool)
         .await
