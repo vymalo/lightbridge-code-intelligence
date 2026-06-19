@@ -1,0 +1,226 @@
+//! Syntax-aware chunking (ADR-0010). For supported languages we use tree-sitter to extract named
+//! top-level items (functions, structs, classes, impls, methods). For everything else — or when the
+//! file is too large / unparseable — we fall back to a fixed-size line window.
+
+use tree_sitter::{Language, Node, Parser};
+
+/// Maximum lines a single structured chunk may span before we split it into windowed sub-chunks.
+const MAX_CHUNK_LINES: usize = 150;
+/// Windowed fallback: window size and step (overlap = WINDOW_SIZE - WINDOW_STEP lines).
+const WINDOW_SIZE: usize = 100;
+const WINDOW_STEP: usize = 50;
+/// Skip files larger than this (avoids embedding enormous generated files).
+const MAX_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub file_path: String,
+    pub language: String,
+    pub chunk_type: String,
+    pub symbol_name: Option<String>,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+}
+
+/// Walk `root` recursively and collect all chunks for `file_path`.
+pub fn chunk_file(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
+    if source.len() > MAX_FILE_BYTES {
+        return Vec::new();
+    }
+    // Detect binary content by scanning the first 512 bytes for null bytes.
+    if source.as_bytes().iter().take(512).any(|&b| b == 0) {
+        return Vec::new();
+    }
+
+    if super::language::has_grammar(language) {
+        if let Some(chunks) = try_treesitter(file_path, source, language) {
+            if !chunks.is_empty() {
+                return chunks;
+            }
+        }
+    }
+    // Fallback: text files and languages without a grammar get windowed chunking.
+    window_chunks(file_path, source, language)
+}
+
+fn ts_language(lang: &str) -> Option<Language> {
+    match lang {
+        "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "typescript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        _ => None,
+    }
+}
+
+fn try_treesitter(file_path: &str, source: &str, language: &str) -> Option<Vec<Chunk>> {
+    let ts_lang = ts_language(language)?;
+    let mut parser = Parser::new();
+    parser.set_language(&ts_lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut chunks = Vec::new();
+    collect_items(&root, bytes, file_path, source, language, &mut chunks);
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks)
+    }
+}
+
+/// Recursively collect interesting nodes. We walk the full tree (not just top-level children) so
+/// that methods inside `impl` blocks, nested functions, and inner classes are captured.
+fn collect_items(
+    node: &Node<'_>,
+    bytes: &[u8],
+    file_path: &str,
+    source: &str,
+    language: &str,
+    out: &mut Vec<Chunk>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some((chunk_type, symbol_name)) = interesting_node(&child, bytes) {
+            let start_line = child.start_position().row as i32;
+            let end_line = child.end_position().row as i32;
+            let span = (end_line - start_line) as usize;
+
+            let content = &source[child.byte_range()];
+
+            if span <= MAX_CHUNK_LINES {
+                out.push(Chunk {
+                    file_path: file_path.to_string(),
+                    language: language.to_string(),
+                    chunk_type: chunk_type.to_string(),
+                    symbol_name,
+                    start_line,
+                    end_line,
+                    content: content.to_string(),
+                });
+            } else {
+                // Large node: recurse into its children instead of emitting the whole node as one
+                // chunk. This handles big `impl` blocks by extracting each method separately.
+                collect_items(&child, bytes, file_path, source, language, out);
+            }
+        } else {
+            // Not an interesting node itself — still descend to find nested interesting nodes.
+            collect_items(&child, bytes, file_path, source, language, out);
+        }
+    }
+}
+
+/// Returns `(chunk_type, symbol_name)` for nodes we want to index; `None` for everything else.
+fn interesting_node(node: &Node<'_>, bytes: &[u8]) -> Option<(&'static str, Option<String>)> {
+    let (kind, name_field) = match node.kind() {
+        // Rust
+        "function_item" => ("function", Some("name")),
+        "impl_item" => ("impl", None),
+        "struct_item" => ("struct", Some("name")),
+        "enum_item" => ("enum", Some("name")),
+        "trait_item" => ("trait", Some("name")),
+        "mod_item" => ("module", Some("name")),
+        "type_alias" => ("type", Some("name")),
+        // TypeScript / JavaScript
+        "function_declaration" => ("function", Some("name")),
+        "function_expression" => ("function", None),
+        "arrow_function" => ("function", None),
+        "class_declaration" => ("class", Some("name")),
+        "class_expression" => ("class", Some("name")),
+        "method_definition" => ("method", Some("name")),
+        "variable_declarator" => return None, // too noisy at top level
+        // Python
+        "function_definition" => ("function", Some("name")),
+        "class_definition" => ("class", Some("name")),
+        "decorated_definition" => ("function", None), // decorator + def/class
+        _ => return None,
+    };
+
+    let symbol_name = name_field.and_then(|field| {
+        node.child_by_field_name(field).and_then(|n| {
+            std::str::from_utf8(&bytes[n.byte_range()])
+                .ok()
+                .map(str::to_string)
+        })
+    });
+
+    Some((kind, symbol_name))
+}
+
+/// Fixed-size line windows with overlap — the fallback for text / unsupported languages.
+fn window_chunks(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() {
+        let end = (start + WINDOW_SIZE).min(lines.len());
+        let content = lines[start..end].join("\n");
+        chunks.push(Chunk {
+            file_path: file_path.to_string(),
+            language: language.to_string(),
+            chunk_type: "window".to_string(),
+            symbol_name: None,
+            start_line: start as i32,
+            end_line: (end - 1) as i32,
+            content,
+        });
+        if end == lines.len() {
+            break;
+        }
+        start += WINDOW_STEP;
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_function_is_extracted_as_one_chunk() {
+        let src = r#"fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn sub(a: i32, b: i32) -> i32 { a - b }
+"#;
+        let chunks = chunk_file("src/math.rs", src, "rust");
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
+        let add = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("add"));
+        assert!(add.is_some(), "should extract fn add");
+        assert_eq!(add.unwrap().chunk_type, "function");
+    }
+
+    #[test]
+    fn binary_content_is_skipped() {
+        let src = "hello\x00world";
+        let chunks = chunk_file("image.png", src, "text");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn text_file_falls_back_to_windows() {
+        let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+        let src = lines.join("\n");
+        let chunks = chunk_file("README.md", &src, "text");
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|c| c.chunk_type == "window"));
+    }
+
+    #[test]
+    fn window_chunk_covers_full_file_when_short() {
+        let src = "one\ntwo\nthree\n";
+        let chunks = window_chunks("f.txt", src, "text");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_line, 0);
+    }
+}

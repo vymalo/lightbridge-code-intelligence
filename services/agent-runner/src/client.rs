@@ -36,6 +36,27 @@ impl TaskContext {
     }
 }
 
+/// One code chunk to submit to the control plane (mirrors `internal.rs::ChunkInput`).
+#[derive(Debug, Serialize)]
+pub struct ChunkPayload {
+    pub file_path: String,
+    pub language: String,
+    pub chunk_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_name: Option<String>,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Body for `POST /internal/tasks/{id}/chunks`.
+#[derive(Debug, Serialize)]
+pub struct ChunkBatch {
+    pub commit_sha: String,
+    pub chunks: Vec<ChunkPayload>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusUpdate<'a> {
     status: &'a str,
@@ -76,6 +97,22 @@ impl ControlPlaneClient {
             .await
             .context("parsing task context")?;
         Ok(context)
+    }
+
+    /// `POST /internal/tasks/{id}/chunks` — submit a batch of indexed code chunks.
+    pub async fn submit_chunks(&self, task_id: Uuid, batch: ChunkBatch) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/chunks", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&batch)
+            .send()
+            .await
+            .context("submitting chunks")?
+            .error_for_status()
+            .context("control plane rejected chunk batch")?;
+        Ok(())
     }
 
     /// `POST /internal/tasks/{id}/status` — report a status transition (best-effort `detail`).

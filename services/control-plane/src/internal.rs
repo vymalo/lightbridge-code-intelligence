@@ -143,6 +143,89 @@ pub async fn get_context(
     .into_response()
 }
 
+/// One chunk submitted by the indexer runner.
+#[derive(Debug, Deserialize)]
+pub struct ChunkInput {
+    pub file_path: String,
+    pub language: String,
+    pub chunk_type: String,
+    pub symbol_name: Option<String>,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Body for `POST /internal/tasks/{id}/chunks`.
+#[derive(Debug, Deserialize)]
+pub struct ChunkBatch {
+    pub commit_sha: String,
+    pub chunks: Vec<ChunkInput>,
+}
+
+/// `POST /internal/tasks/{id}/chunks` — ingest indexed code chunks from the runner.
+///
+/// The runner submits chunks in batches as it processes files; the control plane writes them to
+/// `code_chunks` (pgvector). The task's `repository_id` is read from the DB — the runner cannot
+/// supply it (trust boundary, ADR-0002).
+pub async fn ingest_chunks(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(batch): Json<ChunkBatch>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+
+    let repository_id: Option<i64> =
+        match sqlx::query_scalar("SELECT repository_id FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, task_id = %id, "load task for chunk ingest failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+            }
+        };
+
+    let Some(repository_id) = repository_id else {
+        return (StatusCode::NOT_FOUND, "task not found").into_response();
+    };
+
+    if batch.chunks.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let chunks: Vec<crate::db::CodeChunk> = batch
+        .chunks
+        .into_iter()
+        .map(|c| crate::db::CodeChunk {
+            file_path: c.file_path,
+            language: c.language,
+            chunk_type: c.chunk_type,
+            symbol_name: c.symbol_name,
+            start_line: c.start_line,
+            end_line: c.end_line,
+            content: c.content,
+            embedding: c.embedding,
+        })
+        .collect();
+
+    match crate::db::upsert_code_chunks(pool, repository_id, &batch.commit_sha, &chunks).await {
+        Ok(count) => {
+            tracing::info!(task_id = %id, chunk_count = count, "chunks ingested");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "chunk upsert failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "upsert error").into_response()
+        }
+    }
+}
+
 /// The runner's status report. `detail` is optional free text for diagnostics (not persisted yet).
 #[derive(Debug, Deserialize)]
 pub struct StatusUpdate {

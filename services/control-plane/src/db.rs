@@ -359,6 +359,73 @@ pub async fn set_task_status(pool: &PgPool, id: Uuid, status: &str) -> Result<bo
     Ok(result.rows_affected() > 0)
 }
 
+/// A semantic chunk submitted by the indexer runner (epic #5, slice 2).
+pub struct CodeChunk {
+    pub file_path: String,
+    pub language: String,
+    pub chunk_type: String,
+    pub symbol_name: Option<String>,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+    /// 1536-dimensional embedding vector (text-embedding-3-small; see ADR-0018).
+    pub embedding: Vec<f32>,
+}
+
+/// Upsert a batch of code chunks for a repository snapshot. The embedding is passed as a Postgres
+/// vector literal so no extra crate is needed; `$N::vector` casts the text on the server side.
+/// Runs in a single transaction; returns the number of rows inserted or updated.
+pub async fn upsert_code_chunks(
+    pool: &PgPool,
+    repository_id: i64,
+    commit_sha: &str,
+    chunks: &[CodeChunk],
+) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let mut tx = pool.begin().await.context("begin upsert transaction")?;
+    let mut count = 0usize;
+    for chunk in chunks {
+        let emb = format!(
+            "[{}]",
+            chunk
+                .embedding
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        sqlx::query(
+            "INSERT INTO code_chunks \
+             (repository_id, commit_sha, file_path, language, chunk_type, symbol_name, \
+              start_line, end_line, content, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector) \
+             ON CONFLICT (repository_id, commit_sha, file_path, start_line, end_line) \
+             DO UPDATE SET \
+               language    = EXCLUDED.language, \
+               chunk_type  = EXCLUDED.chunk_type, \
+               symbol_name = EXCLUDED.symbol_name, \
+               content     = EXCLUDED.content, \
+               embedding   = EXCLUDED.embedding",
+        )
+        .bind(repository_id)
+        .bind(commit_sha)
+        .bind(&chunk.file_path)
+        .bind(&chunk.language)
+        .bind(&chunk.chunk_type)
+        .bind(&chunk.symbol_name)
+        .bind(chunk.start_line)
+        .bind(chunk.end_line)
+        .bind(&chunk.content)
+        .bind(&emb)
+        .execute(&mut *tx)
+        .await
+        .context("upsert code_chunks row")?;
+        count += 1;
+    }
+    tx.commit().await.context("commit upsert transaction")?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

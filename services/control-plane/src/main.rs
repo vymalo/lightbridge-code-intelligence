@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::extract::{MatchedPath, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -140,6 +140,12 @@ fn app(state: AppState) -> Router {
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
         .route("/internal/tasks/{id}/status", post(internal::set_status))
+        // Chunk batches can be large: 32 chunks × 1536-dim embeddings as JSON ~600 KB plus
+        // content. Raise the body limit to 16 MiB on this route only.
+        .route(
+            "/internal/tasks/{id}/chunks",
+            post(internal::ingest_chunks).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }

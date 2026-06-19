@@ -67,6 +67,43 @@ async fn report_status_posts_the_status_with_bearer() {
 }
 
 #[tokio::test]
+async fn submit_chunks_posts_batch_with_bearer() {
+    use agent_runner::client::{ChunkBatch, ChunkPayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/chunks")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .submit_chunks(
+            task_id,
+            ChunkBatch {
+                commit_sha: "abc123".to_string(),
+                chunks: vec![ChunkPayload {
+                    file_path: "src/main.rs".to_string(),
+                    language: "rust".to_string(),
+                    chunk_type: "function".to_string(),
+                    symbol_name: Some("main".to_string()),
+                    start_line: 0,
+                    end_line: 5,
+                    content: "fn main() {}".to_string(),
+                    embedding: vec![0.0; 4],
+                }],
+            },
+        )
+        .await
+        .expect("chunks submitted");
+}
+
+#[tokio::test]
 async fn get_context_errors_on_non_2xx() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
