@@ -34,3 +34,5 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0012](0012-rfc-process-alongside-adrs.md) | RFC process alongside ADRs | Accepted |
 | [0013](0013-local-dev-and-build-tooling.md) | Local dev & build tooling (just, xtask, compose, nextest, wiremock) | Accepted |
 | [0014](0014-keycloak-oidc-resource-server.md) | Keycloak OIDC — web client + resource server | Accepted |
+| [0015](0015-web-console-design-language.md) | Web console design language & component system (shadcn/ui) | Accepted |
+| [0016](0016-dashboard-information-architecture.md) | Dashboard information architecture & task-run views | Accepted |
