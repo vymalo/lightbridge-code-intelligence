@@ -64,6 +64,12 @@ impl EmbeddingsClient {
             .context("parsing embeddings response")?
             .data;
         data.sort_by_key(|d| d.index);
+        anyhow::ensure!(
+            data.len() == texts.len(),
+            "embeddings API returned {} vectors for {} inputs",
+            data.len(),
+            texts.len()
+        );
         Ok(data.into_iter().map(|d| d.embedding).collect())
     }
 }

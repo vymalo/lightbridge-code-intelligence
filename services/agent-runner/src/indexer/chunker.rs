@@ -59,10 +59,10 @@ fn try_treesitter(file_path: &str, source: &str, language: &str) -> Option<Vec<C
     let mut parser = Parser::new();
     parser.set_language(&ts_lang).ok()?;
     let tree = parser.parse(source, None)?;
+    // Don't bail on `root.has_error()`: tree-sitter is error-tolerant and successfully parses
+    // most of a file even with localised syntax errors. Returning None here would silently
+    // fall back to windowed chunking for an entire file with one bad expression.
     let root = tree.root_node();
-    if root.has_error() {
-        return None;
-    }
 
     let bytes = source.as_bytes();
     let mut chunks = Vec::new();

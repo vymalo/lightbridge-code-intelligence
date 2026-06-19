@@ -114,8 +114,19 @@ async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
 
                 if ft.is_dir() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    // Skip well-known non-code directories.
-                    if matches!(name, ".git" | "node_modules" | "target" | ".next" | "dist") {
+                    // Skip well-known non-code directories (including Python venvs and build dirs).
+                    if matches!(
+                        name,
+                        ".git"
+                            | "node_modules"
+                            | "target"
+                            | ".next"
+                            | "dist"
+                            | ".venv"
+                            | "venv"
+                            | "__pycache__"
+                            | "build"
+                    ) {
                         continue;
                     }
                     stack.push(path);
@@ -130,11 +141,12 @@ async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
                     continue;
                 };
 
+                // Use forward slashes regardless of OS so DB paths are platform-consistent.
                 let rel_path = path
                     .strip_prefix(&root)
                     .unwrap_or(&path)
                     .to_string_lossy()
-                    .to_string();
+                    .replace('\\', "/");
 
                 let source = match std::fs::read_to_string(&path) {
                     Ok(s) => s,

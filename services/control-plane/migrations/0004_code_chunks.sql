@@ -7,7 +7,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- new migration and full re-indexing.
 CREATE TABLE IF NOT EXISTS code_chunks (
     id            BIGSERIAL PRIMARY KEY,
-    repository_id BIGINT  NOT NULL REFERENCES repositories (id),
+    repository_id BIGINT  NOT NULL REFERENCES repositories (id) ON DELETE CASCADE,
     commit_sha    TEXT    NOT NULL,
     file_path     TEXT    NOT NULL,
     language      TEXT    NOT NULL,

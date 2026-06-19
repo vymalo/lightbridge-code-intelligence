@@ -385,15 +385,18 @@ pub async fn upsert_code_chunks(
     let mut tx = pool.begin().await.context("begin upsert transaction")?;
     let mut count = 0usize;
     for chunk in chunks {
-        let emb = format!(
-            "[{}]",
-            chunk
-                .embedding
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        // Build `[f0,f1,...,fn]` in a single pre-allocated buffer rather than collecting
+        // 1536 individual String allocations then joining (saves ~100 KB per chunk round-trip).
+        let mut emb = String::with_capacity(chunk.embedding.len() * 12 + 2);
+        emb.push('[');
+        for (i, f) in chunk.embedding.iter().enumerate() {
+            if i > 0 {
+                emb.push(',');
+            }
+            use std::fmt::Write as _;
+            let _ = write!(emb, "{f}");
+        }
+        emb.push(']');
         sqlx::query(
             "INSERT INTO code_chunks \
              (repository_id, commit_sha, file_path, language, chunk_type, symbol_name, \
