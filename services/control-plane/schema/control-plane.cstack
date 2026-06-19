@@ -77,6 +77,8 @@ model Task {
   status             String
   priority           Int            @default(100)
   created_at         DateTime       @default(dbgenerated())
+  started_at         DateTime?      # run timing for the dashboard task-run views (ADR-0016)
+  completed_at       DateTime?
 
   @@index([repository_id, status])
 }
