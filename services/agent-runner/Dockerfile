@@ -41,8 +41,15 @@ RUN pip install --no-cache-dir "graphifyy==0.8.44" \
 # ── Stage 3: runtime ────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim-bookworm AS runtime
 # git: clone the target repo (src/clone.rs). ca-certificates: TLS to control plane + GitHub.
+# OpenCode (slice 5, ADR-0021): the review agent the runner spawns — a standalone binary from the
+# official installer (curl/bash/unzip are build-only). Pinned for reproducibility.
+ARG OPENCODE_VERSION=1.17.3
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates git \
+  && apt-get install -y --no-install-recommends ca-certificates git curl bash unzip \
+  && HOME=/opt/opencode bash -c "curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION}" \
+  && ln -s /opt/opencode/.opencode/bin/opencode /usr/local/bin/opencode \
+  && opencode --version \
+  && apt-get purge -y --auto-remove curl unzip \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 1000 --create-home --user-group app \
   && mkdir -p /workspace && chown 1000:1000 /workspace

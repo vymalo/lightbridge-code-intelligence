@@ -40,3 +40,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0018](0018-openai-compatible-embeddings.md) | OpenAI-compatible API for all embeddings (eaig/core-gateway; no bundled model) | Accepted |
 | [0019](0019-graphify-cli-structural-graph.md) | Graphify (bundled CLI) extracts the structural graph; control plane writes Neo4j | Accepted |
 | [0020](0020-mcp-servers-via-control-plane.md) | MCP servers are thin clients of the control-plane retrieval API (no datastore creds in the Job) | Accepted |
+| [0021](0021-opencode-headless-review-agent.md) | OpenCode (headless `run`) is the review agent; generated opencode.json wires eaig + MCP | Accepted |
