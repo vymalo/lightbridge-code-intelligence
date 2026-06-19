@@ -80,8 +80,23 @@ model Task {
   started_at         DateTime?      # run timing for the dashboard task-run views (ADR-0016)
   completed_at       DateTime?
 
+  # --- Work-queue fields (RFC-0001 Phase 1): the dispatcher claims `queued` rows via
+  # SELECT ... FOR UPDATE SKIP LOCKED, takes a short lease, and records the launched Job.
+  attempts           Int            @default(0)
+  run_after          DateTime       @default(dbgenerated())  # delay / backoff before next claim
+  run_epoch          Int            @default(0)              # re-run discriminator for idempotency
+  lease_owner        String?
+  lease_expires_at   DateTime?
+  job_name           String?
+
+  # Idempotent enqueue: at most one task per target + head SHA per run epoch. The SQL index is
+  # NULLS NOT DISTINCT (Postgres 15+) so a null head_sha is still deduped — cstack cannot express
+  # that property, so the migration is authoritative for it.
+  @@unique([repository_id, target_type, target_id, command_text, head_sha, run_epoch])
   @@index([repository_id, status])
   @@index([github_delivery_id])
+  # Dequeue index; the SQL form is partial (WHERE status = 'queued'), which cstack cannot express.
+  @@index([priority, created_at])
 }
 
 # --- Procedure inputs / outputs (become typed client + server payloads) ---

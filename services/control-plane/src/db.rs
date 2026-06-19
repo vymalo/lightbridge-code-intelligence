@@ -4,12 +4,18 @@
 //! pool is optional: absent `DATABASE_URL` the control plane runs in a degraded, in-memory mode
 //! (dev) and readiness reports it.
 
+use std::time::Duration;
+
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// Postgres `LISTEN`/`NOTIFY` channel the dispatcher waits on; `create_task` notifies it on enqueue
+/// so a dispatcher reacts immediately instead of waiting for its poll fallback.
+pub const TASK_QUEUED_CHANNEL: &str = "task_queued";
 
 /// Connect to `DATABASE_URL` and run migrations. Returns `Ok(None)` when the URL is unset (dev).
 /// **Fails fast** (`Err`) when the URL is set but the database is unreachable or migrations fail —
@@ -96,7 +102,7 @@ const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_nam
      r.default_branch AS repo_default_branch \
      FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
 
-/// Fields needed to create a task from a webhook event (status starts at `received`).
+/// Fields needed to create a task from a webhook event.
 pub struct NewTask {
     pub repository_id: i64,
     pub installation_id: i64,
@@ -106,6 +112,20 @@ pub struct NewTask {
     pub command_text: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+}
+
+/// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ClaimedTask {
+    pub id: Uuid,
+    pub repository_id: i64,
+    pub installation_id: i64,
+    pub target_type: String,
+    pub target_id: i64,
+    pub command_text: String,
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+    pub attempts: i32,
 }
 
 /// Insert or update a repository by its GitHub id; returns the local `repositories.id`.
@@ -131,13 +151,19 @@ pub async fn upsert_repository(
     .await
 }
 
-/// Create a task; returns its generated id.
-pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Error> {
+/// Enqueue a task idempotently. Returns the new task id, or `None` when an equivalent task already
+/// exists — GitHub can deliver several events for one PR head (e.g. `opened` then `synchronize`),
+/// and the `tasks_idempotency_idx` unique index collapses those to a single `queued` task. On a real
+/// insert, notifies [`TASK_QUEUED_CHANNEL`] so a listening dispatcher reacts immediately.
+pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    sqlx::query(
+    let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'received')",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued') \
+         ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
+         DO NOTHING \
+         RETURNING id",
     )
     .bind(id)
     .bind(task.repository_id)
@@ -148,9 +174,72 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Er
     .bind(&task.command_text)
     .bind(&task.base_sha)
     .bind(&task.head_sha)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(id)
+
+    if let Some(new_id) = inserted {
+        // Wake a listening dispatcher; harmless if none is connected (the dispatcher also polls).
+        let _ = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(TASK_QUEUED_CHANNEL)
+            .bind(new_id.to_string())
+            .execute(pool)
+            .await;
+    }
+    Ok(inserted)
+}
+
+/// Atomically claim the next due `queued` task and take a short dispatch lease. `FOR UPDATE SKIP
+/// LOCKED` guarantees that concurrent dispatcher replicas never claim the same row. Returns `None`
+/// when nothing is due. (Lease expiry is reaped by the scheduler in RFC-0001 Phase 2.)
+pub async fn claim_next_task(
+    pool: &PgPool,
+    owner: &str,
+    lease: Duration,
+) -> Result<Option<ClaimedTask>, sqlx::Error> {
+    sqlx::query_as::<_, ClaimedTask>(
+        "UPDATE tasks \
+         SET status = 'running', attempts = attempts + 1, started_at = now(), \
+             lease_owner = $1, lease_expires_at = now() + ($2 * interval '1 second') \
+         WHERE id = ( \
+           SELECT id FROM tasks \
+           WHERE status = 'queued' AND run_after <= now() \
+           ORDER BY priority DESC, created_at \
+           FOR UPDATE SKIP LOCKED \
+           LIMIT 1 \
+         ) \
+         RETURNING id, repository_id, installation_id, target_type, target_id, command_text, \
+                   base_sha, head_sha, attempts",
+    )
+    .bind(owner)
+    .bind(lease.as_secs_f64())
+    .fetch_optional(pool)
+    .await
+}
+
+/// Record the Kubernetes Job created for a dispatched task.
+pub async fn set_task_job(pool: &PgPool, id: Uuid, job_name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tasks SET job_name = $2 WHERE id = $1")
+        .bind(id)
+        .bind(job_name)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Return a claimed task to the queue with a backoff delay (e.g. Job creation failed). Clears the
+/// lease so another dispatcher can pick it up after `run_after`.
+pub async fn release_task(pool: &PgPool, id: Uuid, backoff: Duration) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE tasks \
+         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, \
+             run_after = now() + ($2 * interval '1 second') \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(backoff.as_secs_f64())
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Most recent tasks first (the dashboard run list).
@@ -209,5 +298,107 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1, "the replayed delivery is stored exactly once");
+    }
+
+    /// Seed the FK rows a task needs (one repository + one delivery); returns the repository id.
+    async fn seed(pool: &PgPool) -> i64 {
+        let repo_id = upsert_repository(pool, 1, "octo", "repo", "main")
+            .await
+            .unwrap();
+        record_delivery(pool, "d1", "pull_request", &json!({}))
+            .await
+            .unwrap();
+        repo_id
+    }
+
+    fn pr_task(repository_id: i64, head: &str) -> NewTask {
+        NewTask {
+            repository_id,
+            installation_id: 99,
+            github_delivery_id: "d1".to_string(),
+            target_type: "pull_request".to_string(),
+            target_id: 7,
+            command_text: "review".to_string(),
+            base_sha: Some("base".to_string()),
+            head_sha: Some(head.to_string()),
+        }
+    }
+
+    /// Task creation is idempotent on (repo, target, command, head SHA): a second `pull_request`
+    /// event for the same head (e.g. `opened` then `synchronize`) does not create a duplicate task,
+    /// but a new head SHA does.
+    #[sqlx::test]
+    async fn create_task_is_idempotent_on_target_and_head(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        let first = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap();
+        assert!(first.is_some(), "first task is created");
+
+        let dup = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap();
+        assert!(dup.is_none(), "equivalent task is deduped");
+
+        let new_head = create_task(&pool, &pr_task(repo_id, "head2"))
+            .await
+            .unwrap();
+        assert!(new_head.is_some(), "a new head SHA is a new task");
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// The dispatcher claim takes exactly one queued task and leaves none for the next claim — the
+    /// `SKIP LOCKED` guard that lets dispatcher replicas run concurrently without double-claiming.
+    #[sqlx::test]
+    async fn claim_next_task_takes_one_queued_task(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let claimed = claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let claimed = claimed.expect("a queued task is claimed");
+        assert_eq!(claimed.attempts, 1, "claim increments attempts");
+        assert_eq!(claimed.command_text, "review");
+
+        let none = claim_next_task(&pool, "owner-b", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(none.is_none(), "the claimed task is no longer queued");
+    }
+
+    /// A released task returns to the queue and can be claimed again (Job-launch failure path).
+    #[sqlx::test]
+    async fn release_task_requeues_for_another_claim(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first = claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        // Zero backoff so it is immediately due again.
+        release_task(&pool, first.id, Duration::from_secs(0))
+            .await
+            .unwrap();
+
+        let second = claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("released task is claimable again");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.attempts, 2, "the re-claim counts as another attempt");
     }
 }

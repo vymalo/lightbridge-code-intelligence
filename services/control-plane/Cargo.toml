@@ -35,6 +35,13 @@ sqlx = { version = "0.8", default-features = false, features = [
     "macros",
     "migrate",
 ] }
+# Dispatcher role: create one Kubernetes Job per task (ADR-0004). rustls to match the rest of the
+# crate (no OpenSSL).
+kube = { version = "0.99", default-features = false, features = [
+    "client",
+    "rustls-tls",
+] }
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
 
 [dev-dependencies]
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
