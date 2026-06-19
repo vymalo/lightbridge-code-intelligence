@@ -40,3 +40,17 @@ pub async fn get(_claims: Claims, State(state): State<AppState>, Path(id): Path<
         }
     }
 }
+
+/// `GET /repositories` — connected repositories + their run activity (the Repositories view).
+pub async fn list_repositories(_claims: Claims, State(state): State<AppState>) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::list_repositories(pool).await {
+        Ok(repos) => Json(repos).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "list repositories failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}

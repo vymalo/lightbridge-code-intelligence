@@ -3,6 +3,7 @@ import { RunRow } from "@/components/run-row";
 import { ApiErrorLine, EmptyState } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { listTasks } from "@/lib/api";
+import { githubAppInstallUrl } from "@/lib/config";
 import { type StatusVariant, statusVisual } from "@/lib/tasks";
 
 // Task state changes server-side; always render fresh.
@@ -38,7 +39,7 @@ export default async function Overview() {
           action={
             <a
               className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
-              href="https://github.com/apps"
+              href={githubAppInstallUrl()}
               target="_blank"
               rel="noreferrer"
             >

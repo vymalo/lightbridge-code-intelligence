@@ -118,6 +118,7 @@ fn app(state: AppState) -> Router {
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
+        .route("/repositories", get(tasks::list_repositories))
         .with_state(state)
 }
 

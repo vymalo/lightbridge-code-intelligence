@@ -260,6 +260,36 @@ pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::
         .await
 }
 
+/// A connected repository for the dashboard's Repositories view (ADR-0016), with a small activity
+/// summary (run count + most-recent run) derived from `tasks`. RepoIndex health is not joined yet —
+/// the indexer that populates `repo_index` is a later step in the Code product epic.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct RepositoryRow {
+    pub id: i64,
+    pub github_repo_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub default_branch: String,
+    pub active: bool,
+    pub task_count: i64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_task_at: Option<OffsetDateTime>,
+}
+
+/// All connected repositories, most-recently-active first. Aggregates each repo's task activity in
+/// one query so the Repositories list needs no per-row round-trip.
+pub async fn list_repositories(pool: &PgPool) -> Result<Vec<RepositoryRow>, sqlx::Error> {
+    sqlx::query_as::<_, RepositoryRow>(
+        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.active, \
+           COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
+         FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
+         GROUP BY r.id \
+         ORDER BY last_task_at DESC NULLS LAST, r.owner, r.name",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +439,53 @@ mod tests {
             .expect("released task is claimable again");
         assert_eq!(second.id, first.id);
         assert_eq!(second.attempts, 2, "the re-claim counts as another attempt");
+    }
+
+    /// `list_repositories` aggregates run activity (it's runtime SQL, so this is the only place the
+    /// GROUP BY/JOIN is exercised): a repo with two tasks reports `task_count = 2`, an idle repo
+    /// reports `0` with a null `last_task_at`, and the active repo sorts first.
+    #[sqlx::test]
+    async fn list_repositories_summarises_activity(pool: PgPool) {
+        let active = upsert_repository(&pool, 1, "vymalo", "shop", "main")
+            .await
+            .unwrap();
+        let idle = upsert_repository(&pool, 2, "vymalo", "idle", "trunk")
+            .await
+            .unwrap();
+
+        for (n, delivery) in ["d-1", "d-2"].iter().enumerate() {
+            // tasks.github_delivery_id FKs github_deliveries — record the delivery first, exactly as
+            // the webhook handler does before creating a task.
+            record_delivery(&pool, delivery, "pull_request", &json!({}))
+                .await
+                .unwrap();
+            create_task(
+                &pool,
+                &NewTask {
+                    repository_id: active,
+                    installation_id: 7,
+                    github_delivery_id: (*delivery).to_string(),
+                    target_type: "pull_request".to_string(),
+                    target_id: n as i64,
+                    command_text: "review".to_string(),
+                    base_sha: None,
+                    head_sha: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let repos = list_repositories(&pool).await.unwrap();
+        assert_eq!(repos.len(), 2);
+
+        // Active repo (has tasks) sorts first by last_task_at.
+        assert_eq!(repos[0].id, active);
+        assert_eq!(repos[0].task_count, 2);
+        assert!(repos[0].last_task_at.is_some());
+
+        let idle_row = repos.iter().find(|r| r.id == idle).unwrap();
+        assert_eq!(idle_row.task_count, 0);
+        assert!(idle_row.last_task_at.is_none());
     }
 }
