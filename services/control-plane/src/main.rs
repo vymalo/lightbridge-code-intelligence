@@ -167,6 +167,13 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/graph",
             post(internal::ingest_graph).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+        // Retrieval for the MCP servers (slice 4): semantic search (pgvector) + structural queries
+        // (Neo4j), each scoped server-side to the task's repo snapshot.
+        .route("/internal/tasks/{id}/search", post(internal::search))
+        .route(
+            "/internal/tasks/{id}/graph/query",
+            post(internal::graph_query),
+        )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }
