@@ -62,16 +62,22 @@ async fn drain<L: TaskLauncher>(pool: &PgPool, launcher: &L, owner: &str) {
 /// Launch a claimed task's Job and record it; on failure, requeue with backoff so the work is not
 /// lost (the claim already moved it out of `queued`).
 async fn dispatch<L: TaskLauncher>(pool: &PgPool, launcher: &L, task: &db::ClaimedTask) {
+    let started = std::time::Instant::now();
     match launcher.launch(task).await {
-        Ok(job_name) => match db::set_task_job(pool, task.id, &job_name).await {
-            Ok(()) => tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job"),
-            Err(error) => {
-                // The Job exists but we couldn't record its name; surface it for follow-up rather
-                // than launching a second Job.
-                tracing::error!(%error, task_id = %task.id, job_name, "failed to record job name")
+        Ok(job_name) => {
+            crate::metrics::dispatch_outcome("launched");
+            crate::metrics::dispatch_claim_seconds(started.elapsed().as_secs_f64());
+            match db::set_task_job(pool, task.id, &job_name).await {
+                Ok(()) => tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job"),
+                Err(error) => {
+                    // The Job exists but we couldn't record its name; surface it for follow-up
+                    // rather than launching a second Job.
+                    tracing::error!(%error, task_id = %task.id, job_name, "failed to record job name")
+                }
             }
-        },
+        }
         Err(error) => {
+            crate::metrics::dispatch_outcome("failed");
             tracing::error!(%error, task_id = %task.id, "failed to launch job; requeueing");
             if let Err(release_error) = db::release_task(pool, task.id, LAUNCH_BACKOFF).await {
                 tracing::error!(%release_error, task_id = %task.id, "failed to requeue task");

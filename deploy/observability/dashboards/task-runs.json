@@ -1,0 +1,163 @@
+{
+  "annotations": {},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT t.created_at AS \"created\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_type AS \"target\", t.target_id AS \"number\", t.command_text AS \"command\", t.status, t.attempts, t.head_sha, t.started_at, t.completed_at, t.job_name, t.id FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${status}' = 'All' OR t.status = '${status}') AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') ORDER BY t.created_at DESC LIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "title": "Task runs",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": false,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "${stream} | json | task_id = `${task_id}`",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Logs for $task_id",
+      "transformations": [],
+      "transparent": false,
+      "type": "logs"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": [
+    "lightbridge",
+    "generated"
+  ],
+  "templating": {
+    "list": [
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Status",
+        "multi": false,
+        "name": "status",
+        "query": "All,queued,running,succeeded,failed,timed_out,cancelled",
+        "skipUrlSync": false,
+        "type": "custom"
+      },
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "${DS_POSTGRES}"
+        },
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Repository",
+        "multi": false,
+        "name": "repo",
+        "query": "SELECT 'All' AS __text, '' AS __value UNION ALL SELECT owner || '/' || name, owner || '/' || name FROM repositories ORDER BY 1",
+        "skipUrlSync": false,
+        "type": "query"
+      },
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Task ID (for logs)",
+        "multi": false,
+        "name": "task_id",
+        "query": "",
+        "skipUrlSync": false,
+        "type": "textbox"
+      },
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Loki stream",
+        "multi": false,
+        "name": "stream",
+        "query": "{app=~\"lightbridge.*\"}",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Lightbridge \u2014 Task Runs",
+  "uid": "lci-task-runs"
+}

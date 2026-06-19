@@ -1,0 +1,36 @@
+{{- if .Values.postgresDatasource.create }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: {{ .Values.postgresDatasource.name }}
+  labels:
+    app.kubernetes.io/name: lightbridge
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  instanceSelector:
+    matchLabels:
+      {{- range $k, $v := .Values.instanceSelector.matchLabels }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
+  # The read-only password is injected from a Secret, never stored in the chart.
+  valuesFrom:
+    - targetPath: secureJsonData.password
+      valueFrom:
+        secretKeyRef:
+          name: {{ .Values.postgresDatasource.passwordSecret.name | quote }}
+          key: {{ .Values.postgresDatasource.passwordSecret.key | quote }}
+  datasource:
+    name: {{ .Values.postgresDatasource.name | quote }}
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: {{ .Values.postgresDatasource.host | quote }}
+    user: {{ .Values.postgresDatasource.user | quote }}
+    isDefault: false
+    jsonData:
+      database: {{ .Values.postgresDatasource.database | quote }}
+      sslmode: {{ .Values.postgresDatasource.sslmode | quote }}
+      postgresVersion: {{ .Values.postgresDatasource.postgresVersion }}
+    secureJsonData:
+      password: "${PASSWORD}"
+{{- end }}

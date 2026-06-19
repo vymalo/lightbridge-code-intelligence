@@ -1,0 +1,93 @@
+{
+  "annotations": {},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT r.owner || '/' || r.name AS \"repository\", r.default_branch AS \"branch\", r.active, count(t.id) AS \"tasks\", count(t.id) FILTER (WHERE t.status = 'failed') AS \"failed\", count(t.id) FILTER (WHERE t.status IN ('queued', 'running')) AS \"in_flight\", max(t.created_at) AS \"last_task\" FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id GROUP BY r.id, r.owner, r.name, r.default_branch, r.active ORDER BY count(t.id) DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Repositories",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT r.owner || '/' || r.name AS \"repository\", ri.branch, ri.status, ri.commit_sha, ri.started_at, ri.completed_at FROM repo_index ri JOIN repositories r ON r.id = ri.repository_id ORDER BY ri.completed_at DESC NULLS LAST LIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "title": "Index status",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": [
+    "lightbridge",
+    "generated"
+  ],
+  "templating": {},
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Lightbridge \u2014 Repositories",
+  "uid": "lci-repositories"
+}

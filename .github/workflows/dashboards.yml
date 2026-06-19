@@ -1,0 +1,50 @@
+name: dashboards
+
+# Verify the committed Grafana dashboards are in sync with the generator, and that the
+# observability Helm chart renders. Dashboards are generated artifacts (tools/dashboard-gen) — a
+# stale deploy/observability/dashboards/ fails this check.
+
+on:
+  pull_request:
+    paths:
+      - "tools/dashboard-gen/**"
+      - "deploy/observability/**"
+      - ".github/workflows/dashboards.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/dashboard-gen/**"
+      - "deploy/observability/**"
+
+permissions:
+  contents: read
+
+jobs:
+  generate-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install generator
+        run: pip install -r tools/dashboard-gen/requirements.txt
+      - name: Regenerate dashboards
+        working-directory: tools/dashboard-gen
+        run: python generate.py
+      - name: Fail if dashboards are out of date
+        run: |
+          if ! git diff --exit-code -- deploy/observability/dashboards; then
+            echo "::error::Dashboards are stale. Run 'python tools/dashboard-gen/generate.py' and commit the result."
+            exit 1
+          fi
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint chart
+        run: helm lint deploy/observability
+      - name: Render chart
+        run: helm template lci-obs deploy/observability > /dev/null
