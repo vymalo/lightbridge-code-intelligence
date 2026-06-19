@@ -9,15 +9,19 @@ short-lived Kubernetes Job. The work is backed by **repository-aware retrieval**
 complementary indexes — a Neo4j knowledge graph (structure) and pgvector (semantics) — with
 reasoning performed by OpenCode agents over ACP/MCP.
 
-The Rust control plane is the **trust boundary**: it owns all secrets, the agent only proposes, and
-the control plane validates results before any write-back to GitHub.
+The Rust control plane is the **trust boundary**: it holds the GitHub App private key and mints
+short-lived, per-task installation tokens — the App key itself never reaches a Job. The agent only
+proposes; the control plane validates results before any write-back to GitHub.
 
 ---
 
 ## System architecture
 
 One control-plane binary runs in two roles (`serve` and `dispatcher`); the actual repository work
-runs in disposable per-task Jobs that hold no long-lived credentials.
+runs in disposable per-task Jobs. A Job never receives the GitHub App key — it bootstraps a
+short-lived installation token at runtime — but it **is** injected with the shared runner bearer
+(`AGENT_RUNNER_TOKEN`) and the embeddings API key it needs to do its work (see
+[Secrets a Job holds](#secrets-a-job-holds)).
 
 ```mermaid
 flowchart TD
@@ -179,6 +183,23 @@ sequenceDiagram
     R->>CP: POST /internal/tasks/{id}/status = succeeded
     Note over R,GH: Graphify→Neo4j, agent reasoning & write-back = slices 3–6
 ```
+
+### Secrets a Job holds
+
+The trust boundary is specifically about the **GitHub App private key**, which never leaves the
+control plane — a Job mints a short-lived (~1h), installation-scoped token at runtime instead. A Job
+is **not** credential-free, though. Today the dispatcher injects into every runner pod
+([`k8s.rs`](services/control-plane/src/k8s.rs)):
+
+| Secret | Source | Lifetime | Notes |
+|---|---|---|---|
+| GitHub installation token | minted per task by `serve` | ~1h, auto-expires | the only GitHub credential a Job sees |
+| `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec | long-lived, **shared** across all Jobs | bearer for the internal API; a hardening target (move to a `secretKeyRef`, per-task scoping) |
+| `EMBEDDINGS_API_KEY` | `secretKeyRef` → `lightbridge-agent-secrets` | long-lived, shared | the embeddings gateway key |
+
+So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld.
+Narrowing the shared `AGENT_RUNNER_TOKEN`'s exposure (secret ref + per-task scoping) is tracked as a
+follow-up.
 
 ---
 
