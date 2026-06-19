@@ -2,6 +2,7 @@ import { GitBranch } from "lucide-react";
 import { ApiErrorLine, EmptyState, StatusLine } from "@/components/states";
 import { Card } from "@/components/ui/card";
 import { listRepositories } from "@/lib/api";
+import { githubAppInstallUrl } from "@/lib/config";
 import { repoSlug } from "@/lib/repos";
 import { relativeTime } from "@/lib/tasks";
 
@@ -30,7 +31,7 @@ export default async function Repositories() {
           action={
             <a
               className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
-              href="https://github.com/apps/lucky-rabbit-ai"
+              href={githubAppInstallUrl()}
               target="_blank"
               rel="noreferrer"
             >
@@ -38,8 +39,8 @@ export default async function Repositories() {
             </a>
           }
         >
-          A repository appears here once the GitHub App processes an event on it (e.g. opening a pull
-          request).
+          A repository appears here once the GitHub App processes an event on it (e.g. opening a
+          pull request).
         </EmptyState>
       ) : (
         <Card className="overflow-hidden">
