@@ -7,8 +7,10 @@
 //! (cratestack codegen deferred — ADR-0005).
 
 mod db;
+mod dispatcher;
 mod github;
 mod jwt;
+mod k8s;
 mod tasks;
 mod types;
 mod webhook;
@@ -181,7 +183,24 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
+    // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
+    // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
+    // the same image so they scale independently. `scheduler` arrives in Phase 2.
+    let role = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
+        .unwrap_or_else(|| "serve".to_string());
+
     let state = AppState::from_env().await?;
+    match role.as_str() {
+        "serve" => serve(state).await,
+        "dispatcher" => run_dispatcher(state).await,
+        other => anyhow::bail!("unknown role {other:?} (expected: serve | dispatcher)"),
+    }
+}
+
+/// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).
+async fn serve(state: AppState) -> anyhow::Result<()> {
     // Bind the raw string so hostnames (e.g. `localhost:8080`) resolve via `ToSocketAddrs`,
     // not only literal IP addresses.
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
@@ -190,6 +209,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %addr, "control-plane listening");
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+/// The dispatcher role: consume the task queue and create one Kubernetes Job per task. Requires a
+/// database (it is the queue) and a reachable cluster.
+async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
+    let pool = state
+        .db
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("dispatcher requires DATABASE_URL"))?;
+    let launcher = k8s::KubeLauncher::from_env().await?;
+    // The pod name is a natural, unique lease owner; fall back to a generic label off-cluster.
+    let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "dispatcher".to_string());
+    dispatcher::run(pool, launcher, owner).await
 }
 
 #[cfg(test)]

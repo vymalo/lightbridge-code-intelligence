@@ -128,8 +128,16 @@ async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delive
         head_sha: pr["head"]["sha"].as_str().map(str::to_string),
     };
     match crate::db::create_task(pool, &task).await {
-        Ok(task_id) => {
+        Ok(Some(task_id)) => {
             tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task")
+        }
+        Ok(None) => {
+            // Idempotency index hit: an equivalent task for this PR head already exists.
+            tracing::info!(
+                delivery_id,
+                pr = task.target_id,
+                "review task already queued; skipping (idempotent)"
+            )
         }
         Err(error) => tracing::error!(%error, delivery_id, "failed to create task"),
     }
