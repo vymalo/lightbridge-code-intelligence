@@ -14,6 +14,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    # Don't rebuild on commits that only touch deploy tags or docs. Critically, this breaks the
+    # argocd-image-updater feedback loop: image-updater writes the new image tag back to
+    # deploy/envs/production/values.yaml on main, and without this filter that push would
+    # re-trigger a build → newer image → another write-back → … (a runaway rebuild loop).
+    paths-ignore:
+      - "deploy/**"
+      - "docs/**"
+      - "**/*.md"
   pull_request:
 
 # Minimal default; the publish job opts into packages: write explicitly.
