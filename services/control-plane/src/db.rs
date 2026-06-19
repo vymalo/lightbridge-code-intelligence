@@ -8,23 +8,30 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-/// Connect to `DATABASE_URL` and run migrations. Returns `None` when the URL is unset (dev) or the
-/// connection/migration fails (readiness then fails closed). Never panics.
-pub async fn connect_from_env() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = match PgPoolOptions::new().max_connections(5).connect(&url).await {
-        Ok(pool) => pool,
+/// Connect to `DATABASE_URL` and run migrations. Returns `Ok(None)` when the URL is unset (dev).
+/// **Fails fast** (`Err`) when the URL is set but the database is unreachable or migrations fail —
+/// the process should exit so the orchestrator restarts it and retries, rather than running
+/// permanently unready with no recovery path.
+pub async fn connect_from_env() -> anyhow::Result<Option<PgPool>> {
+    use anyhow::Context;
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(error) => {
-            tracing::error!(%error, "failed to connect to DATABASE_URL");
-            return None;
+            return Err(anyhow::Error::from(error).context("failed to read DATABASE_URL"));
         }
     };
-    if let Err(error) = sqlx::migrate!().run(&pool).await {
-        tracing::error!(%error, "database migrations failed");
-        return None;
-    }
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .context("failed to connect to DATABASE_URL")?;
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .context("database migrations failed")?;
     tracing::info!("database connected and migrations applied");
-    Some(pool)
+    Ok(Some(pool))
 }
 
 /// Persist a GitHub delivery, using its `delivery_id` PRIMARY KEY for exactly-once handling.

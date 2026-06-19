@@ -81,6 +81,7 @@ model Task {
   completed_at       DateTime?
 
   @@index([repository_id, status])
+  @@index([github_delivery_id])
 }
 
 # --- Procedure inputs / outputs (become typed client + server payloads) ---
