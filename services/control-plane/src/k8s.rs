@@ -48,8 +48,18 @@ impl TaskLauncher for KubeLauncher {
         let name = job_name(task);
         let manifest = job_manifest(&name, &self.image, &self.service_account, task);
         let job: Job = serde_json::from_value(manifest)?;
-        self.jobs.create(&PostParams::default(), &job).await?;
-        Ok(name)
+        match self.jobs.create(&PostParams::default(), &job).await {
+            Ok(_) => Ok(name),
+            // The Job name is derived from the unique task id, so a 409 means *our own* Job already
+            // exists — e.g. a previous attempt created it but we crashed before recording job_name,
+            // or the create timed out after the apiserver accepted it. Adopt it instead of erroring,
+            // which would requeue and 409 forever (dispatch is at-least-once).
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
+                Ok(name)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

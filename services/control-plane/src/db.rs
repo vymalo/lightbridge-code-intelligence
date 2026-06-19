@@ -231,7 +231,7 @@ pub async fn set_task_job(pool: &PgPool, id: Uuid, job_name: &str) -> Result<(),
 pub async fn release_task(pool: &PgPool, id: Uuid, backoff: Duration) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE tasks \
-         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, \
+         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, started_at = NULL, \
              run_after = now() + ($2 * interval '1 second') \
          WHERE id = $1",
     )
@@ -393,6 +393,15 @@ mod tests {
         release_task(&pool, first.id, Duration::from_secs(0))
             .await
             .unwrap();
+
+        // Releasing clears started_at so the dashboard doesn't show a queued task as already running.
+        let started_at: Option<OffsetDateTime> =
+            sqlx::query_scalar("SELECT started_at FROM tasks WHERE id = $1")
+                .bind(first.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(started_at.is_none(), "release clears started_at");
 
         let second = claim_next_task(&pool, "owner-a", Duration::from_secs(60))
             .await
