@@ -48,5 +48,4 @@ Copy [the template](0000-rfc-template.md) to `NNNN-kebab-title.md`, numbered seq
 | # | Title | Status |
 |---|---|---|
 | [0000](0000-rfc-template.md) | RFC template | — |
-
-_No substantive RFCs yet. New proposals are added here._
+| [0001](0001-horizontally-scalable-control-plane.md) | Horizontally scalable control plane (stateless roles + Postgres-backed queue) | Proposed |
