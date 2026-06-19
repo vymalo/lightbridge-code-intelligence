@@ -112,6 +112,14 @@ fn job_manifest(
         json!({ "name": "ATTEMPT", "value": task.attempts.to_string() }),
         json!({ "name": "CONTROL_PLANE_URL", "value": control_plane_url }),
         json!({ "name": "AGENT_RUNNER_TOKEN", "value": runner_token }),
+        // Embeddings config (ADR-0018): all three are required — no defaults — so a misconfigured
+        // Job fails loud rather than silently embedding with the wrong model.
+        json!({ "name": "EMBEDDINGS_BASE_URL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-base-url" } } }),
+        json!({ "name": "EMBEDDINGS_API_KEY",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-api-key" } } }),
+        json!({ "name": "EMBEDDINGS_MODEL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-model" } } }),
     ];
     if let Some(base_sha) = &task.base_sha {
         env.push(json!({ "name": "BASE_SHA", "value": base_sha }));

@@ -37,3 +37,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0015](0015-web-console-design-language.md) | Web console design language & component system (shadcn/ui) | Accepted |
 | [0016](0016-dashboard-information-architecture.md) | Dashboard information architecture & task-run views | Accepted |
 | [0017](0017-agent-runner-control-plane-bootstrap.md) | Agent runner bootstraps from the control plane (no App key in the Job) | Accepted |
+| [0018](0018-openai-compatible-embeddings.md) | OpenAI-compatible API for all embeddings (eaig/core-gateway; no bundled model) | Accepted |

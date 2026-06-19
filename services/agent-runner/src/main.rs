@@ -7,12 +7,14 @@
 //! trust boundary — it mints the token and (in a later slice) validates findings and writes to
 //! GitHub (ADR-0002, docs/opencode-acp-mcp.md).
 //!
-//! This slice (epic #5, slice 1) wires the lifecycle end-to-end with a stubbed "work" step: it
-//! proves clone + report so the indexer and OpenCode agent have a runner to live in.
+//! Slice 1 wired the lifecycle end-to-end with a stubbed work step (clone + report). Slice 2 adds
+//! the pgvector indexer: tree-sitter chunking + OpenAI-compatible embeddings → control-plane API.
 
 use agent_runner::client::ControlPlaneClient;
 use agent_runner::clone;
-use agent_runner::config::RunnerConfig;
+use agent_runner::config::{EmbeddingsConfig, RunnerConfig};
+use agent_runner::embeddings::EmbeddingsClient;
+use agent_runner::indexer;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -33,10 +35,26 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-
     let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token);
 
-    match run(&config, &client).await {
+    let embeddings_config = match EmbeddingsConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            // The task is already `running` at this point; report failed so the dispatcher
+            // doesn't wait for a lease timeout before it can reschedule.
+            let detail = error.to_string();
+            tracing::error!(%detail, "invalid embeddings configuration");
+            report(&client, &config, "failed", Some(&detail)).await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let embedder = EmbeddingsClient::new(
+        &embeddings_config.base_url,
+        &embeddings_config.api_key,
+        &embeddings_config.model,
+    );
+
+    match run(&config, &client, &embedder).await {
         Ok(summary) => {
             tracing::info!(task_id = %config.task_id, summary, "task succeeded");
             report(&client, &config, "succeeded", None).await;
@@ -52,7 +70,11 @@ async fn main() -> std::process::ExitCode {
 }
 
 /// The task lifecycle. Returns a human summary on success; any error is reported as `failed`.
-async fn run(config: &RunnerConfig, client: &ControlPlaneClient) -> anyhow::Result<String> {
+async fn run(
+    config: &RunnerConfig,
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+) -> anyhow::Result<String> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
     // re-affirms it from the pod and is a no-op if already set).
     report(client, config, "running", None).await;
@@ -68,12 +90,11 @@ async fn run(config: &RunnerConfig, client: &ControlPlaneClient) -> anyhow::Resu
 
     let checkout = clone::checkout(&context, &config.workdir).await?;
 
-    // ── Stubbed work step (slice 1) ───────────────────────────────────────────────────────────
-    // Indexing (tree-sitter → Neo4j + pgvector) and the OpenCode agent land in later slices of
-    // epic #5. For now, prove the checkout is real and usable.
-    let file_count = count_files(&checkout).await?;
+    // ── Indexing: tree-sitter → pgvector (epic #5, slice 2) ──────────────────────────────────
+    let chunk_count = indexer::index_checkout(&context, &checkout, client, embedder).await?;
+
     Ok(format!(
-        "cloned {}/{} at {} ({file_count} files); indexing + agent not yet implemented",
+        "indexed {}/{} at {} — {chunk_count} chunks submitted",
         context.owner,
         context.name,
         context
@@ -94,27 +115,4 @@ async fn report(
     if let Err(error) = client.report_status(config.task_id, status, detail).await {
         tracing::warn!(%error, task_id = %config.task_id, status, "failed to report status");
     }
-}
-
-/// Count tracked files under the checkout, skipping the `.git` directory. A cheap, real signal that
-/// the clone produced a working tree — replaced by the indexer in slice 2.
-async fn count_files(root: &std::path::Path) -> anyhow::Result<usize> {
-    let mut count = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let file_type = entry.file_type().await?;
-            if file_type.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
-                    continue;
-                }
-                stack.push(path);
-            } else if file_type.is_file() {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
 }

@@ -28,6 +28,30 @@ impl RunnerConfig {
     }
 }
 
+/// Configuration for the OpenAI-compatible embeddings API (ADR-0018). All three fields are
+/// required — no default model, so a misconfigured Job fails loudly with a named variable.
+#[derive(Debug, Clone)]
+pub struct EmbeddingsConfig {
+    /// Base URL of the OpenAI-compatible endpoint (no trailing `/v1`).
+    /// Prod: `https://core-gateway-internal.envoy-gateway-system.svc.cluster.local`
+    pub base_url: String,
+    /// API key presented as `Authorization: Bearer`. Prod key: `converse_openai_api_key`.
+    pub api_key: String,
+    /// Model identifier, e.g. `text-embedding-3-small`. The schema expects 1536-dim vectors
+    /// matching that model; choosing a different-dimension model requires a migration (ADR-0018).
+    pub model: String,
+}
+
+impl EmbeddingsConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            base_url: require("EMBEDDINGS_BASE_URL")?,
+            api_key: require("EMBEDDINGS_API_KEY")?,
+            model: require("EMBEDDINGS_MODEL")?,
+        })
+    }
+}
+
 fn require(name: &str) -> anyhow::Result<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),

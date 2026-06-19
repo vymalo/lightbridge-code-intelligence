@@ -20,6 +20,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # rustls to match the control plane (no OpenSSL in the runtime image).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Tree-sitter: syntax-aware chunking (ADR-0010). Grammar crates compile the C grammar via the
+# build script (cc required in the builder stage — present in the official Rust image).
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
 
 [dev-dependencies]
 # HTTP mocking for the control-plane client contract tests (no live control plane).
