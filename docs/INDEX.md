@@ -46,8 +46,9 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 ### Web & auth path
 1. [Architecture overview — Web & auth tier](architecture.md#web--auth-tier)
 2. [ADR-0006: Next.js (App Router) for the web UI](adr/0006-nextjs-app-router-web-ui.md)
-3. [ADR-0007: better-auth with a rust-backend delegation plugin](adr/0007-better-auth-rust-backend-plugin.md)
-4. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
+3. [ADR-0007: better-auth with a rust-backend delegation plugin](adr/0007-better-auth-rust-backend-plugin.md) (superseded by ADR-0014)
+4. [ADR-0014: Keycloak OIDC — web client + control-plane resource server](adr/0014-keycloak-oidc-resource-server.md)
+5. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
 
 ## Design principles
 

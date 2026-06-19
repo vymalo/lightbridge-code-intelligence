@@ -50,7 +50,7 @@ Use four explicit subsystems:
 | PR updates | Overlay / incremental index | Faster than full re-index |
 | OpenCode tools | Task-specific MCP profiles | Limits context size and blast radius |
 | Comments vs checks | Support both, start with comments | Faster MVP, richer checks later |
-| Web auth | better-auth + our Rust backend | Portable authN, delegated via a custom plugin |
+| Web auth | Keycloak (OIDC) — web client + resource server | Standards-based authN, no credentials of our own, SSO-ready |
 
 These decisions are recorded as immutable [Architecture Decision Records](adr/README.md).
 

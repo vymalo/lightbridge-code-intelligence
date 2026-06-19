@@ -47,14 +47,31 @@ test:
     pnpm test
     @if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run; else cargo test; fi
 
+# Codegen stays DEFERRED (ADR-0005); this only lints `control-plane.cstack` so the
+# schema-first source of truth cannot silently drift from src/types.rs. Best-effort:
+# skips with a hint when cratestack-cli is absent, so CI never hard-requires compiling
+# a young external crate. Install to enforce: cargo install cratestack-cli --version 0.4.9
+# Validate the cratestack schema against the documented 0.4.x grammar.
+validate-schema:
+    @if command -v cratestack-cli >/dev/null 2>&1; then \
+        cratestack-cli validate services/control-plane/schema/control-plane.cstack; \
+    else \
+        echo "cratestack-cli not installed — skipping schema validation."; \
+        echo "Install to enforce: cargo install cratestack-cli --version 0.4.9"; \
+    fi
+
 # The full local CI gate (delegates the Rust side to cargo xtask).
-ci:
+ci: validate-schema
     pnpm lint
     pnpm build
     cargo xtask ci
 
-# --- Local infra (docker compose: Postgres+pgvector, Neo4j) ---
+# --- Local infra (docker compose: Postgres+pgvector, Neo4j, Keycloak) ---
 
+# Keycloak comes up on http://localhost:8081 (admin/admin) with the `lightbridge` realm imported
+# (client `lightbridge-web`, dev user `dev` / `password`). The web app and control plane read the
+# OIDC issuer from env — copy apps/web/.env.example to apps/web/.env.local, and for the backend set
+# OIDC_ISSUER=http://localhost:8081/realms/lightbridge and OIDC_AUDIENCE=lightbridge-api.
 up:
     docker compose up -d
 

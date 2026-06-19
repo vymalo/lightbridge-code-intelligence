@@ -1,18 +1,39 @@
-# control-plane.cstack — DRAFT schema-first definition for the Lightbridge control plane.
+# control-plane.cstack — schema-first definition for the Lightbridge control plane.
 #
-# cratestack (https://cratestack.dev) generates an Axum + SQLx server, typed clients, and
-# policy enforcement from one schema. The exact 0.4.x grammar must be confirmed against the
-# cratestack docs before codegen runs (see ADR-0005); this draft mirrors the Postgres schema
-# in docs/components-and-data-models.md so the modelling work is captured and reviewable now.
-# Until codegen is wired, src/types.rs holds the hand-written equivalents.
+# cratestack (https://cratestack.dev) is a Prisma-like, schema-first framework that generates an
+# Axum + SQLx server, typed clients, and policy enforcement from one schema. This file mirrors the
+# Postgres schema in docs/components-and-data-models.md.
+#
+# CODEGEN IS STILL DEFERRED (ADR-0005). cratestack reached 0.4.x only in June 2026 and is too young
+# to bind the control plane to yet; src/types.rs holds the hand-written equivalents and remains the
+# compiled source. This file is the reviewable source of truth for the data model and is checked in
+# CI (`just validate-schema`) so it cannot silently drift from the documented grammar.
+#
+# Identity is NOT modelled here. The control plane is an OAuth2 resource server (ADR-0014): users
+# and credentials live in the external OIDC provider (Keycloak), and identity is read from
+# validated JWT claims (`sub`, `email`, …) at request time — there is no local user table.
+#
+# Grammar confirmed against the cratestack 0.4.x docs (June 2026): Prisma-like models, the
+# `datasource`/`type` blocks, scalars (String, Int, Boolean, DateTime, Uuid, Json), field
+# attributes (@id, @unique, @default, @relation), block attributes (@@unique, @@index). Constructs
+# the public docs do NOT pin down are flagged `# TODO(grammar)` and must be confirmed with
+# `cratestack-cli validate` before codegen is enabled.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
 model Repository {
-  id             Int      @id @auto
-  github_repo_id Int      @unique
+  id             Int     @id @default(autoincrement())
+  github_repo_id Int     @unique
   owner          String
   name           String
   default_branch String
-  active         Bool     @default(true)
+  active         Boolean @default(true)
+
+  indexes RepoIndex[]
+  tasks   Task[]
 }
 
 model GithubDelivery {
@@ -20,13 +41,16 @@ model GithubDelivery {
   event_name      String
   installation_id Int?
   repository_id   Int?
-  received_at     DateTime @default(now())
+  received_at     DateTime @default(dbgenerated())
   payload_json    Json
+
+  tasks Task[]
 }
 
 model RepoIndex {
-  id             Int      @id @auto
-  repository_id  Int      @ref(Repository.id)
+  id             Int        @id @default(autoincrement())
+  repository_id  Int
+  repository     Repository @relation(fields: [repository_id], references: [id])
   branch         String
   commit_sha     String
   graph_version  String
@@ -34,44 +58,52 @@ model RepoIndex {
   status         String
   started_at     DateTime?
   completed_at   DateTime?
+
   @@unique([repository_id, branch, commit_sha, graph_version, vector_version])
 }
 
 model Task {
-  id                 Uuid    @id
-  repository_id      Int     @ref(Repository.id)
+  id                 Uuid           @id
+  repository_id      Int
+  repository         Repository     @relation(fields: [repository_id], references: [id])
   installation_id    Int
-  github_delivery_id String  @ref(GithubDelivery.delivery_id)
+  github_delivery_id String
+  github_delivery    GithubDelivery @relation(fields: [github_delivery_id], references: [delivery_id])
   target_type        String
   target_id          Int
   command_text       String
   base_sha           String?
   head_sha           String?
   status             String
-  priority           Int      @default(100)
-  created_at         DateTime @default(now())
+  priority           Int            @default(100)
+  created_at         DateTime       @default(dbgenerated())
+
   @@index([repository_id, status])
 }
 
-# AuthN user store — the standalone, portable authentication surface the web app's better-auth
-# "rust-backend" plugin verifies against (ADR-0007). This is authentication, NOT the
-# Envoy/Authorino authorization path (that is lightbridge-authz, a separate component).
-model AuthUser {
-  id            Uuid     @id
-  email         String   @unique
-  name          String?
-  password_hash String   @secret
-  created_at    DateTime @default(now())
+# --- Procedure inputs / outputs (become typed client + server payloads) ---
+
+type TaskInput {
+  repository_id      Int
+  installation_id    Int
+  github_delivery_id String
+  target_type        String
+  target_id          Int
+  command_text       String
+  base_sha           String?
+  head_sha           String?
 }
 
-# Procedures become server routes + typed client methods.
-procedure verify_credentials(email: String, password: String) -> AuthSession {
-  policy: public    # exposed as POST /auth/verify
+# --- Procedures (become server routes + typed client methods) ---
+
+# INTERNAL: control-plane only; never callable directly by the agent. Access control for callers is
+# enforced upstream by the OAuth2 resource server (JWT validation) and the gateway authZ layer.
+# TODO(grammar): confirm procedure-level policy syntax against `cratestack-cli validate`. Model
+# `@@allow` is documented; the procedure equivalent is not. `("execute", false)` encodes "not
+# externally callable".
+procedure create_task(input: TaskInput): Task {
+  @@allow("execute", false)
 }
 
-procedure create_task(input: TaskInput) -> Task {
-  policy: internal  # control-plane only; never callable directly by the agent
-}
-
-# TODO(ADR-0005): once the grammar is pinned, enable cratestack's banking-grade primitives
+# TODO(ADR-0005): once codegen is enabled, turn on cratestack's banking-grade primitives
 # (idempotency keys on Task, optimistic locking, audit logging, soft deletes).

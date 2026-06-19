@@ -1,7 +1,13 @@
 # ADR-0007: better-auth for web auth via a rust-backend delegation plugin
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0014](0014-keycloak-oidc-resource-server.md)
 - **Date:** 2026-06-18
+
+> **Superseded (2026-06-19).** We no longer manage credentials ourselves. Authentication now uses
+> **Keycloak (OIDC)** with the web app as an OIDC client and the control plane as a resource server
+> — see [ADR-0014](0014-keycloak-oidc-resource-server.md). The better-auth `rust-backend` plugin and
+> the first-party `/auth/verify` credential store described below have been removed. The remainder
+> of this document is retained for historical context.
 
 ## Context and Problem Statement
 

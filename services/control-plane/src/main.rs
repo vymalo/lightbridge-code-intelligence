@@ -1,23 +1,26 @@
 //! Lightbridge control plane.
 //!
 //! The trust boundary of the system: it verifies GitHub webhooks, owns task/persistence
-//! lifecycle, and exposes a standalone, portable authentication surface that the web app's
-//! better-auth plugin verifies against. This is a skeleton — persistence (cratestack/SQLx)
-//! and task routing are intentionally stubbed; see docs/ and the ADRs.
+//! lifecycle, and acts as an OAuth2 **resource server** — validating OIDC access tokens (Keycloak
+//! in dev) on protected routes. It does not issue tokens or store credentials; identity comes from
+//! the validated JWT claims (see ADR-0014). This is a skeleton — persistence (cratestack/SQLx) and
+//! task routing are intentionally stubbed; see docs/ and the ADRs.
 
-mod auth;
+mod jwt;
 mod types;
 mod webhook;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::Router;
 use tracing_subscriber::EnvFilter;
+
+use jwt::JwtValidator;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,6 +29,9 @@ pub struct AppState {
     /// In-memory delivery-id dedup set. Production replaces this with the Postgres
     /// `github_deliveries` table (see docs/components-and-data-models.md).
     pub seen_deliveries: Arc<Mutex<HashSet<String>>>,
+    /// OIDC token validator for protected routes. `None` when `OIDC_ISSUER` is unset, which makes
+    /// protected routes fail closed (503) rather than silently accept unauthenticated traffic.
+    pub jwt: Option<Arc<JwtValidator>>,
 }
 
 impl AppState {
@@ -35,6 +41,7 @@ impl AppState {
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
             ),
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
+            jwt: jwt::from_env(),
         }
     }
 }
@@ -44,7 +51,7 @@ fn app(state: AppState) -> Router {
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
         .route("/github/webhook", post(webhook::github_webhook))
-        .route("/auth/verify", post(auth::verify))
+        .route("/me", get(jwt::me))
         .with_state(state)
 }
 
@@ -52,8 +59,9 @@ async fn liveness() -> &'static str {
     "ok"
 }
 
-/// Readiness fails closed when required configuration is missing, so a misconfigured pod
-/// (e.g. no `GITHUB_WEBHOOK_SECRET`) is not handed traffic it would silently drop.
+/// Readiness fails closed when required configuration is missing, so a misconfigured pod is not
+/// handed traffic it would only reject: missing webhook secret, missing OIDC issuer, or an
+/// unreachable IdP JWKS (which would 503 every protected request anyway).
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     if state.github_webhook_secret.is_empty() {
         return (
@@ -61,7 +69,16 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             "github webhook secret not configured",
         );
     }
-    (StatusCode::OK, "ok")
+    match &state.jwt {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OIDC_ISSUER not configured",
+        ),
+        Some(validator) => match validator.warm().await {
+            Ok(()) => (StatusCode::OK, "ok"),
+            Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "oidc jwks unavailable"),
+        },
+    }
 }
 
 #[tokio::main]

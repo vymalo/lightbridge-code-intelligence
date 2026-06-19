@@ -1,18 +1,24 @@
-import { headers } from "next/headers";
-import { auth } from "@/lib/auth";
+import { SESSION_COOKIE, verifyAccessToken, verifyConfigFromEnv } from "@lightbridge/auth";
+import { cookies } from "next/headers";
 
+// `middleware.ts` already gates this route; we re-read the cookie here to display the user.
 export default async function Dashboard() {
-  const session = await auth.api.getSession({ headers: await headers() }).catch(() => null);
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+  const claims = token ? await verifyAccessToken(token, verifyConfigFromEnv()) : null;
 
   return (
     <main>
       <h1>Dashboard</h1>
-      {session?.user ? (
-        <p>Signed in as {session.user.email}.</p>
+      {claims ? (
+        <>
+          <p>Signed in as {claims.email ?? claims.preferred_username ?? claims.sub}.</p>
+          <p>
+            <a href="/api/auth/logout">Sign out</a>
+          </p>
+        </>
       ) : (
         <p>
-          Not signed in. <a href="/sign-in">Sign in</a>. (Session wiring is a skeleton TODO — see
-          ADR-0007.)
+          Not signed in. <a href="/sign-in">Sign in</a>.
         </p>
       )}
     </main>

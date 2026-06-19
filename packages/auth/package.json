@@ -4,8 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./client": "./src/client-plugin.ts"
+    ".": "./src/index.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",
@@ -13,7 +12,7 @@
     "test": "echo \"@lightbridge/auth: no tests yet\""
   },
   "dependencies": {
-    "better-auth": "^1.6.19"
+    "jose": "^5.9.6"
   },
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",

@@ -26,10 +26,11 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0004](0004-one-k8s-job-per-task.md) | One Kubernetes Job per task for execution isolation | Accepted |
 | [0005](0005-cratestack-schema-first-control-plane.md) | Adopt cratestack (schema-first Rust) for the control plane | Accepted |
 | [0006](0006-nextjs-app-router-web-ui.md) | Next.js (App Router) for the web UI | Accepted |
-| [0007](0007-better-auth-rust-backend-plugin.md) | better-auth for web auth via a rust-backend plugin | Accepted |
+| [0007](0007-better-auth-rust-backend-plugin.md) | better-auth for web auth via a rust-backend plugin | Superseded by ADR-0014 |
 | [0008](0008-adopt-ai-governance-framework.md) | Adopt the ADORSYS-GIS AI Governance framework | Accepted |
 | [0009](0009-pnpm-turborepo-monorepo.md) | pnpm + Turborepo monorepo layout | Accepted |
 | [0010](0010-graphify-treesitter-indexing-baseline.md) | Graphify + tree-sitter as the indexing baseline | Accepted |
 | [0011](0011-engineering-practices-xp-lean-devops.md) | Engineering practices: XP + Lean + DevOps + shift-left | Accepted |
 | [0012](0012-rfc-process-alongside-adrs.md) | RFC process alongside ADRs | Accepted |
 | [0013](0013-local-dev-and-build-tooling.md) | Local dev & build tooling (just, xtask, compose, nextest, wiremock) | Accepted |
+| [0014](0014-keycloak-oidc-resource-server.md) | Keycloak OIDC — web client + resource server | Accepted |

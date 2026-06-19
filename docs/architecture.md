@@ -113,32 +113,35 @@ posted, retried, or rejected. See [ADR-0002](adr/0002-rust-control-plane-trust-b
 ## Web & auth tier
 
 A Next.js (App Router) web console lives under `apps/web`. It gives operators a UI over the
-control plane: repository onboarding, task history, index status, and audit trails. The web app
-uses [**better-auth**](adr/0007-better-auth-rust-backend-plugin.md) for session management.
+control plane: repository onboarding, task history, index status, and audit trails. Authentication
+is delegated to [**Keycloak** as the OIDC provider](adr/0014-keycloak-oidc-resource-server.md);
+we manage no credentials, sessions, or password storage ourselves.
 
-Authentication (**authN**) is not implemented inside Next.js. It is delegated to Lightbridge's
-**own standalone, portable Rust backend** — the control plane — via a custom better-auth plugin
-named `rust-backend`. That plugin POSTs submitted credentials to
-`${AUTH_BACKEND_URL}/auth/verify`; the Rust backend validates them against its `AuthUser` store
-and returns a session principal. Because the backend is standalone and portable, the same authN
-surface can be reused outside the web app.
+Authentication (**authN**) is **not** implemented inside Next.js. **Keycloak** owns users, login,
+and token issuance. The web app (`apps/web`) is an **OIDC client** (PKCE): it runs the
+Authorization-Code flow (`/api/auth/login`, `/api/auth/callback`, `/api/auth/logout`),
+stores the resulting access token in an **httpOnly cookie**, and validates it in `middleware.ts`
+with `jose`. The **Rust control plane** is a pure OAuth2 **resource server**: it validates the
+bearer JWT against Keycloak's **JWKS** (`iss` / `aud` / `exp`) and reads identity from the claims —
+it has no user store and no token issuance.
 
 ```mermaid
 flowchart LR
-  B[Browser] -->|credentials| W[Next.js apps/web<br/>better-auth + rust-backend plugin]
-  W -->|POST AUTH_BACKEND_URL/auth/verify| RC[Rust control plane]
-  RC -->|verify against AuthUser store| RC
-  RC -->|session principal| W
-  W -->|session cookie| B
+  B[Browser] -->|Authorization-Code + PKCE login| K[Keycloak<br/>OIDC provider]
+  K -->|access token| W[Next.js apps/web<br/>OIDC client]
+  W -->|httpOnly cookie| B
+  W -->|Bearer access token| RC[Rust control plane<br/>resource server]
+  RC -->|validate JWT via Keycloak JWKS| K
 ```
 
 > **authN is NOT authZ.** The path above is *authentication only* — proving who a web user is.
 > Gateway **authorization** (decides what a caller may do at the API edge) is a separate concern
 > handled by **Envoy** together with **Authorino** and the standalone
 > [`ADORSYS-GIS/lightbridge-authz`](https://github.com/ADORSYS-GIS/lightbridge-authz) component.
-> `lightbridge-authz` is **not** this project's auth backend, and our better-auth Rust backend is
-> **not** the gateway authorizer. Keep the two cleanly separated. See
-> [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md) and the
+> `lightbridge-authz` is **not** this project's identity provider, and the control plane (a resource
+> server) is **not** the gateway authorizer. Keep the two cleanly separated — though both validate
+> the *same* Keycloak-issued JWTs via JWKS. See
+> [ADR-0014](adr/0014-keycloak-oidc-resource-server.md) and the
 > [FAQ](faq.md#how-does-authentication-authn-differ-from-authorization-authz).
 
 ## Control-plane implementation note
