@@ -22,4 +22,4 @@ lci:
         main:
           image:
             repository: ghcr.io/vymalo/lightbridge-web
-            tag: "sha-6a7b8c0"
+            tag: "sha-128d8ec"
