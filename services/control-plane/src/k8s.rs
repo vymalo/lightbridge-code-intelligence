@@ -23,6 +23,11 @@ pub struct KubeLauncher {
     jobs: Api<Job>,
     image: String,
     service_account: String,
+    /// In-cluster URL the runner calls back for context + status (the control plane's own Service).
+    control_plane_url: String,
+    /// Shared bearer the runner presents to that internal API (ADR-0017). Injected into the Job so
+    /// the runner can authenticate; empty when unset (the internal API is then disabled anyway).
+    runner_token: String,
 }
 
 impl KubeLauncher {
@@ -35,10 +40,17 @@ impl KubeLauncher {
             .unwrap_or_else(|_| "ghcr.io/vymalo/lightbridge-agent-runner:latest".to_string());
         let service_account = std::env::var("AGENT_SERVICE_ACCOUNT")
             .unwrap_or_else(|_| "lightbridge-agent".to_string());
+        // Where the runner calls back. Defaults to the in-cluster Service name the ai-helm chart
+        // gives the serve role; override per environment with CONTROL_PLANE_INTERNAL_URL.
+        let control_plane_url = std::env::var("CONTROL_PLANE_INTERNAL_URL")
+            .unwrap_or_else(|_| "http://lightbridge-ci-control-plane:8080".to_string());
+        let runner_token = std::env::var("AGENT_RUNNER_TOKEN").unwrap_or_default();
         Ok(Self {
             jobs: Api::namespaced(client, &namespace),
             image,
             service_account,
+            control_plane_url,
+            runner_token,
         })
     }
 }
@@ -46,7 +58,14 @@ impl KubeLauncher {
 impl TaskLauncher for KubeLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String> {
         let name = job_name(task);
-        let manifest = job_manifest(&name, &self.image, &self.service_account, task);
+        let manifest = job_manifest(
+            &name,
+            &self.image,
+            &self.service_account,
+            &self.control_plane_url,
+            &self.runner_token,
+            task,
+        );
         let job: Job = serde_json::from_value(manifest)?;
         match self.jobs.create(&PostParams::default(), &job).await {
             Ok(_) => Ok(name),
@@ -71,9 +90,18 @@ fn job_name(task: &ClaimedTask) -> String {
 /// The per-task agent Job manifest (mirrors docs/kubernetes-deployment.md): `restartPolicy: Never`,
 /// a TTL for cleanup, an active deadline to bound runtime, a least-privilege service account, and the
 /// task id passed through so the runner can fetch its work and report back.
-fn job_manifest(name: &str, image: &str, service_account: &str, task: &ClaimedTask) -> Value {
+fn job_manifest(
+    name: &str,
+    image: &str,
+    service_account: &str,
+    control_plane_url: &str,
+    runner_token: &str,
+    task: &ClaimedTask,
+) -> Value {
     // Pass the claimed task's context so the runner knows what to act on (target + SHAs) and how to
-    // report back (task / repository / installation ids), without an extra round-trip.
+    // report back: the task id, plus where to call (CONTROL_PLANE_URL) and the shared bearer it
+    // presents (AGENT_RUNNER_TOKEN). The runner fetches full context from the internal API rather
+    // than trusting these env values for anything security-sensitive.
     let mut env = vec![
         json!({ "name": "TASK_ID", "value": task.id.to_string() }),
         json!({ "name": "REPOSITORY_ID", "value": task.repository_id.to_string() }),
@@ -82,6 +110,8 @@ fn job_manifest(name: &str, image: &str, service_account: &str, task: &ClaimedTa
         json!({ "name": "TARGET_TYPE", "value": task.target_type }),
         json!({ "name": "TARGET_ID", "value": task.target_id.to_string() }),
         json!({ "name": "ATTEMPT", "value": task.attempts.to_string() }),
+        json!({ "name": "CONTROL_PLANE_URL", "value": control_plane_url }),
+        json!({ "name": "AGENT_RUNNER_TOKEN", "value": runner_token }),
     ];
     if let Some(base_sha) = &task.base_sha {
         env.push(json!({ "name": "BASE_SHA", "value": base_sha }));
@@ -158,7 +188,14 @@ mod tests {
     #[test]
     fn manifest_is_a_valid_job_with_task_wiring() {
         let task = sample_task();
-        let value = job_manifest(&job_name(&task), "img:tag", "sa", &task);
+        let value = job_manifest(
+            &job_name(&task),
+            "img:tag",
+            "sa",
+            "http://cp:8080",
+            "runner-secret",
+            &task,
+        );
 
         // Deserializes into the typed k8s Job (catches structural mistakes without a cluster).
         let job: Job = serde_json::from_value(value.clone()).expect("valid Job manifest");
@@ -184,5 +221,14 @@ mod tests {
         assert_eq!(value_of("HEAD_SHA").as_deref(), Some("deadbeef"));
         // base_sha is None on the sample, so BASE_SHA is omitted entirely.
         assert!(value_of("BASE_SHA").is_none());
+        // The runner's callback wiring travels with the Job.
+        assert_eq!(
+            value_of("CONTROL_PLANE_URL").as_deref(),
+            Some("http://cp:8080")
+        );
+        assert_eq!(
+            value_of("AGENT_RUNNER_TOKEN").as_deref(),
+            Some("runner-secret")
+        );
     }
 }

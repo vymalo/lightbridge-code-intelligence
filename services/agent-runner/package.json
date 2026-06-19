@@ -1,0 +1,12 @@
+{
+  "name": "@lightbridge/agent-runner",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Thin wrapper so Turborepo can orchestrate the Rust agent runner alongside JS packages.",
+  "scripts": {
+    "build": "cargo build -p agent-runner",
+    "lint": "cargo clippy -p agent-runner --all-targets -- -D warnings",
+    "test": "cargo nextest run -p agent-runner || cargo test -p agent-runner",
+    "dev": "cargo run -p agent-runner"
+  }
+}

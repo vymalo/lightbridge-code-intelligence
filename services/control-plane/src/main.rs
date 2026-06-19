@@ -9,6 +9,7 @@
 mod db;
 mod dispatcher;
 mod github;
+mod internal;
 mod jwt;
 mod k8s;
 mod tasks;
@@ -45,6 +46,10 @@ pub struct AppState {
     pub allow_no_db: bool,
     /// GitHub App auth (App JWT → installation tokens). `None` when the App env is unset.
     pub github: Option<github::GithubApp>,
+    /// Shared bearer for the internal runner API (`AGENT_RUNNER_TOKEN`). `None` disables those
+    /// routes (they fail closed with 503) — the control plane injects the same value into each
+    /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
+    pub runner_token: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -72,6 +77,10 @@ impl AppState {
             db,
             allow_no_db,
             github: github::GithubApp::from_env(),
+            runner_token: std::env::var("AGENT_RUNNER_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+                .map(Arc::new),
         })
     }
 }
@@ -119,6 +128,9 @@ fn app(state: AppState) -> Router {
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/repositories", get(tasks::list_repositories))
+        // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
+        .route("/internal/tasks/{id}", get(internal::get_context))
+        .route("/internal/tasks/{id}/status", post(internal::set_status))
         .with_state(state)
 }
 

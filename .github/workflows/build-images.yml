@@ -43,6 +43,8 @@ jobs:
             dockerfile: services/control-plane/Dockerfile
           - image: lightbridge-web
             dockerfile: apps/web/Dockerfile
+          - image: lightbridge-agent-runner
+            dockerfile: services/agent-runner/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -75,6 +77,8 @@ jobs:
             dockerfile: services/control-plane/Dockerfile
           - image: lightbridge-web
             dockerfile: apps/web/Dockerfile
+          - image: lightbridge-agent-runner
+            dockerfile: services/agent-runner/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

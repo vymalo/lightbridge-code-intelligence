@@ -1,0 +1,27 @@
+[package]
+name = "agent-runner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightbridge agent runner: the per-task Kubernetes Job that clones, indexes, and reviews a repo."
+
+[[bin]]
+name = "agent-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# rustls to match the control plane (no OpenSSL in the runtime image).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# HTTP mocking for the control-plane client contract tests (no live control plane).
+wiremock = "0.6"
+tempfile = "3"
