@@ -1,8 +1,9 @@
 //! GitHub webhook receiver.
 //!
 //! Mirrors docs/github-app-and-control-plane.md: verify `X-Hub-Signature-256`, dedupe on
-//! `X-GitHub-Delivery`, then hand off to task routing. The dedup set here is in-memory; the
-//! production path persists to the Postgres `github_deliveries` table first.
+//! `X-GitHub-Delivery`, then hand off to task routing. With a database, dedup + persistence happen
+//! atomically via the `github_deliveries` PRIMARY KEY; without one (dev) it falls back to an
+//! in-memory set.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -29,18 +30,34 @@ pub async fn github_webhook(
     if delivery_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing delivery id");
     }
+    let event = header(&headers, "x-github-event");
 
-    {
-        let mut seen = state.seen_deliveries.lock().expect("dedup lock poisoned");
-        if !seen.insert(delivery_id.clone()) {
-            return (StatusCode::ACCEPTED, "duplicate delivery");
+    // Dedup (and persist, when a database is configured). `is_new` is false for a replayed
+    // delivery id — GitHub retries, so this is the exactly-once guard.
+    let is_new = match &state.db {
+        Some(pool) => {
+            let payload = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            match crate::db::record_delivery(pool, &delivery_id, &event, &payload).await {
+                Ok(is_new) => is_new,
+                Err(error) => {
+                    tracing::error!(%error, delivery_id, "failed to persist delivery");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error");
+                }
+            }
         }
+        None => state
+            .seen_deliveries
+            .lock()
+            .expect("dedup lock poisoned")
+            .insert(delivery_id.clone()),
+    };
+    if !is_new {
+        return (StatusCode::ACCEPTED, "duplicate delivery");
     }
 
-    let event = header(&headers, "x-github-event");
     tracing::info!(delivery_id, event, "accepted webhook");
 
-    // TODO: persist delivery + route to task creation (docs/github-app-and-control-plane.md).
+    // TODO: route the persisted delivery to task creation (docs/github-app-and-control-plane.md).
     (StatusCode::ACCEPTED, "accepted")
 }
 
