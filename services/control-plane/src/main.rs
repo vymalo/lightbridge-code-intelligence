@@ -37,6 +37,10 @@ pub struct AppState {
     pub jwt: Option<Arc<JwtValidator>>,
     /// Postgres pool. `None` when `DATABASE_URL` is unset (dev) or the connection failed.
     pub db: Option<PgPool>,
+    /// Dev-only opt-in (`ALLOW_NO_DB=1`) to run without a database. Without it, a pod that has no
+    /// `DATABASE_URL` fails readiness instead of silently dedup'ing in process memory — which would
+    /// reintroduce the multi-replica duplicate-task bug (RFC-0001 Phase 0).
+    pub allow_no_db: bool,
     /// GitHub App auth (App JWT → installation tokens). `None` when the App env is unset.
     pub github: Option<github::GithubApp>,
 }
@@ -44,6 +48,19 @@ pub struct AppState {
 impl AppState {
     async fn from_env() -> anyhow::Result<Self> {
         let db = db::connect_from_env().await?;
+        let allow_no_db = env_flag("ALLOW_NO_DB");
+        if db.is_none() {
+            if allow_no_db {
+                tracing::warn!(
+                    "running WITHOUT a database (ALLOW_NO_DB): in-memory dedup, single-replica only — dev use"
+                );
+            } else {
+                tracing::error!(
+                    "DATABASE_URL is not set and ALLOW_NO_DB is unset: the pod will fail readiness. \
+                     Set DATABASE_URL in production, or ALLOW_NO_DB=1 for local dev."
+                );
+            }
+        }
         Ok(Self {
             github_webhook_secret: Arc::new(
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
@@ -51,8 +68,31 @@ impl AppState {
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
             jwt: jwt::from_env(),
             db,
+            allow_no_db,
             github: github::GithubApp::from_env(),
         })
+    }
+}
+
+/// A boolean env flag that is true for `1`/`true`/`yes` (case-insensitive), false otherwise.
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Whether the database dimension of readiness passes. With a pool, requires a successful ping.
+/// Without a pool (no `DATABASE_URL`), only ready when the dev opt-in is set — otherwise a
+/// misconfigured production pod would silently run per-replica in-memory dedup yet report ready.
+fn db_dimension_ready(has_pool: bool, ping_ok: bool, allow_no_db: bool) -> bool {
+    if has_pool {
+        ping_ok
+    } else {
+        allow_no_db
     }
 }
 
@@ -94,13 +134,18 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
     }
-    // A configured database must be reachable; if `DATABASE_URL` is unset (dev) we run degraded.
+    // A configured database must be reachable. With no database, we report ready only when the
+    // dev opt-in (`ALLOW_NO_DB`) is set — otherwise a misconfigured prod pod would fail closed
+    // rather than silently dedup in process memory across replicas.
     let db_ok = match &state.db {
-        Some(pool) => db::ping(pool).await.is_ok(),
-        None => std::env::var("DATABASE_URL").is_err(),
+        Some(pool) => db_dimension_ready(true, db::ping(pool).await.is_ok(), state.allow_no_db),
+        None => db_dimension_ready(false, false, state.allow_no_db),
     };
     if !db_ok {
-        return (StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database not configured (set DATABASE_URL; ALLOW_NO_DB=1 for dev only)",
+        );
     }
     (StatusCode::OK, "ok")
 }
@@ -123,4 +168,39 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %addr, "control-plane listening");
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_pool_readiness_follows_the_ping() {
+        // A configured database must actually answer; the dev opt-in never overrides a failed ping.
+        assert!(db_dimension_ready(true, true, false));
+        assert!(!db_dimension_ready(true, false, false));
+        assert!(!db_dimension_ready(true, false, true));
+    }
+
+    #[test]
+    fn without_pool_requires_the_dev_opt_in() {
+        // No DATABASE_URL: ready only when ALLOW_NO_DB is set — otherwise fail closed so a
+        // misconfigured prod pod is never handed traffic it would dedup only in process memory.
+        assert!(!db_dimension_ready(false, false, false));
+        assert!(db_dimension_ready(false, false, true));
+    }
+
+    #[test]
+    fn env_flag_parses_truthy_values_only() {
+        for truthy in ["1", "true", "TRUE", "Yes"] {
+            std::env::set_var("CP_TEST_FLAG", truthy);
+            assert!(env_flag("CP_TEST_FLAG"), "{truthy} should be truthy");
+        }
+        for falsy in ["0", "false", "no", "", "off"] {
+            std::env::set_var("CP_TEST_FLAG", falsy);
+            assert!(!env_flag("CP_TEST_FLAG"), "{falsy} should be falsy");
+        }
+        std::env::remove_var("CP_TEST_FLAG");
+        assert!(!env_flag("CP_TEST_FLAG"));
+    }
 }
