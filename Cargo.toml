@@ -1,9 +1,10 @@
 # Cargo workspace for the Lightbridge Rust services and automation.
 # The control plane is the standalone, portable backend (HTTP control + auth surface);
+# the agent runner is the per-task Kubernetes Job that clones/indexes/reviews a repo;
 # `xtask` is the build/CI automation entrypoint invoked from the justfile.
 [workspace]
 resolver = "2"
-members = ["services/control-plane", "xtask"]
+members = ["services/control-plane", "services/agent-runner", "xtask"]
 
 [workspace.package]
 edition = "2021"

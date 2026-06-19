@@ -290,6 +290,75 @@ pub async fn list_repositories(pool: &PgPool) -> Result<Vec<RepositoryRow>, sqlx
     .await
 }
 
+/// Everything the agent runner needs to act on a task, joined with its repository identity. Served
+/// by the internal runner API (`GET /internal/tasks/{id}`) so the runner never holds the GitHub App
+/// key — it receives repo coordinates here and a freshly-minted installation token alongside (the
+/// control plane mints it; see `internal.rs`). `installation_id` is kept server-side for that.
+#[derive(Debug, sqlx::FromRow)]
+pub struct TaskContextRow {
+    pub id: Uuid,
+    pub repository_id: i64,
+    pub installation_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub default_branch: String,
+    pub target_type: String,
+    pub target_id: i64,
+    pub command_text: String,
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+}
+
+/// Load a task's execution context, or `None` if no such task exists. INNER JOIN on `repositories`:
+/// a task always references a repository (FK), so a missing row means a bad/expired id.
+pub async fn get_task_context(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<TaskContextRow>, sqlx::Error> {
+    sqlx::query_as::<_, TaskContextRow>(
+        "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
+                t.target_type, t.target_id, t.command_text, t.base_sha, t.head_sha \
+         FROM tasks t JOIN repositories r ON r.id = t.repository_id \
+         WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Statuses the runner is allowed to report. Transitioning into a terminal one stamps
+/// `completed_at` and releases the lease; `running` (re)stamps `started_at`. Anything else is
+/// rejected by the handler before reaching here.
+pub fn is_runner_reportable_status(status: &str) -> bool {
+    matches!(
+        status,
+        "running" | "posting_result" | "succeeded" | "failed" | "timed_out" | "cancelled"
+    )
+}
+
+/// Apply a runner-reported status transition. Terminal states (`succeeded`/`failed`/`timed_out`/
+/// `cancelled`) stamp `completed_at` and clear the dispatcher lease so the reaper (Phase 2) won't
+/// reclaim a finished task; `running` stamps `started_at` if unset. Returns `false` if no task
+/// matched the id. The caller validates `status` with [`is_runner_reportable_status`] first.
+pub async fn set_task_status(pool: &PgPool, id: Uuid, status: &str) -> Result<bool, sqlx::Error> {
+    let terminal = matches!(status, "succeeded" | "failed" | "timed_out" | "cancelled");
+    let result = sqlx::query(
+        "UPDATE tasks SET \
+             status = $2, \
+             started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, now()) ELSE started_at END, \
+             completed_at = CASE WHEN $3 THEN now() ELSE completed_at END, \
+             lease_owner = CASE WHEN $3 THEN NULL ELSE lease_owner END, \
+             lease_expires_at = CASE WHEN $3 THEN NULL ELSE lease_expires_at END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(terminal)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +556,74 @@ mod tests {
         let idle_row = repos.iter().find(|r| r.id == idle).unwrap();
         assert_eq!(idle_row.task_count, 0);
         assert!(idle_row.last_task_at.is_none());
+    }
+
+    /// The runner's task context joins repository identity onto the task, and returns `None` for an
+    /// unknown id (the seam the internal API serves to the agent runner).
+    #[sqlx::test]
+    async fn get_task_context_joins_repo_identity(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let context = get_task_context(&pool, task_id)
+            .await
+            .unwrap()
+            .expect("task exists");
+        assert_eq!(context.owner, "octo");
+        assert_eq!(context.name, "repo");
+        assert_eq!(context.default_branch, "main");
+        assert_eq!(context.installation_id, 99);
+        assert_eq!(context.command_text, "review");
+        assert_eq!(context.head_sha.as_deref(), Some("head1"));
+
+        assert!(
+            get_task_context(&pool, Uuid::nil())
+                .await
+                .unwrap()
+                .is_none(),
+            "unknown id yields None"
+        );
+    }
+
+    /// A terminal status stamps `completed_at` and clears the lease; `running` stamps `started_at`.
+    /// `set_task_status` returns false for an unknown id (so the API can answer 404).
+    #[sqlx::test]
+    async fn set_task_status_stamps_and_releases(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head1").await;
+
+        assert!(set_task_status(&pool, task, "succeeded").await.unwrap());
+
+        let row: (String, Option<OffsetDateTime>, Option<String>) =
+            sqlx::query_as("SELECT status, completed_at, lease_owner FROM tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "succeeded");
+        assert!(row.1.is_some(), "terminal status stamps completed_at");
+        assert!(row.2.is_none(), "terminal status clears the lease");
+
+        assert!(
+            !set_task_status(&pool, Uuid::nil(), "failed").await.unwrap(),
+            "unknown id reports no row updated"
+        );
+    }
+
+    /// Create then claim a task (claim sets it `running` with a lease) so status-transition tests
+    /// start from the state a dispatched task is really in.
+    async fn claim_after_create(pool: &PgPool, repo_id: i64, head: &str) -> Uuid {
+        create_task(pool, &pr_task(repo_id, head))
+            .await
+            .unwrap()
+            .unwrap();
+        claim_next_task(pool, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap()
+            .id
     }
 }
