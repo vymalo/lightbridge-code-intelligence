@@ -27,13 +27,41 @@ pub struct EmbeddingsClient {
     http: reqwest::Client,
 }
 
+/// Build the HTTP client, additionally trusting the CA PEM at `EMBEDDINGS_CA_CERT` if set. The eaig
+/// gateway's internal HTTPS endpoint is signed by a private CA (`ClusterIssuer/self-signed-ca`) that
+/// the default rustls/webpki roots don't include; the Job mounts that CA and points the env at it.
+/// Absent the env, the default client (public roots) is used — fine for plain-HTTP / public-cert
+/// endpoints. `add_root_certificate` augments the default roots, it doesn't replace them.
+fn build_http_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Ok(path) = std::env::var("EMBEDDINGS_CA_CERT") {
+        match load_ca(&path) {
+            Ok(cert) => {
+                builder = builder.add_root_certificate(cert);
+                tracing::info!(%path, "embeddings: trusting extra CA");
+            }
+            Err(error) => {
+                tracing::warn!(%error, %path, "embeddings: could not load EMBEDDINGS_CA_CERT; using default roots");
+            }
+        }
+    }
+    builder
+        .build()
+        .expect("building the embeddings HTTP client with default roots cannot fail")
+}
+
+fn load_ca(path: &str) -> anyhow::Result<reqwest::Certificate> {
+    let pem = std::fs::read(path)?;
+    Ok(reqwest::Certificate::from_pem(&pem)?)
+}
+
 impl EmbeddingsClient {
     pub fn new(base_url: &str, api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             url: format!("{base_url}/v1/embeddings"),
             api_key: api_key.into(),
             model: model.into(),
-            http: reqwest::Client::new(),
+            http: build_http_client(),
         }
     }
 
