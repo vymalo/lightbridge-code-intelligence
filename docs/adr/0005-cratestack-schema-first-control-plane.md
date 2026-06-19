@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-18
+- **Updated:** 2026-06-19 — cratestack 0.4.x grammar confirmed; `.cstack` rewritten to it; codegen still deferred (see Update below).
 
 ## Context and Problem Statement
 
@@ -37,3 +38,19 @@ enabled.
 - Bad, because until codegen is wired, `.cstack` and `types.rs` must be kept in sync by hand.
 - Neutral, because banking-grade primitives (idempotency keys, optimistic locking, audit logging)
   are a follow-up once the grammar is fixed.
+
+## Update (2026-06-19)
+
+cratestack reached **0.4.9** (published 2026-06-17). The grammar is now confirmed against its docs
+to be **Prisma-like**: `datasource`/`auth`/`type` blocks, models with `@relation`, `@@allow` policy
+expressions, and proc-macro codegen (`include_server_schema!`) rather than a CLI/xtask codegen step.
+
+The earlier `.cstack` draft was written in an invented grammar (`Bool`, `@auto`, `@ref(...)`,
+`policy: public`, `-> Type`) that does **not** parse under 0.4.x. It has been rewritten to the real
+grammar, and `just validate-schema` lints it (best-effort; skips when `cratestack-cli` is absent).
+
+**Codegen remains deferred.** At ~two days old and a few hundred downloads, 0.4.x is too young to
+bind a "banking-grade" control plane to; `src/types.rs` stays the hand-written, compiled source. Two
+constructs the public docs do not specify — procedure-level policy syntax and the `autoincrement`
+default — are flagged `# TODO(grammar)` in the schema and must be confirmed with the validator before
+codegen is enabled. Revisit adoption once cratestack matures.

@@ -9,8 +9,8 @@ the ADORSYS-GIS AI Governance doctrine. This is recorded as
 - **Pairing** — non-trivial and security-sensitive work is paired (or mob-reviewed). Two sets of
   eyes on the trust boundary, the auth path, and the indexing pipeline.
 - **Test-Driven Development** — write the failing test first, then the code. The control plane's
-  webhook handling, idempotency, line-validation, and the `/auth/verify` contract are natural TDD
-  targets.
+  webhook handling, idempotency, line-validation, and JWT/JWKS resource-server validation are
+  natural TDD targets.
 - **Continuous Integration** — `main` stays green. Every change runs the quality gates in CI
   (mirroring the local pre-push gates below).
 - **Small releases** — ship small, frequent, reversible changes. Prefer many small PRs over a big

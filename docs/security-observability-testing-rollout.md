@@ -15,10 +15,10 @@
 
 These are two separate planes, intentionally kept apart:
 
-- **Authentication (authN)** — proving *who* a web user is. Handled by the Next.js web app's
-  better-auth integration, which delegates credential verification to our own standalone, portable
-  Rust backend (`POST ${AUTH_BACKEND_URL}/auth/verify`). See
-  [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md).
+- **Authentication (authN)** — proving *who* a web user is. Login is owned by **Keycloak** (OIDC);
+  the Next.js web app is an OIDC client and the Rust control plane is a resource server that
+  validates bearer JWTs against Keycloak's JWKS (`iss` / `aud` / `exp`). See
+  [ADR-0014](adr/0014-keycloak-oidc-resource-server.md).
 - **Authorization (authZ)** — deciding *what* a caller may do at the gateway edge. Handled by
   **Envoy + Authorino** together with the separate
   [`ADORSYS-GIS/lightbridge-authz`](https://github.com/ADORSYS-GIS/lightbridge-authz) component.
@@ -70,7 +70,7 @@ and [ADR-0011](adr/0011-engineering-practices-xp-lean-devops.md).
 |---|---|---|---|
 | Unit | pure logic | command parsing, state transitions, line-validation | `cargo nextest`, Vitest |
 | Integration | service boundaries | webhook receiver + Postgres, Neo4j ingestion, pgvector search | `cargo nextest`, docker compose |
-| Contract | stable interfaces | MCP schema tests, GitHub payload fixtures, `/auth/verify` contract | `wiremock`, fixtures |
+| Contract | stable interfaces | MCP schema tests, GitHub payload fixtures, JWT/JWKS resource-server validation | `wiremock`, fixtures |
 | End-to-end | full flow | mention `@lightbridge`, receive comment back | e2e harness |
 | Fuzz | parser and webhook robustness | malformed JSON, giant payloads, odd unicode | fuzz targets |
 | Security tests | policy posture | prompt-injection fixtures, secret redaction tests | fixtures |

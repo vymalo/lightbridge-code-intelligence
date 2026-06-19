@@ -40,11 +40,13 @@ See [ADR-0001](adr/0001-use-github-app.md) for why a GitHub App is preferred ove
 | `GET` | `/metrics` | Prometheus/OTel-compatible export |
 | `POST` | `/internal/tasks/{id}/cancel` | Internal admin action |
 | `POST` | `/internal/repos/{id}/reindex` | Internal admin action |
-| `POST` | `/auth/verify` | AuthN credential verification (web app's better-auth `rust-backend` plugin) |
+| `GET` | `/me` | Returns the caller's verified identity claims (first authenticated endpoint) |
 
-> `/auth/verify` is the standalone authentication surface delegated to by the Next.js web app. It
-> is authentication only and is distinct from gateway authorization (Envoy/Authorino +
-> `lightbridge-authz`). See [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md).
+> The control plane is a pure OAuth2 **resource server**: it issues no tokens and stores no users.
+> Protected endpoints (e.g. `GET /me`) require a **Bearer access token** issued by the OIDC provider
+> (Keycloak), validated as an RS256 JWT against the provider's **JWKS** (`iss` / `aud` / `exp`).
+> This is authentication only and is distinct from gateway authorization (Envoy/Authorino +
+> `lightbridge-authz`). See [ADR-0014](adr/0014-keycloak-oidc-resource-server.md).
 
 ## Idempotency model
 

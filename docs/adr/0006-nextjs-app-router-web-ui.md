@@ -27,7 +27,7 @@ chosen auth library.
 ## Decision Outcome
 
 Chosen option: **Next.js with the App Router.** It gives server components and SSR, fits the
-Turborepo workspace as `apps/web`, and integrates with [better-auth](0007-better-auth-rust-backend-plugin.md).
+Turborepo workspace as `apps/web`, and runs the [Keycloak OIDC client flow](0014-keycloak-oidc-resource-server.md).
 
 ### Consequences
 

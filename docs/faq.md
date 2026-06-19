@@ -56,19 +56,20 @@ control plane.
 
 They are deliberately separate planes:
 
-- **Authentication (authN)** answers *"who is this web user?"* It is handled by the Next.js web app
-  (`apps/web`) using **better-auth**, with a custom `rust-backend` plugin that POSTs credentials to
-  **our own standalone, portable Rust backend** (the control plane) at
-  `${AUTH_BACKEND_URL}/auth/verify`. This Rust backend *is* part of this project. See
-  [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md).
+- **Authentication (authN)** answers *"who is this web user?"* Login is owned by **Keycloak** (the
+  OIDC provider) — we manage no credentials. The Next.js web app (`apps/web`) is an
+  **OIDC client** (Authorization-Code + PKCE) that stores the access token in an httpOnly cookie;
+  the Rust control plane is a pure **resource server** that validates that JWT against Keycloak's
+  JWKS. See [ADR-0014](adr/0014-keycloak-oidc-resource-server.md).
 - **Authorization (authZ)** answers *"is this caller allowed to do this?"* at the gateway edge. It
   is handled by **Envoy + Authorino** together with the separate
   [`ADORSYS-GIS/lightbridge-authz`](https://github.com/ADORSYS-GIS/lightbridge-authz) component.
-  `lightbridge-authz` is **not** this project's auth backend, and our better-auth Rust backend is
+  `lightbridge-authz` is **not** this project's auth backend, and our OIDC resource server is
   **not** the gateway authorizer.
 
-In short: better-auth + our Rust backend = authN (login). Envoy/Authorino/lightbridge-authz = authZ
-(access control at the gateway). They do not overlap.
+In short: Keycloak + our OIDC client/resource server = authN (login). Envoy/Authorino/lightbridge-authz
+= authZ (access control at the gateway). They do not overlap, though both validate the same
+Keycloak-issued JWTs.
 
 ## What is the MVP?
 
