@@ -385,18 +385,7 @@ pub async fn upsert_code_chunks(
     let mut tx = pool.begin().await.context("begin upsert transaction")?;
     let mut count = 0usize;
     for chunk in chunks {
-        // Build `[f0,f1,...,fn]` in a single pre-allocated buffer rather than collecting
-        // 1536 individual String allocations then joining (saves ~100 KB per chunk round-trip).
-        let mut emb = String::with_capacity(chunk.embedding.len() * 12 + 2);
-        emb.push('[');
-        for (i, f) in chunk.embedding.iter().enumerate() {
-            if i > 0 {
-                emb.push(',');
-            }
-            use std::fmt::Write as _;
-            let _ = write!(emb, "{f}");
-        }
-        emb.push(']');
+        let emb = vector_literal(&chunk.embedding);
         sqlx::query(
             "INSERT INTO code_chunks \
              (repository_id, commit_sha, file_path, language, chunk_type, symbol_name, \
@@ -427,6 +416,64 @@ pub async fn upsert_code_chunks(
     }
     tx.commit().await.context("commit upsert transaction")?;
     Ok(count)
+}
+
+/// Render a float slice as a pgvector text literal `[f0,f1,…]` in one pre-allocated buffer
+/// (`$N::vector` casts it server-side, so no extra crate is needed).
+fn vector_literal(v: &[f32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(v.len() * 12 + 2);
+    s.push('[');
+    for (i, f) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{f}");
+    }
+    s.push(']');
+    s
+}
+
+/// One semantic-search hit (a `code_chunks` row + its similarity score). Serialized straight to the
+/// retrieval API the vector MCP server calls.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct CodeChunkHit {
+    pub file_path: String,
+    pub language: String,
+    pub chunk_type: String,
+    pub symbol_name: Option<String>,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+    /// Cosine similarity in `[0,1]` (`1 - cosine_distance`); higher is closer.
+    pub score: f64,
+}
+
+/// Semantic search: the `limit` nearest chunks to `query_embedding` within one repo snapshot,
+/// by cosine distance (the HNSW index's operator class). Scoped by `(repository_id, commit_sha)` so
+/// a task only ever sees its own repo's index — the caller never picks the scope (trust boundary).
+pub async fn search_code_chunks(
+    pool: &PgPool,
+    repository_id: i64,
+    commit_sha: &str,
+    query_embedding: &[f32],
+    limit: i64,
+) -> Result<Vec<CodeChunkHit>, sqlx::Error> {
+    let emb = vector_literal(query_embedding);
+    sqlx::query_as::<_, CodeChunkHit>(
+        "SELECT file_path, language, chunk_type, symbol_name, start_line, end_line, content, \
+                1.0 - (embedding <=> $1::vector) AS score \
+         FROM code_chunks \
+         WHERE repository_id = $2 AND commit_sha = $3 \
+         ORDER BY embedding <=> $1::vector \
+         LIMIT $4",
+    )
+    .bind(&emb)
+    .bind(repository_id)
+    .bind(commit_sha)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -695,5 +742,68 @@ mod tests {
             .unwrap()
             .unwrap()
             .id
+    }
+
+    /// A 1536-dim one-hot vector (a 1.0 at `hot`, zeros elsewhere) — distinct directions give
+    /// clean, predictable cosine ordering for the search test.
+    fn one_hot(hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 1536];
+        v[hot] = 1.0;
+        v
+    }
+
+    fn chunk_at(file: &str, line: i32, hot: usize) -> CodeChunk {
+        CodeChunk {
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some(file.to_string()),
+            start_line: line,
+            end_line: line + 5,
+            content: format!("// {file}"),
+            embedding: one_hot(hot),
+        }
+    }
+
+    /// Semantic search returns the nearest chunk first (cosine), scoped to the repo+commit, and
+    /// honours the limit. Exercises the real pgvector `<=>` path + HNSW index.
+    #[sqlx::test]
+    async fn search_code_chunks_ranks_by_cosine_and_scopes(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let chunks = vec![
+            chunk_at("a.rs", 1, 0),
+            chunk_at("b.rs", 1, 5),
+            chunk_at("c.rs", 1, 9),
+        ];
+        upsert_code_chunks(&pool, repo_id, "headsha", &chunks)
+            .await
+            .unwrap();
+        // A chunk on a *different* commit must not show up (scope check).
+        upsert_code_chunks(&pool, repo_id, "othersha", &[chunk_at("a.rs", 1, 0)])
+            .await
+            .unwrap();
+
+        // Query closest to the `hot=5` direction → b.rs ranks first with score ~1.0.
+        let hits = search_code_chunks(&pool, repo_id, "headsha", &one_hot(5), 2)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "limit honoured");
+        assert_eq!(hits[0].file_path, "b.rs");
+        assert!(
+            hits[0].score > 0.99,
+            "exact direction ~1.0, got {}",
+            hits[0].score
+        );
+        assert!(hits[0].score >= hits[1].score, "ordered by similarity");
+
+        // Only this commit's chunks are searched (othersha excluded).
+        let all = search_code_chunks(&pool, repo_id, "headsha", &one_hot(0), 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "scoped to (repo, headsha) — othersha not included"
+        );
     }
 }

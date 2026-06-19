@@ -322,6 +322,137 @@ pub async fn ingest_graph(
     }
 }
 
+/// Resolve a task's `(repository_id, commit_sha)` — the scope every retrieval query is pinned to.
+/// `commit_sha` is the head SHA the index was built at (or the default branch). Returns `None` for
+/// an unknown task. The caller never supplies the scope, so a task can only read its own repo.
+async fn task_scope(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<(i64, String)>, sqlx::Error> {
+    Ok(crate::db::get_task_context(pool, id).await?.map(|ctx| {
+        let commit = ctx.head_sha.unwrap_or(ctx.default_branch);
+        (ctx.repository_id, commit)
+    }))
+}
+
+/// Clamp a caller-supplied limit into a sane range (default 10, max 100).
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(10).clamp(1, 100)
+}
+
+/// Body for `POST /internal/tasks/{id}/search` — the query already embedded by the caller (the
+/// vector MCP server embeds the text with the runner's embeddings key; the control plane holds none).
+#[derive(Debug, Deserialize)]
+pub struct SearchRequest {
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `POST /internal/tasks/{id}/search` — semantic search over the task's pgvector index.
+pub async fn search(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SearchRequest>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    if req.embedding.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty embedding").into_response();
+    }
+    let scope = match task_scope(pool, id).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "search scope lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    let (repository_id, commit) = scope;
+    match crate::db::search_code_chunks(
+        pool,
+        repository_id,
+        &commit,
+        &req.embedding,
+        clamp_limit(req.limit),
+    )
+    .await
+    {
+        Ok(hits) => Json(hits).into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "semantic search failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "search error").into_response()
+        }
+    }
+}
+
+/// Body for `POST /internal/tasks/{id}/graph/query` — a small fixed op set over the Neo4j graph.
+#[derive(Debug, Deserialize)]
+pub struct GraphQueryRequest {
+    /// `find_symbol` (needs `term`) or `get_callers` (needs `node_id`).
+    pub op: String,
+    #[serde(default)]
+    pub term: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `POST /internal/tasks/{id}/graph/query` — structural queries over the task's Neo4j graph.
+pub async fn graph_query(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<GraphQueryRequest>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    let scope = match task_scope(pool, id).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "graph-query scope lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    let (repository_id, commit) = scope;
+    let limit = clamp_limit(req.limit);
+
+    let result = match req.op.as_str() {
+        "find_symbol" => {
+            let Some(term) = req.term.as_deref() else {
+                return (StatusCode::BAD_REQUEST, "find_symbol requires `term`").into_response();
+            };
+            crate::neo4j::find_symbol(neo4j, repository_id, &commit, term, limit).await
+        }
+        "get_callers" => {
+            let Some(node_id) = req.node_id.as_deref() else {
+                return (StatusCode::BAD_REQUEST, "get_callers requires `node_id`").into_response();
+            };
+            crate::neo4j::get_callers(neo4j, repository_id, &commit, node_id, limit).await
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unsupported op {other:?} (expected: find_symbol | get_callers)"),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok(hits) => Json(hits).into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, op = %req.op, "graph query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "graph query error").into_response()
+        }
+    }
+}
+
 /// The runner's status report. `detail` is optional free text for diagnostics (not persisted yet).
 #[derive(Debug, Deserialize)]
 pub struct StatusUpdate {

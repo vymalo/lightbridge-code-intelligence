@@ -142,6 +142,57 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
 }
 
 #[tokio::test]
+async fn search_posts_embedding_and_parses_hits() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/search")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "file_path": "src/auth.rs", "language": "rust", "chunk_type": "function",
+                "symbol_name": "validate", "start_line": 10, "end_line": 40,
+                "content": "fn validate() {}", "score": 0.93
+            }
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let hits = client
+        .search(task_id, &[0.1, 0.2, 0.3], 5)
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].file_path, "src/auth.rs");
+    assert!((hits[0].score - 0.93).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn graph_get_callers_posts_op_and_parses_symbols() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph/query")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            { "node_id": "src_math_calc_bump", "label": "bump()", "source_file": "src/math.rs", "start_line": 6 }
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let callers = client
+        .graph_get_callers(task_id, "src_math_add", 10)
+        .await
+        .expect("callers");
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0].node_id, "src_math_calc_bump");
+}
+
+#[tokio::test]
 async fn get_context_errors_on_non_2xx() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

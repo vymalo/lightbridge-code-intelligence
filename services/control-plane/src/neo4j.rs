@@ -6,6 +6,7 @@
 //! the same reason chunk ingestion routes through the control plane rather than direct DB access.
 
 use neo4rs::{query, Graph};
+use serde::Serialize;
 
 /// One graph node submitted by the runner (mirrors a Graphify `graph.json` node).
 #[derive(Debug, Clone)]
@@ -97,6 +98,99 @@ pub async fn upsert_graph(
     Ok((nodes.len(), edges.len()))
 }
 
+/// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
+#[derive(Debug, Serialize)]
+pub struct SymbolHit {
+    pub node_id: String,
+    pub label: String,
+    pub source_file: String,
+    pub start_line: i64,
+}
+
+/// Map a result row's `s.*` projection into a [`SymbolHit`].
+fn symbol_from_row(row: &neo4rs::Row) -> Option<SymbolHit> {
+    Some(SymbolHit {
+        node_id: row.get("node_id").ok()?,
+        label: row.get("label").unwrap_or_default(),
+        source_file: row.get("source_file").unwrap_or_default(),
+        start_line: row.get("start_line").unwrap_or(0),
+    })
+}
+
+/// Find symbols by substring of name / id / file, within one repo snapshot. Scoped by
+/// `(repository_id, commit_sha)` so a task only sees its own repo (trust boundary).
+pub async fn find_symbol(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    term: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<SymbolHit>> {
+    use anyhow::Context;
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
+                 WHERE toLower(s.label) CONTAINS toLower($term) \
+                    OR toLower(s.node_id) CONTAINS toLower($term) \
+                    OR toLower(s.source_file) CONTAINS toLower($term) \
+                 RETURN s.node_id AS node_id, s.label AS label, s.source_file AS source_file, \
+                        s.start_line AS start_line \
+                 LIMIT $limit",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("term", term)
+            .param("limit", limit),
+        )
+        .await
+        .context("find_symbol query")?;
+
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next().await.context("find_symbol row")? {
+        if let Some(hit) = symbol_from_row(&row) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
+/// Return the symbols that **call** `node_id` (reverse `calls` traversal), within one repo snapshot.
+pub async fn get_callers(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    node_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<SymbolHit>> {
+    use anyhow::Context;
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (caller:Symbol {repo_id: $repo, commit: $commit}) \
+                       -[:REL {relation: 'calls'}]-> \
+                       (target:Symbol {repo_id: $repo, commit: $commit, node_id: $id}) \
+                 RETURN caller.node_id AS node_id, caller.label AS label, \
+                        caller.source_file AS source_file, caller.start_line AS start_line \
+                 LIMIT $limit",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("id", node_id)
+            .param("limit", limit),
+        )
+        .await
+        .context("get_callers query")?;
+
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next().await.context("get_callers row")? {
+        if let Some(hit) = symbol_from_row(&row) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +264,27 @@ mod tests {
             .expect("count query");
         let c = count.next().await.expect("row").expect("present");
         assert_eq!(c.get::<i64>("n").unwrap(), 2, "MERGE is idempotent");
+
+        // find_symbol: case-insensitive substring match, scoped to (repo, commit).
+        let found = find_symbol(&graph, 42, commit, "add", 10)
+            .await
+            .expect("find");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id, "src_math_add");
+        assert_eq!(found[0].start_line, 2);
+
+        // get_callers: reverse `calls` traversal — bump() calls add().
+        let callers = get_callers(&graph, 42, commit, "src_math_add", 10)
+            .await
+            .expect("callers");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].node_id, "src_math_calc_bump");
+
+        // Scope isolation: the same query under a different repo id returns nothing.
+        assert!(find_symbol(&graph, 999, commit, "add", 10)
+            .await
+            .expect("find other repo")
+            .is_empty());
 
         // Cleanup.
         graph
