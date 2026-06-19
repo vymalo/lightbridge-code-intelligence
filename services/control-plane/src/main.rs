@@ -85,14 +85,26 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-/// Whether the database dimension of readiness passes. With a pool, requires a successful ping.
-/// Without a pool (no `DATABASE_URL`), only ready when the dev opt-in is set — otherwise a
-/// misconfigured production pod would silently run per-replica in-memory dedup yet report ready.
-fn db_dimension_ready(has_pool: bool, ping_ok: bool, allow_no_db: bool) -> bool {
-    if has_pool {
-        ping_ok
-    } else {
-        allow_no_db
+/// The database dimension of readiness. With a pool, readiness requires a successful ping; without
+/// one (no `DATABASE_URL`), the pod is ready only under the dev opt-in — otherwise a misconfigured
+/// production pod would silently run per-replica in-memory dedup yet report ready. The three
+/// outcomes map to distinct `/readyz` messages so a database outage isn't mistaken for missing
+/// config.
+#[derive(Debug, PartialEq, Eq)]
+enum DbReadiness {
+    Ready,
+    /// Pool present but the database did not answer (outage / network).
+    Unreachable,
+    /// No `DATABASE_URL` and no dev opt-in — fail closed.
+    NotConfigured,
+}
+
+fn db_readiness(has_pool: bool, ping_ok: bool, allow_no_db: bool) -> DbReadiness {
+    match (has_pool, ping_ok, allow_no_db) {
+        (true, true, _) => DbReadiness::Ready,
+        (true, false, _) => DbReadiness::Unreachable,
+        (false, _, true) => DbReadiness::Ready,
+        (false, _, false) => DbReadiness::NotConfigured,
     }
 }
 
@@ -134,18 +146,28 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
     }
-    // A configured database must be reachable. With no database, we report ready only when the
-    // dev opt-in (`ALLOW_NO_DB`) is set — otherwise a misconfigured prod pod would fail closed
-    // rather than silently dedup in process memory across replicas.
-    let db_ok = match &state.db {
-        Some(pool) => db_dimension_ready(true, db::ping(pool).await.is_ok(), state.allow_no_db),
-        None => db_dimension_ready(false, false, state.allow_no_db),
+    // A configured database must be reachable. With no database, we report ready only when the dev
+    // opt-in (`ALLOW_NO_DB`) is set — otherwise a misconfigured prod pod would silently dedup in
+    // process memory across replicas. The two failure modes get distinct messages so an outage is
+    // not mistaken for missing configuration.
+    let ping_ok = match &state.db {
+        Some(pool) => db::ping(pool).await.is_ok(),
+        None => false,
     };
-    if !db_ok {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database not configured (set DATABASE_URL; ALLOW_NO_DB=1 for dev only)",
-        );
+    match db_readiness(state.db.is_some(), ping_ok, state.allow_no_db) {
+        DbReadiness::Ready => {}
+        DbReadiness::Unreachable => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database connection failed",
+            )
+        }
+        DbReadiness::NotConfigured => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database not configured (set DATABASE_URL; ALLOW_NO_DB=1 for dev only)",
+            )
+        }
     }
     (StatusCode::OK, "ok")
 }
@@ -176,18 +198,23 @@ mod tests {
 
     #[test]
     fn with_pool_readiness_follows_the_ping() {
-        // A configured database must actually answer; the dev opt-in never overrides a failed ping.
-        assert!(db_dimension_ready(true, true, false));
-        assert!(!db_dimension_ready(true, false, false));
-        assert!(!db_dimension_ready(true, false, true));
+        // A configured database must actually answer; a failed ping is reported as Unreachable
+        // (distinct from missing config), and the dev opt-in never overrides it.
+        assert_eq!(db_readiness(true, true, false), DbReadiness::Ready);
+        assert_eq!(db_readiness(true, false, false), DbReadiness::Unreachable);
+        assert_eq!(db_readiness(true, false, true), DbReadiness::Unreachable);
     }
 
     #[test]
     fn without_pool_requires_the_dev_opt_in() {
-        // No DATABASE_URL: ready only when ALLOW_NO_DB is set — otherwise fail closed so a
-        // misconfigured prod pod is never handed traffic it would dedup only in process memory.
-        assert!(!db_dimension_ready(false, false, false));
-        assert!(db_dimension_ready(false, false, true));
+        // No DATABASE_URL: ready only when ALLOW_NO_DB is set — otherwise NotConfigured (fail
+        // closed) so a misconfigured prod pod is never handed traffic it would dedup only in memory.
+        assert_eq!(
+            db_readiness(false, false, false),
+            DbReadiness::NotConfigured
+        );
+        assert_eq!(db_readiness(false, true, false), DbReadiness::NotConfigured);
+        assert_eq!(db_readiness(false, false, true), DbReadiness::Ready);
     }
 
     #[test]
