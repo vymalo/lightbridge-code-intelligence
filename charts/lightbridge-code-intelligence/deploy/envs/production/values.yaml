@@ -6,11 +6,11 @@ lci:
       containers:
         main:
           image:
-            tag: sha-658d07d
+            tag: sha-918244a
             repository: ghcr.io/vymalo/lightbridge-control-plane
     web:
       containers:
         main:
           image:
-            tag: sha-658d07d
+            tag: sha-918244a
             repository: ghcr.io/vymalo/lightbridge-web
