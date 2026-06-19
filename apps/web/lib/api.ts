@@ -1,5 +1,6 @@
 import { SESSION_COOKIE } from "@lightbridge/auth";
 import { cookies } from "next/headers";
+import type { Repository } from "@/lib/repos";
 import type { Task } from "@/lib/tasks";
 
 /**
@@ -59,6 +60,18 @@ export async function getTask(id: string): Promise<ApiResult<Task | null>> {
     if (res.status === 404) return { ok: true, data: null };
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as Task };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `GET /repositories` — connected repositories + run activity. */
+export async function listRepositories(): Promise<ApiResult<Repository[]>> {
+  try {
+    const res = await authedFetch("/repositories");
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as Repository[] };
   } catch {
     return { ok: false, reason: "unavailable" };
   }
