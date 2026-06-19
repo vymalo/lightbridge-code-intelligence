@@ -1,0 +1,25 @@
+# Production image tags for Lightbridge Code Intelligence.
+#
+# argocd-image-updater OWNS the `tag` fields below. On each `main` build it
+# selects the newest signed `sha-<gitsha>` image from GHCR and commits the new
+# tag here (git write-back). The ai-helm `aii-lightbridge-code-intelligence`
+# Application reads this file as its `$values` source (targetRevision: main), so
+# the commit auto-syncs to the cluster — no ai-helm release per deploy.
+#
+# Do NOT hand-edit the tags: image-updater is the source of truth and will
+# overwrite manual changes. The keys mirror the chart's image paths in
+# ai-helm/charts/lightbridge-code-intelligence (bjw-s app-template, alias `lci`).
+lci:
+  controllers:
+    control-plane:
+      containers:
+        main:
+          image:
+            repository: ghcr.io/vymalo/lightbridge-control-plane
+            tag: "sha-773abea"
+    web:
+      containers:
+        main:
+          image:
+            repository: ghcr.io/vymalo/lightbridge-web
+            tag: "sha-773abea"

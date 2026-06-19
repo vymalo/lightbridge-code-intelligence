@@ -2,8 +2,12 @@
 # (ghcr.io/<owner>/lightbridge-control-plane and .../lightbridge-web).
 #
 # PRs run `build` (validate only — no registry credentials). Pushes to main and version
-# tags run `publish` (the only job granted packages: write). To cut the `0.1.0` tag the
-# deployment pins, push a git tag `v0.1.0`.
+# tags run `publish` (the only job granted packages: write + id-token: write). To cut the
+# `0.1.0` tag the deployment pins, push a git tag `v0.1.0`.
+#
+# `publish` also cosign-signs each pushed digest (keyless, GitHub OIDC). On every main
+# build argocd-image-updater promotes the newest signed `sha-<gitsha>` by committing it
+# to deploy/envs/production/values.yaml — see deploy/README.md.
 name: Build images
 
 on:
@@ -45,12 +49,16 @@ jobs:
           cache-to: type=gha,mode=max
 
   publish:
-    # main / version tags: build + push to GHCR. Only this job can write packages.
+    # main / version tags: build + push to GHCR, then cosign-sign each pushed
+    # digest. Only this job can write packages. `id-token: write` lets cosign
+    # mint a keyless Fulcio cert from the GitHub OIDC token (no long-lived key);
+    # argocd-image-updater verifies that signature before promoting an image.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +70,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -79,6 +89,7 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -88,3 +99,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Keyless cosign signature over the immutable digest (covers every tag that
+      # points at it). argocd-image-updater refuses any digest whose signature
+      # doesn't trace back to this workflow's identity (Fulcio + Rekor).
+      - name: Sign image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
