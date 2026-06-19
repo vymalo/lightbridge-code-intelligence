@@ -4,55 +4,210 @@
 [![GitHub App](https://img.shields.io/badge/GitHub-App-green.svg)](https://github.com/apps)
 
 Lightbridge is a GitHub App for **intelligent code review and repository Q&A**. It listens for
-GitHub webhook events, creates task records in a Rust control plane, and runs the requested work in
-isolated Kubernetes Jobs — backed by repository-aware retrieval over a Neo4j knowledge graph
-(structure) and pgvector (semantics), with reasoning performed by OpenCode agents over ACP/MCP.
-The Rust control plane is the trust boundary: the agent proposes, the control plane validates and
-writes back.
+GitHub webhook events, records work in a Rust control plane, and runs each task in an isolated,
+short-lived Kubernetes Job. The work is backed by **repository-aware retrieval** over two
+complementary indexes — a Neo4j knowledge graph (structure) and pgvector (semantics) — with
+reasoning performed by OpenCode agents over ACP/MCP.
 
-## Architecture
+The Rust control plane is the **trust boundary**: it owns all secrets, the agent only proposes, and
+the control plane validates results before any write-back to GitHub.
+
+---
+
+## System architecture
+
+One control-plane binary runs in two roles (`serve` and `dispatcher`); the actual repository work
+runs in disposable per-task Jobs that hold no long-lived credentials.
 
 ```mermaid
 flowchart TD
-    WEB["Next.js web + auth<br/>(better-auth)"] -->|authN via /auth/verify| CP
-    GH["GitHub App<br/>(webhooks)"] -->|webhook| CP["Rust Control Plane<br/>(trust boundary)"]
-    CP -->|validated write-back| GH
-    CP -->|create Job| K8S["Kubernetes<br/>(isolated Jobs)"]
-    CP --> GRAPHIFY["Graphify<br/>(parser / indexer)"]
-    GRAPHIFY --> NEO["Neo4j<br/>(graph / structure)"]
-    GRAPHIFY --> VEC["pgvector<br/>(semantics)"]
-    K8S --> AGENT["OpenCode Agent<br/>(ACP / MCP reasoning)"]
-    NEO -->|MCP retrieval| AGENT
-    VEC -->|MCP retrieval| AGENT
-    AGENT -->|structured result| CP
+    subgraph external["External services"]
+        GH["GitHub App<br/>(webhooks + API)"]
+        KC["Keycloak<br/>(OIDC IdP)"]
+        EAIG["eaig / core-gateway<br/>(OpenAI-compatible embeddings)"]
+    end
+
+    WEB["Next.js web console<br/>(OIDC Auth Code + PKCE)"]
+
+    subgraph cp["Rust control plane — trust boundary"]
+        SERVE["role: serve<br/>HTTP API · mints tokens · validates JWT"]
+        DISP["role: dispatcher<br/>queue consumer"]
+        Q[("Postgres<br/>work queue")]
+    end
+
+    subgraph job["Kubernetes Job (ephemeral, per task)"]
+        RUNNER["agent-runner<br/>clone · index · reason"]
+        TS["tree-sitter chunker"]
+        GFY["Graphify (planned)"]
+    end
+
+    VEC[("pgvector<br/>semantic")]
+    NEO[("Neo4j<br/>structural")]
+    AGENT["OpenCode agent (planned)"]
+
+    KC -. login .-> WEB
+    WEB -->|"Bearer JWT (read)"| SERVE
+    GH -->|webhook| SERVE
+    SERVE -->|enqueue| Q
+    Q -->|"claim (SKIP LOCKED)"| DISP
+    DISP -->|"one Job per task"| RUNNER
+    SERVE <-->|"context · token · status · chunks"| RUNNER
+    RUNNER --> TS
+    RUNNER --> GFY
+    TS -->|embeddings| EAIG
+    EAIG --> VEC
+    GFY --> NEO
+    VEC -. MCP .-> AGENT
+    NEO -. MCP .-> AGENT
+    AGENT -. result .-> SERVE
+    SERVE -. writeback .-> GH
 ```
 
-See [docs/architecture.md](docs/architecture.md) for diagrams and the full picture, including the
-web & auth tier and the schema-first control plane.
+> `(planned)` and the dotted edges mark parts that are designed and decided but not yet implemented
+> (epic #5, slices 3–6). Everything with a solid edge is on `main` today.
+
+See [docs/architecture.md](docs/architecture.md) and [docs/INDEX.md](docs/INDEX.md) for the full
+picture.
+
+---
+
+## Why two indexers? (tree-sitter chunker **and** Graphify)
+
+This is the most common point of confusion, so it's worth being explicit: the Rust tree-sitter
+chunker and Graphify are **not** doing the same job twice. They feed **two different stores that
+answer two different kinds of question** — the dual-retrieval design
+([ADR-0003](docs/adr/0003-dual-retrieval-neo4j-pgvector.md),
+[ADR-0010](docs/adr/0010-graphify-treesitter-indexing-baseline.md)). A good code review needs both
+kinds of recall, and no single store does both well.
+
+```mermaid
+flowchart LR
+    SRC["Repo checkout<br/>(one clone, in the runner)"]
+
+    SRC --> TS["tree-sitter chunker<br/>splits into semantic units"]
+    SRC --> GFY["Graphify<br/>extracts symbols + relationships"]
+
+    TS --> VEC[("pgvector<br/>embedding per chunk")]
+    GFY --> NEO[("Neo4j<br/>typed graph")]
+
+    VEC --> QS["Semantic question:<br/>'where is similar behaviour?'"]
+    NEO --> QG["Structural question:<br/>'what calls this? PR impact?'"]
+```
+
+| | **tree-sitter chunker → pgvector** | **Graphify → Neo4j** |
+|---|---|---|
+| Kind of recall | **Semantic** (vector similarity) | **Structural** (graph traversal) |
+| Question it answers | "where is similar code / behaviour?", natural-language search | "what calls this function?", "what does this PR touch?", containment, test ownership |
+| What it emits | embedding-sized chunks with stable source ranges | nodes (symbols, files) + edges (defines, calls, imports) |
+| Why this tool | purpose-built, lightweight, in-process Rust we control; chunk boundaries are a *chunking* concern | specialised multi-modal graph extractor; relationships are a *graph* concern |
+| Can the other store answer it? | ❌ a graph can't rank by semantic similarity | ❌ vector search can't enumerate exact callers |
+| Status | ✅ built (slice 2) | 🔜 slice 3 |
+
+Both run in the **same runner Job over the same checkout** — one indexes for *fuzzy* retrieval, the
+other for *exact* retrieval. The reasoning agent (slice 5) then queries each store via MCP for the
+question it's best at.
+
+---
+
+## Task lifecycle
+
+A task is created from a webhook, parked in the Postgres queue, claimed by a dispatcher under a
+lease, and executed in a Job. Statuses below are the ones the runner reports back to the control
+plane.
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: webhook → enqueue (idempotent)
+    queued --> running: dispatcher claims (lease) + Job starts
+
+    state running {
+        [*] --> cloning
+        cloning --> indexing: checkout ready
+        indexing --> reasoning: vector done / graph planned
+        reasoning --> [*]: review built (planned)
+    }
+
+    running --> posting_result: write-back to GitHub (planned)
+    posting_result --> succeeded
+    running --> succeeded: indexing-only task (today)
+
+    running --> failed: error reported
+    running --> timed_out: activeDeadline exceeded
+    queued --> cancelled: superseded / cancelled
+
+    succeeded --> [*]
+    failed --> [*]
+    timed_out --> [*]
+    cancelled --> [*]
+```
+
+> Today a task runs through **clone → index (pgvector)** and reports `succeeded`. The `reasoning`,
+> `posting_result`, and graph steps are slices 3–6.
+
+---
+
+## Indexing flow (sequence)
+
+How a single task gets from a webhook to stored vectors. Note the runner never holds the GitHub App
+key — it borrows a short-lived installation token from the control plane just-in-time
+([ADR-0002](docs/adr/0002-rust-control-plane-trust-boundary.md),
+[ADR-0017](docs/adr/0017-agent-runner-control-plane-bootstrap.md)).
+
+```mermaid
+sequenceDiagram
+    participant GH as GitHub
+    participant CP as Control plane (serve)
+    participant DB as Postgres (+pgvector)
+    participant DP as Dispatcher
+    participant R as Agent runner (Job)
+    participant E as eaig (embeddings)
+
+    GH->>CP: webhook (PR / command)
+    CP->>DB: enqueue task (idempotent)
+    DP->>DB: claim next (SKIP LOCKED) + lease
+    DP->>R: launch Kubernetes Job
+    R->>CP: GET /internal/tasks/{id}
+    CP-->>R: context + short-lived install token
+    R->>GH: clone @ head SHA (token)
+    R->>R: tree-sitter chunk (Rust/TS/JS/Python)
+    loop batches of 32 chunks
+        R->>E: POST /v1/embeddings
+        E-->>R: vectors
+        R->>CP: POST /internal/tasks/{id}/chunks
+        CP->>DB: upsert code_chunks (vector 1536)
+    end
+    R->>CP: POST /internal/tasks/{id}/status = succeeded
+    Note over R,GH: Graphify→Neo4j, agent reasoning & write-back = slices 3–6
+```
+
+---
 
 ## Monorepo layout
 
-This is a pnpm + Turborepo monorepo with a Cargo `xtask` for Rust automation
+A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust automation
 ([ADR-0009](docs/adr/0009-pnpm-turborepo-monorepo.md)).
 
 | Path | What it is |
 |---|---|
-| `apps/web` | Next.js (App Router) web console; better-auth with a `rust-backend` plugin |
-| `packages/auth` | Shared auth client / better-auth wiring |
+| `apps/web` | Next.js (App Router) web console; OIDC Auth Code + PKCE login against Keycloak ([ADR-0014](docs/adr/0014-keycloak-oidc-resource-server.md)) |
+| `packages/auth` | Shared OIDC/JWT helpers (token verification, claims, session cookie) |
 | `packages/tsconfig` | Shared TypeScript configs |
-| `services/control-plane` | Rust (Axum) control plane; schema-first via cratestack |
+| `services/control-plane` | Rust (Axum) control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. |
+| `services/agent-runner` | Rust per-task Job: bootstraps from the control plane, clones, indexes (tree-sitter → pgvector), reports back |
 | `xtask` | Cargo `xtask` for Rust automation (`cargo xtask ci`, etc.) |
 | `docs/` | Documentation set, ADRs, RFCs, ways of working |
-| `deploy/` | Kubernetes / Helm / Kustomize manifests (planned) |
+| `deploy/` | Kubernetes / Helm / Kustomize manifests (planned, #6) |
 
 ### Kubernetes namespaces
 
 | Namespace | Purpose |
 |-----------|---------|
-| `lightbridge-system` | Control plane, webhook handlers |
+| `lightbridge-system` | Control plane (`serve` + `dispatcher`), webhook handlers |
 | `lightbridge-indexing` | Indexing jobs, Graphify runs |
-| `lightbridge-agents` | OpenCode agent containers |
+| `lightbridge-agents` | Agent-runner / OpenCode containers |
 | `lightbridge-data` | Neo4j, PostgreSQL/pgvector |
+
+---
 
 ## Prerequisites
 
@@ -81,8 +236,9 @@ pnpm install && cargo fetch          # just setup
 docker compose up -d                 # just up
 pnpm dev                             # just dev
 
-# Run only one side:
-cargo run -p control-plane           # just dev-backend
+# Run only one side / role:
+cargo run -p control-plane           # serve role (default)
+cargo run -p control-plane dispatcher # dispatcher role
 pnpm --filter @lightbridge/web dev   # just dev-web
 ```
 
@@ -114,9 +270,11 @@ framework (Definition of Ready/Done, AI usage declarations). See
 
 ## Development status
 
-🚧 **Early development.** The architecture and decisions are documented; implementation is
-in progress. See the [Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for
-the roadmap.
+🚧 **Active early development.** Foundation, control plane (webhooks, Postgres work queue +
+dispatcher, OIDC), web console, and the pgvector indexer are on `main`. The structural graph
+(Graphify → Neo4j), MCP servers, OpenCode reasoning, and validated write-back are in progress under
+epic [#5](https://github.com/vymalo/lightbridge-code-intelligence/issues/5). See the
+[Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for the roadmap.
 
 ## License
 
@@ -125,7 +283,8 @@ MIT — see [LICENSE](LICENSE).
 ## Acknowledgments
 
 - [Graphify](https://github.com/safishamsi/graphify) — multi-modal graph extraction
+- [tree-sitter](https://tree-sitter.github.io/) — syntax-aware parsing / chunking
 - [OpenCode](https://opencode.ai) — agent reasoning framework
 - [Neo4j](https://neo4j.com/) — graph database
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL vector extension
-- [better-auth](https://better-auth.com) — web authentication
+- [Keycloak](https://www.keycloak.org/) — OIDC identity provider
