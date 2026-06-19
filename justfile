@@ -26,8 +26,14 @@ dev:
 # ALLOW_NO_DB=1 lets dev run degraded without a database (in-memory dedup, single-replica). In
 # production DATABASE_URL is set instead; a pod missing it fails readiness on purpose, rather than
 # silently dedup'ing per-replica in memory (RFC-0001 Phase 0). Export DATABASE_URL to use Postgres.
+# NEO4J_URI points at the compose Neo4j so structural-graph ingestion works locally (ADR-0019);
+# unset, the /internal/tasks/{id}/graph route fails closed (503).
 dev-backend:
-    ALLOW_NO_DB=1 cargo run -p control-plane
+    ALLOW_NO_DB=1 \
+    NEO4J_URI=${NEO4J_URI:-bolt://localhost:7687} \
+    NEO4J_USER=${NEO4J_USER:-neo4j} \
+    NEO4J_PASSWORD=${NEO4J_PASSWORD:-lightbridge} \
+    cargo run -p control-plane
 
 # Run the web app only.
 dev-web:

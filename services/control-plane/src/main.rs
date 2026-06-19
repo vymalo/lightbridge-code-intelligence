@@ -13,6 +13,7 @@ mod internal;
 mod jwt;
 mod k8s;
 mod metrics;
+mod neo4j;
 mod tasks;
 mod types;
 mod webhook;
@@ -54,6 +55,10 @@ pub struct AppState {
     /// routes (they fail closed with 503) — the control plane injects the same value into each
     /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
     pub runner_token: Option<Arc<String>>,
+    /// Neo4j (Bolt) handle for the structural code graph (ADR-0019). `None` when `NEO4J_URI` is
+    /// unset — the graph-ingest route then fails closed (503). Held here so the untrusted Job never
+    /// gets Neo4j creds (it POSTs the graph through the internal API instead).
+    pub neo4j: Option<Arc<neo4rs::Graph>>,
     /// Prometheus render handle backing `/metrics` (scraped by Alloy for the Operations dashboard).
     pub metrics: PrometheusHandle,
 }
@@ -62,6 +67,15 @@ impl AppState {
     async fn from_env() -> anyhow::Result<Self> {
         let metrics = metrics::install();
         let db = db::connect_from_env().await?;
+        let neo4j = match neo4j::connect_from_env().await {
+            Ok(handle) => handle.map(Arc::new),
+            // A graph store outage shouldn't stop the control plane from serving everything else;
+            // the graph-ingest route fails closed (503) when this is None.
+            Err(error) => {
+                tracing::error!(%error, "neo4j connection failed; graph ingestion disabled");
+                None
+            }
+        };
         let allow_no_db = env_flag("ALLOW_NO_DB");
         if db.is_none() {
             if allow_no_db {
@@ -88,6 +102,7 @@ impl AppState {
                 .ok()
                 .filter(|token| !token.is_empty())
                 .map(Arc::new),
+            neo4j,
             metrics,
         })
     }
@@ -145,6 +160,12 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/chunks",
             post(internal::ingest_chunks).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        // The structural graph (Graphify → Neo4j, ADR-0019). A whole-repo graph.json can be large,
+        // so raise the body limit here too.
+        .route(
+            "/internal/tasks/{id}/graph",
+            post(internal::ingest_graph).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)

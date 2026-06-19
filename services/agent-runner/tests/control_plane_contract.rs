@@ -104,6 +104,44 @@ async fn submit_chunks_posts_batch_with_bearer() {
 }
 
 #[tokio::test]
+async fn submit_graph_posts_nodes_and_edges_with_bearer() {
+    use agent_runner::client::{GraphBatch, GraphEdgePayload, GraphNodePayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .submit_graph(
+            task_id,
+            GraphBatch {
+                commit_sha: "abc123".to_string(),
+                nodes: vec![GraphNodePayload {
+                    node_id: "src_math_add".to_string(),
+                    label: "add()".to_string(),
+                    source_file: "src/math.rs".to_string(),
+                    start_line: 2,
+                }],
+                edges: vec![GraphEdgePayload {
+                    source: "src_math_calc_bump".to_string(),
+                    target: "src_math_add".to_string(),
+                    relation: "calls".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("graph submitted");
+}
+
+#[tokio::test]
 async fn get_context_errors_on_non_2xx() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

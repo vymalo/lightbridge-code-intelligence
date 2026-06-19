@@ -226,6 +226,102 @@ pub async fn ingest_chunks(
     }
 }
 
+/// One structural-graph node submitted by the runner (a Graphify `graph.json` node).
+#[derive(Debug, Deserialize)]
+pub struct GraphNodeInput {
+    pub node_id: String,
+    pub label: String,
+    pub source_file: String,
+    pub start_line: i64,
+}
+
+/// One directed edge (`contains` / `method` / `calls` / …).
+#[derive(Debug, Deserialize)]
+pub struct GraphEdgeInput {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/graph`.
+#[derive(Debug, Deserialize)]
+pub struct GraphBatch {
+    pub commit_sha: String,
+    pub nodes: Vec<GraphNodeInput>,
+    pub edges: Vec<GraphEdgeInput>,
+}
+
+/// `POST /internal/tasks/{id}/graph` — ingest the structural code graph (Graphify → Neo4j, ADR-0019).
+///
+/// The runner spawns Graphify, reads its `graph.json`, and POSTs nodes+edges here; the control plane
+/// writes them to Neo4j. `repository_id` is read from the DB, not trusted from the caller (ADR-0002).
+pub async fn ingest_graph(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(batch): Json<GraphBatch>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+
+    let repository_id: Option<i64> =
+        match sqlx::query_scalar("SELECT repository_id FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, task_id = %id, "load task for graph ingest failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+            }
+        };
+
+    let Some(repository_id) = repository_id else {
+        return (StatusCode::NOT_FOUND, "task not found").into_response();
+    };
+
+    if batch.nodes.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let nodes: Vec<crate::neo4j::GraphNode> = batch
+        .nodes
+        .into_iter()
+        .map(|n| crate::neo4j::GraphNode {
+            node_id: n.node_id,
+            label: n.label,
+            source_file: n.source_file,
+            start_line: n.start_line,
+        })
+        .collect();
+    let edges: Vec<crate::neo4j::GraphEdge> = batch
+        .edges
+        .into_iter()
+        .map(|e| crate::neo4j::GraphEdge {
+            source: e.source,
+            target: e.target,
+            relation: e.relation,
+        })
+        .collect();
+
+    match crate::neo4j::upsert_graph(neo4j, repository_id, &batch.commit_sha, &nodes, &edges).await
+    {
+        Ok((n, e)) => {
+            tracing::info!(task_id = %id, nodes = n, edges = e, "graph ingested");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "graph upsert failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "upsert error").into_response()
+        }
+    }
+}
+
 /// The runner's status report. `detail` is optional free text for diagnostics (not persisted yet).
 #[derive(Debug, Deserialize)]
 pub struct StatusUpdate {

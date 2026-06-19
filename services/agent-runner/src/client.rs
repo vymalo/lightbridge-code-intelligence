@@ -57,6 +57,31 @@ pub struct ChunkBatch {
     pub chunks: Vec<ChunkPayload>,
 }
 
+/// One structural-graph node (mirrors `internal.rs::GraphNodeInput`).
+#[derive(Debug, Serialize)]
+pub struct GraphNodePayload {
+    pub node_id: String,
+    pub label: String,
+    pub source_file: String,
+    pub start_line: i64,
+}
+
+/// One directed edge (`contains` / `method` / `calls` / …).
+#[derive(Debug, Serialize)]
+pub struct GraphEdgePayload {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/graph`.
+#[derive(Debug, Serialize)]
+pub struct GraphBatch {
+    pub commit_sha: String,
+    pub nodes: Vec<GraphNodePayload>,
+    pub edges: Vec<GraphEdgePayload>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusUpdate<'a> {
     status: &'a str,
@@ -112,6 +137,22 @@ impl ControlPlaneClient {
             .context("submitting chunks")?
             .error_for_status()
             .context("control plane rejected chunk batch")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (Graphify → Neo4j).
+    pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&batch)
+            .send()
+            .await
+            .context("submitting graph")?
+            .error_for_status()
+            .context("control plane rejected graph batch")?;
         Ok(())
     }
 

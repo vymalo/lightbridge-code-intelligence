@@ -90,11 +90,22 @@ async fn run(
 
     let checkout = clone::checkout(&context, &config.workdir).await?;
 
-    // ── Indexing: tree-sitter → pgvector (epic #5, slice 2) ──────────────────────────────────
+    // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────────
     let chunk_count = indexer::index_checkout(&context, &checkout, client, embedder).await?;
 
+    // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────────
+    // Best-effort: the semantic index already landed, and the graph store may be unconfigured
+    // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
+    let graph_summary = match indexer::graph::index_graph(&context, &checkout, client).await {
+        Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
+        Err(error) => {
+            tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
+            "graph skipped".to_string()
+        }
+    };
+
     Ok(format!(
-        "indexed {}/{} at {} — {chunk_count} chunks submitted",
+        "indexed {}/{} at {} — {chunk_count} chunks, {graph_summary}",
         context.owner,
         context.name,
         context
