@@ -71,47 +71,61 @@ pub async fn github_webhook(
     crate::metrics::webhook_delivery(&event);
     tracing::info!(delivery_id, event, "accepted webhook");
 
-    // Route actionable events to a task. For now: a pull_request opened/synchronize/reopened
-    // becomes a review task. Other events are persisted only. (issue_comment commands: follow-up.)
-    if state.db.is_some() && event == "pull_request" {
-        create_pr_task(&state, &payload, &delivery_id).await;
+    // Webhook → internal action mapping (the only events that do anything beyond being persisted):
+    //
+    //   pull_request   opened                  → review task (the automatic FIRST review)
+    //   pull_request   closed                  → cancel the PR's active tasks (+ reaper stops Jobs)
+    //   pull_request   synchronize | reopened  → nothing (re-review must be asked for via @mention)
+    //   issue_comment  created, body @<handle> → review task (a manual re-review)
+    //
+    // Everything else is persisted to `github_deliveries` only.
+    if state.db.is_some() {
+        match event.as_str() {
+            "pull_request" => handle_pull_request(&state, &payload, &delivery_id).await,
+            "issue_comment" => handle_issue_comment(&state, &payload, &delivery_id).await,
+            _ => {}
+        }
     }
 
     (StatusCode::ACCEPTED, "accepted")
 }
 
-/// Create a review task from a `pull_request` webhook (best-effort; logs and skips on malformed
-/// payloads — the delivery is already persisted, so nothing is lost).
-async fn create_pr_task(state: &crate::AppState, payload: &serde_json::Value, delivery_id: &str) {
+/// True when a comment body is addressed to the app — its first non-space text is `@<handle>`
+/// (case-insensitive). A leading `@<handle>` is how a human asks for a re-review.
+fn mentions_handle(body: &str, handle: &str) -> bool {
+    let mention = format!("@{}", handle.to_ascii_lowercase());
+    body.trim_start().to_ascii_lowercase().starts_with(&mention)
+}
+
+/// `pull_request` events. `opened` → the automatic first review. `closed` → cancel the PR's active
+/// tasks (the reaper then stops their Jobs). `synchronize`/`reopened` do nothing — a re-review is
+/// requested with an `@<handle>` comment ([`handle_issue_comment`]).
+async fn handle_pull_request(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
     let Some(pool) = state.db.as_ref() else {
         return;
     };
     let action = payload["action"].as_str().unwrap_or_default();
-    if !matches!(action, "opened" | "synchronize" | "reopened") {
+    if !matches!(action, "opened" | "closed") {
         return;
     }
     let repo = &payload["repository"];
-    let (
-        Some(github_repo_id),
-        Some(owner),
-        Some(name),
-        Some(default_branch),
-        Some(installation_id),
-    ) = (
+    let (Some(github_repo_id), Some(owner), Some(name), Some(default_branch), Some(pr_number)) = (
         repo["id"].as_i64(),
         repo["owner"]["login"].as_str(),
         repo["name"].as_str(),
         repo["default_branch"].as_str(),
-        payload["installation"]["id"].as_i64(),
-    )
-    else {
+        payload["pull_request"]["number"].as_i64(),
+    ) else {
         tracing::warn!(
             delivery_id,
-            "pull_request payload missing fields; skipping task"
+            "pull_request payload missing repo/number fields; skipping"
         );
         return;
     };
-
     let repository_id =
         match crate::db::upsert_repository(pool, github_repo_id, owner, name, default_branch).await
         {
@@ -122,39 +136,173 @@ async fn create_pr_task(state: &crate::AppState, payload: &serde_json::Value, de
             }
         };
 
-    let pr = &payload["pull_request"];
+    match action {
+        "opened" => {
+            let Some(installation_id) = payload["installation"]["id"].as_i64() else {
+                return;
+            };
+            let pr = &payload["pull_request"];
+            let task = crate::db::NewTask {
+                repository_id,
+                installation_id,
+                github_delivery_id: delivery_id.to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: pr_number,
+                command_text: "review".to_string(),
+                base_sha: pr["base"]["sha"].as_str().map(str::to_string),
+                head_sha: pr["head"]["sha"].as_str().map(str::to_string),
+                run_epoch: 0, // the automatic first review
+            };
+            create_review_task(state, pool, task, owner, name, delivery_id).await;
+        }
+        "closed" => {
+            match crate::db::cancel_active_tasks_for_pr(pool, repository_id, pr_number).await {
+                Ok(ids) if !ids.is_empty() => tracing::info!(
+                    delivery_id,
+                    pr = pr_number,
+                    cancelled = ids.len(),
+                    "PR closed; cancelled active tasks (reaper stops their Jobs)"
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, delivery_id, pr = pr_number, "failed to cancel PR tasks")
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `issue_comment` on a PR whose body starts with `@<handle>` → a manual re-review. The comment
+/// payload has no SHAs, so we fetch the PR's base/head via the API; the next `run_epoch` lets a fresh
+/// task through the idempotency index even when the head SHA is unchanged.
+async fn handle_issue_comment(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    if payload["action"].as_str() != Some("created") {
+        return;
+    }
+    // An issue is a PR only when it carries a `pull_request` object.
+    if payload["issue"]["pull_request"].is_null() {
+        return;
+    }
+    let body = payload["comment"]["body"].as_str().unwrap_or_default();
+    if !mentions_handle(body, &state.app_handle) {
+        return; // not addressed to us
+    }
+
+    let repo = &payload["repository"];
+    let (
+        Some(github_repo_id),
+        Some(owner),
+        Some(name),
+        Some(default_branch),
+        Some(installation_id),
+        Some(pr_number),
+    ) = (
+        repo["id"].as_i64(),
+        repo["owner"]["login"].as_str(),
+        repo["name"].as_str(),
+        repo["default_branch"].as_str(),
+        payload["installation"]["id"].as_i64(),
+        payload["issue"]["number"].as_i64(),
+    )
+    else {
+        tracing::warn!(
+            delivery_id,
+            "issue_comment payload missing fields; skipping"
+        );
+        return;
+    };
+
+    let Some(app) = state.github.as_ref() else {
+        tracing::warn!(
+            delivery_id,
+            "github app not configured; cannot fetch PR for re-review"
+        );
+        return;
+    };
+    let token = match app.installation_token(installation_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "mint token for re-review failed");
+            return;
+        }
+    };
+    let (base_sha, head_sha) = match app.pull_request_shas(&token, owner, name, pr_number).await {
+        Ok(shas) => shas,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, pr = pr_number, "fetch PR SHAs failed");
+            return;
+        }
+    };
+    let repository_id =
+        match crate::db::upsert_repository(pool, github_repo_id, owner, name, default_branch).await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(%error, delivery_id, "failed to upsert repository");
+                return;
+            }
+        };
+    let run_epoch = crate::db::next_run_epoch(
+        pool,
+        repository_id,
+        "pull_request",
+        pr_number,
+        "review",
+        head_sha.as_deref(),
+    )
+    .await
+    .unwrap_or(0);
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
         github_delivery_id: delivery_id.to_string(),
         target_type: "pull_request".to_string(),
-        target_id: pr["number"].as_i64().unwrap_or_default(),
+        target_id: pr_number,
         command_text: "review".to_string(),
-        base_sha: pr["base"]["sha"].as_str().map(str::to_string),
-        head_sha: pr["head"]["sha"].as_str().map(str::to_string),
+        base_sha,
+        head_sha,
+        run_epoch,
     };
+    tracing::info!(delivery_id, pr = pr_number, "@mention re-review requested");
+    create_review_task(state, pool, task, owner, name, delivery_id).await;
+}
+
+/// Insert a review task and, on a real insert, 👀 the PR (spawned so external GitHub calls can't
+/// block the webhook's ~10s deadline). Shared by the auto-open and manual-mention paths.
+async fn create_review_task(
+    state: &crate::AppState,
+    pool: &sqlx::PgPool,
+    task: crate::db::NewTask,
+    owner: &str,
+    name: &str,
+    delivery_id: &str,
+) {
+    let (pr, installation_id, run_epoch) = (task.target_id, task.installation_id, task.run_epoch);
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
             crate::metrics::task_created();
-            tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task");
-            // Acknowledge on the PR that the review has started (👀). Spawned, not awaited: the
-            // reaction makes external GitHub calls, and the webhook handler must return well within
-            // GitHub's ~10s delivery timeout. Best-effort — never fails the webhook.
+            tracing::info!(delivery_id, %task_id, pr, run_epoch, "created review task");
             let state = state.clone();
-            let (owner, repo, pr) = (owner.to_string(), name.to_string(), task.target_id);
+            let (owner, name) = (owner.to_string(), name.to_string());
             tokio::spawn(async move {
-                react_seen(&state, &owner, &repo, installation_id, pr).await;
+                react_seen(&state, &owner, &name, installation_id, pr).await;
             });
         }
-        Ok(None) => {
-            // Idempotency index hit: an equivalent task for this PR head already exists.
-            tracing::info!(
-                delivery_id,
-                pr = task.target_id,
-                "review task already queued; skipping (idempotent)"
-            )
-        }
-        Err(error) => tracing::error!(%error, delivery_id, "failed to create task"),
+        Ok(None) => tracing::info!(
+            delivery_id,
+            pr,
+            run_epoch,
+            "review task already exists; skipping (idempotent)"
+        ),
+        Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create task"),
     }
 }
 
@@ -211,6 +359,31 @@ fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mention_must_lead_the_comment() {
+        assert!(mentions_handle(
+            "@lightbridge-assistant please review",
+            "lightbridge-assistant"
+        ));
+        assert!(
+            mentions_handle("  @Lightbridge-Assistant rerun", "lightbridge-assistant"),
+            "leading space + case-insensitive"
+        );
+        // A mid-sentence mention is NOT a command (avoids re-running on casual references).
+        assert!(!mentions_handle(
+            "cc @lightbridge-assistant",
+            "lightbridge-assistant"
+        ));
+        assert!(!mentions_handle(
+            "just a normal comment",
+            "lightbridge-assistant"
+        ));
+        assert!(!mentions_handle(
+            "@someone-else go",
+            "lightbridge-assistant"
+        ));
+    }
 
     #[test]
     fn rejects_when_secret_unset() {

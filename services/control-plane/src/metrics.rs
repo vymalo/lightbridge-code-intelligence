@@ -72,7 +72,7 @@ pub fn dispatch_launch_seconds(seconds: f64) {
 }
 
 /// A reaper reconciliation outcome for a stuck task (RFC-0001 Phase 2): `renewed`, `succeeded`,
-/// `requeued`, or `failed`. String literals → zero-allocation.
+/// `requeued`, `failed`, or `cancelled` (a closed PR's Job stopped). String literals → zero-alloc.
 pub fn reap_outcome(outcome: &'static str) {
     counter!("lci_reaper_tasks_total", "outcome" => outcome).increment(1);
 }

@@ -129,6 +129,32 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
             tracing::error!(%error, task_id = %task.id, "reaper: DB op failed for this task; continuing");
         }
     }
+
+    // Stop the Jobs of cancelled tasks (e.g. a closed PR, RFC-0001 / webhook lifecycle): delete the
+    // Job, then clear `job_name` so it isn't revisited. The control plane that serves webhooks has no
+    // Kubernetes client, so cancellation is recorded in the DB and the Job is reaped here.
+    for task in db::list_cancelled_with_job(pool, REAP_BATCH).await? {
+        let Some(name) = &task.job_name else {
+            continue;
+        };
+        // Only clear `job_name` if the delete actually succeeded — otherwise a transient k8s error
+        // would orphan a live Job (the row would no longer be revisited). `delete_job` treats a
+        // 404 as success, so an already-gone Job still clears. A real error: leave it for next cycle.
+        match launcher.delete_job(name).await {
+            Ok(()) => match db::clear_job_name(pool, task.id).await {
+                Ok(()) => {
+                    crate::metrics::reap_outcome("cancelled");
+                    tracing::info!(task_id = %task.id, "reaper: stopped cancelled task's Job");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, task_id = %task.id, "reaper: failed to clear job_name after cancel")
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, task_id = %task.id, job_name = name, "reaper: failed to delete cancelled task's Job; will retry")
+            }
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +283,7 @@ mod tests {
                 command_text: "review".to_string(),
                 base_sha: None,
                 head_sha: Some("head1".to_string()),
+                run_epoch: 0,
             },
         )
         .await

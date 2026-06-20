@@ -112,6 +112,10 @@ pub struct NewTask {
     pub command_text: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    /// Re-run discriminator (RFC-0001). `0` for the automatic first review; an explicit re-review
+    /// (e.g. an `@mention`) uses the next epoch so the idempotency index lets a new task through for
+    /// the same head SHA. See [`next_run_epoch`].
+    pub run_epoch: i32,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -159,8 +163,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued') \
+         target_id, command_text, base_sha, head_sha, run_epoch, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued') \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id",
@@ -174,6 +178,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.command_text)
     .bind(&task.base_sha)
     .bind(&task.head_sha)
+    .bind(task.run_epoch)
     .fetch_optional(pool)
     .await?;
 
@@ -186,6 +191,77 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
             .await;
     }
     Ok(inserted)
+}
+
+/// Next `run_epoch` for an explicit re-run of a task's natural key: `max(run_epoch) + 1`, or `0` if
+/// none exists yet. Lets a manual re-review (same head SHA) get past the idempotency index.
+pub async fn next_run_epoch(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    command_text: &str,
+    head_sha: Option<&str>,
+) -> Result<i32, sqlx::Error> {
+    let next: Option<i32> = sqlx::query_scalar(
+        "SELECT MAX(run_epoch) + 1 FROM tasks \
+         WHERE repository_id = $1 AND target_type = $2 AND target_id = $3 \
+           AND command_text = $4 AND head_sha IS NOT DISTINCT FROM $5",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(command_text)
+    .bind(head_sha)
+    .fetch_one(pool)
+    .await?;
+    Ok(next.unwrap_or(0))
+}
+
+/// Cancel a PR's active tasks (queued/running/posting_result) — used when the PR is closed so its
+/// work stops. Returns the cancelled task ids. The agent Jobs of cancelled tasks are deleted by the
+/// reaper (the control plane that serves webhooks has no Kubernetes client — trust boundary).
+pub async fn cancel_active_tasks_for_pr(
+    pool: &PgPool,
+    repository_id: i64,
+    pr: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE tasks SET status = 'cancelled', completed_at = now(), \
+             lease_owner = NULL, lease_expires_at = NULL \
+         WHERE repository_id = $1 AND target_type = 'pull_request' AND target_id = $2 \
+           AND status IN ('queued', 'running', 'posting_result') \
+         RETURNING id",
+    )
+    .bind(repository_id)
+    .bind(pr)
+    .fetch_all(pool)
+    .await
+}
+
+/// Cancelled tasks that still have a Kubernetes Job to clean up (the reaper deletes the Job, then
+/// clears `job_name` so the row isn't returned again).
+pub async fn list_cancelled_with_job(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ReapableTask>, sqlx::Error> {
+    sqlx::query_as::<_, ReapableTask>(
+        "SELECT id, job_name, attempts FROM tasks \
+         WHERE status = 'cancelled' AND job_name IS NOT NULL \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Clear a task's `job_name` once its Job has been deleted (so the cleanup is idempotent).
+pub async fn clear_job_name(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tasks SET job_name = NULL WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// Atomically claim the next due `queued` task and take a short dispatch lease. `FOR UPDATE SKIP
@@ -582,6 +658,7 @@ mod tests {
             command_text: "review".to_string(),
             base_sha: Some("base".to_string()),
             head_sha: Some(head.to_string()),
+            run_epoch: 0,
         }
     }
 
@@ -635,6 +712,38 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_none(), "the claimed task is no longer queued");
+    }
+
+    /// `cancel_active_tasks_for_pr` cancels a PR's active task; `next_run_epoch` bumps so a manual
+    /// re-review on the same head can create a new task (webhook re-trigger path).
+    #[sqlx::test]
+    async fn cancel_pr_and_next_run_epoch(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // One task exists at epoch 0 for this key → next is 1.
+        let epoch = next_run_epoch(&pool, repo_id, "pull_request", 7, "review", Some("h1"))
+            .await
+            .unwrap();
+        assert_eq!(epoch, 1);
+        // A never-seen key starts at 0.
+        let zero = next_run_epoch(&pool, repo_id, "pull_request", 999, "review", Some("x"))
+            .await
+            .unwrap();
+        assert_eq!(zero, 0);
+
+        // Closing the PR cancels its active task.
+        let cancelled = cancel_active_tasks_for_pr(&pool, repo_id, 7).await.unwrap();
+        assert_eq!(cancelled, vec![id]);
+        let status: String = sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
     }
 
     /// A released task returns to the queue and can be claimed again (Job-launch failure path).
@@ -701,6 +810,7 @@ mod tests {
                     command_text: "review".to_string(),
                     base_sha: None,
                     head_sha: None,
+                    run_epoch: 0,
                 },
             )
             .await
