@@ -60,3 +60,5 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 - Security posture depends on trust level of source branch / fork
 - Authentication (authN) is delegated to our own portable Rust backend; authorization (authZ)
   at the gateway is a separate concern (Envoy/Authorino + `lightbridge-authz`)
+
+<!-- graph smoke 2179600 -->
