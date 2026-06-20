@@ -1,10 +1,12 @@
 //! Structural graph indexing via Graphify (ADR-0019).
 //!
 //! Graphify is a standalone, multi-language (36 grammars) AST→graph extractor bundled into the
-//! runner image. We spawn it headless (`graphify extract … --no-cluster`, no LLM/API key needed),
-//! parse the `graph.json` it writes, and hand the nodes+edges to the control plane, which owns the
-//! Neo4j write. We deliberately do *not* use Graphify for embeddings — it has none; the semantic
-//! (pgvector) path stays with our own tree-sitter chunker.
+//! runner image. We spawn it as **`graphify update … --no-cluster`** — the AST-only, no-LLM path
+//! ("re-extract code files and update the graph"). NOT `graphify extract`, which always runs a
+//! semantic-LLM pass over docs and exits non-zero without an API key on any repo containing
+//! markdown/docs. We parse the `graph.json` it writes and hand the **code** nodes+edges to the
+//! control plane, which owns the Neo4j write. We deliberately do *not* use Graphify for embeddings —
+//! it has none; the semantic (pgvector) path stays with our own tree-sitter chunker.
 
 use std::path::Path;
 
@@ -14,12 +16,13 @@ use serde::Deserialize;
 use crate::client::TaskContext;
 use crate::client::{ControlPlaneClient, GraphBatch, GraphEdgePayload, GraphNodePayload};
 
-/// Graphify's `graph.json` shape (only the fields we consume).
+/// Graphify's `graph.json` shape (only the fields we consume). `update` writes edges under `links`
+/// (older `extract` used `edges`); accept either.
 #[derive(Debug, Deserialize)]
 struct GraphFile {
     #[serde(default)]
     nodes: Vec<RawNode>,
-    #[serde(default)]
+    #[serde(default, alias = "links")]
     edges: Vec<RawEdge>,
 }
 
@@ -33,6 +36,9 @@ struct RawNode {
     /// Graphify encodes the line as `"L42"`; may be absent for some node kinds.
     #[serde(default)]
     source_location: Option<String>,
+    /// `code` | `document` | … — we keep only `code` so markdown structure stays out of the graph.
+    #[serde(default)]
+    file_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,9 +71,12 @@ pub async fn index_graph(
         .nodes
         .into_iter()
         .filter_map(|n| {
-            // A node without a source file is a synthetic/aggregate node (e.g. a doc or community);
-            // skip it — the structural code graph is what we want in Neo4j.
+            // Keep only code nodes: `update` also emits document/heading nodes (markdown) and
+            // synthetic nodes (no source_file) — neither belongs in the structural code graph.
             let source_file = n.source_file?;
+            if n.file_type.as_deref() != Some("code") {
+                return None;
+            }
             Some(GraphNodePayload {
                 node_id: n.id,
                 label: n.label,
@@ -77,9 +86,13 @@ pub async fn index_graph(
         })
         .collect();
 
+    // Drop edges that touch a non-code node (e.g. a `contains` from a markdown file to its heading).
+    let code_ids: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.node_id.as_str()).collect();
     let edges: Vec<GraphEdgePayload> = parsed
         .edges
         .into_iter()
+        .filter(|e| code_ids.contains(e.source.as_str()) && code_ids.contains(e.target.as_str()))
         .map(|e| GraphEdgePayload {
             source: e.source,
             target: e.target,
@@ -108,17 +121,14 @@ pub async fn index_graph(
     Ok((n, e))
 }
 
-/// Spawn `graphify extract <checkout> --no-cluster --out <out>` and return the graph.json contents.
+/// Spawn `graphify update <checkout> --no-cluster` (AST-only, no LLM) and return the graph.json.
 async fn run_graphify(checkout: &Path) -> anyhow::Result<String> {
-    let out_dir = checkout.join(".graphify-run");
     let status = tokio::process::Command::new("graphify")
-        .arg("extract")
+        .arg("update")
         .arg(checkout)
         .arg("--no-cluster")
-        .arg("--out")
-        .arg(&out_dir)
-        // No semantic LLM pass — AST extraction only, fully offline. Be explicit so a stray
-        // API key in the environment can't trigger paid calls.
+        // `update` is AST-only and needs no key; strip any so a stray key can't change behaviour
+        // or trigger paid calls.
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("GEMINI_API_KEY")
@@ -127,11 +137,11 @@ async fn run_graphify(checkout: &Path) -> anyhow::Result<String> {
         .context("spawning graphify (is it on PATH in the image?)")?;
 
     if !status.success() {
-        anyhow::bail!("graphify extract exited with {status}");
+        anyhow::bail!("graphify update exited with {status}");
     }
 
-    // `--out DIR` writes `DIR/graphify-out/graph.json`.
-    let graph_path = out_dir.join("graphify-out").join("graph.json");
+    // `update` writes `<path>/graphify-out/graph.json`.
+    let graph_path = checkout.join("graphify-out").join("graph.json");
     tokio::fs::read_to_string(&graph_path)
         .await
         .with_context(|| format!("reading {}", graph_path.display()))
@@ -156,26 +166,45 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_graphify_graph_json() {
-        // A trimmed real sample (Rust + Python) from `graphify extract --no-cluster`.
+    fn parses_a_graphify_update_graph_json() {
+        // A trimmed real sample from `graphify update --no-cluster`: edges live under `links`, nodes
+        // carry `file_type`, and document/heading nodes are mixed in with code.
         let json = r#"{
             "nodes": [
-                {"id": "src_math_add", "label": "add()", "source_file": "src/math.rs", "source_location": "L2"},
-                {"id": "src_app_greeter", "label": "Greeter", "source_file": "src/app.py", "source_location": "L4"},
+                {"id": "src_math", "label": "math.rs", "source_file": "src/math.rs", "source_location": "L1", "file_type": "code"},
+                {"id": "src_math_add", "label": "add()", "source_file": "src/math.rs", "source_location": "L2", "file_type": "code"},
+                {"id": "readme", "label": "README.md", "source_file": "README.md", "source_location": "L1", "file_type": "document"},
                 {"id": "community_0", "label": "Community 0"}
             ],
-            "edges": [
-                {"source": "src_app_greeter_hi", "target": "src_app_greet", "relation": "calls"}
+            "links": [
+                {"source": "src_math", "target": "src_math_add", "relation": "contains"},
+                {"source": "readme", "target": "readme_h1", "relation": "contains"}
             ]
         }"#;
         let parsed: GraphFile = serde_json::from_str(json).unwrap();
-        // The synthetic community node (no source_file) is dropped; the two code nodes remain.
-        let code_nodes: Vec<_> = parsed
+
+        // `links` is read into `edges` via the serde alias.
+        assert_eq!(parsed.edges.len(), 2);
+        assert_eq!(parsed.edges[0].relation, "contains");
+
+        // Code-only filter: drop the document node + the synthetic (no source_file) node.
+        let code: std::collections::HashSet<&str> = parsed
             .nodes
-            .into_iter()
-            .filter(|n| n.source_file.is_some())
+            .iter()
+            .filter(|n| n.source_file.is_some() && n.file_type.as_deref() == Some("code"))
+            .map(|n| n.id.as_str())
             .collect();
-        assert_eq!(code_nodes.len(), 2);
-        assert_eq!(parsed.edges[0].relation, "calls");
+        assert_eq!(
+            code.len(),
+            2,
+            "two code nodes kept; document + synthetic dropped"
+        );
+        // The markdown `contains` edge (readme → heading) is dropped (endpoints aren't code).
+        let kept = parsed
+            .edges
+            .iter()
+            .filter(|e| code.contains(e.source.as_str()) && code.contains(e.target.as_str()))
+            .count();
+        assert_eq!(kept, 1, "only the code-to-code edge survives");
     }
 }
