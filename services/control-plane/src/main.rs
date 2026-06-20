@@ -14,6 +14,7 @@ mod jwt;
 mod k8s;
 mod metrics;
 mod neo4j;
+mod reaper;
 mod review;
 mod tasks;
 mod types;
