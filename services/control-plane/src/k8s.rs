@@ -181,7 +181,11 @@ fn job_manifest(
         },
         "spec": {
             "backoffLimit": 1,
-            "activeDeadlineSeconds": 900,
+            // Runtime cap: clone + tree-sitter chunk + embed + Graphify can legitimately run for
+            // tens of minutes on a large repo (observed >15min in prod purely on indexing), so bound
+            // it at 1h rather than killing healthy long indexers. `ttlSecondsAfterFinished` below is a
+            // separate, shorter post-completion cleanup window.
+            "activeDeadlineSeconds": 3600,
             "ttlSecondsAfterFinished": 900,
             "template": {
                 "metadata": {
@@ -251,6 +255,7 @@ mod tests {
         let spec = job.spec.expect("job spec");
         let pod = spec.template.spec.expect("pod spec");
         assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(spec.active_deadline_seconds, Some(3600));
         assert_eq!(spec.ttl_seconds_after_finished, Some(900));
         assert_eq!(pod.service_account_name.as_deref(), Some("sa"));
 
