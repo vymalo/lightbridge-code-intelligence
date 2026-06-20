@@ -189,3 +189,11 @@ mod tests {
         assert!(body.contains("`a.rs:5`"));
     }
 }
+
+/// Clamp a severity string to the GitHub-comment set; unknown → "info". (review-smoke)
+pub fn normalize_severity(s: &str) -> &str {
+    match s {
+        "error" | "warning" | "info" => s,
+        _ => "info",
+    }
+}
