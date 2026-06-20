@@ -94,28 +94,39 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
             },
         };
 
-        match decide(liveness, task.attempts, MAX_ATTEMPTS) {
-            ReapAction::RenewLease => {
-                db::renew_lease(pool, task.id, LEASE_RENEWAL).await?;
-            }
+        // A DB error on one task is logged and skipped — it must not abort the whole cycle and
+        // starve the other stuck tasks in the batch.
+        let result: Result<(), sqlx::Error> = match decide(liveness, task.attempts, MAX_ATTEMPTS) {
+            ReapAction::RenewLease => db::renew_lease(pool, task.id, LEASE_RENEWAL).await.map(|_| {
+                crate::metrics::reap_outcome("renewed");
+            }),
             ReapAction::MarkSucceeded => {
-                db::set_task_status(pool, task.id, "succeeded").await?;
-                crate::metrics::reap_outcome("succeeded");
-                tracing::info!(task_id = %task.id, "reaper: Job completed but report was lost; marked succeeded");
+                db::set_task_status(pool, task.id, "succeeded").await.map(|_| {
+                    crate::metrics::reap_outcome("succeeded");
+                    tracing::info!(task_id = %task.id, "reaper: Job completed but report was lost; marked succeeded");
+                })
             }
             ReapAction::Requeue => {
                 delete_dead_job(launcher, &task).await;
-                if db::release_task(pool, task.id, requeue_backoff(task.attempts)).await? {
-                    crate::metrics::reap_outcome("requeued");
-                    tracing::warn!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task requeued");
-                }
+                db::release_task(pool, task.id, requeue_backoff(task.attempts))
+                    .await
+                    .map(|requeued| {
+                        if requeued {
+                            crate::metrics::reap_outcome("requeued");
+                            tracing::warn!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task requeued");
+                        }
+                    })
             }
             ReapAction::Fail => {
                 delete_dead_job(launcher, &task).await;
-                db::set_task_status(pool, task.id, "failed").await?;
-                crate::metrics::reap_outcome("failed");
-                tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
+                db::set_task_status(pool, task.id, "failed").await.map(|_| {
+                    crate::metrics::reap_outcome("failed");
+                    tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
+                })
             }
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, task_id = %task.id, "reaper: DB op failed for this task; continuing");
         }
     }
     Ok(())

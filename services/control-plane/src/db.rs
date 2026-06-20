@@ -229,14 +229,14 @@ pub async fn set_task_job(pool: &PgPool, id: Uuid, job_name: &str) -> Result<(),
 /// Return a `running` task to the queue with a backoff delay — used both when Job creation fails and
 /// when the reaper requeues a stuck task. Clears the lease, `started_at`, and `job_name` so the next
 /// claim is clean and the next dispatch creates a fresh Job (the Job name is derived from the task
-/// id, so a stale name would otherwise collide). Guarded on `status = 'running'` so two reapers can't
+/// id, so a stale name would otherwise collide). Guarded on the active statuses so two reapers can't
 /// both requeue the same task. Returns `true` if a row was actually requeued.
 pub async fn release_task(pool: &PgPool, id: Uuid, backoff: Duration) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE tasks \
          SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, started_at = NULL, \
              job_name = NULL, run_after = now() + ($2 * interval '1 second') \
-         WHERE id = $1 AND status = 'running'",
+         WHERE id = $1 AND status IN ('running', 'posting_result')",
     )
     .bind(id)
     .bind(backoff.as_secs_f64())
@@ -254,16 +254,17 @@ pub struct ReapableTask {
     pub attempts: i32,
 }
 
-/// Tasks stuck in `running` past their lease. The lease is set short at claim and renewed by the
-/// reaper only while the Job is live, so an expired lease just means "needs reconciling", not
-/// "dead" — the caller decides by checking each Job's liveness. Bounded so one cycle is cheap.
+/// Tasks stuck in an active status (`running`/`posting_result`) past their lease — the lease is set
+/// short at claim and renewed by the reaper only while the Job is live, so an expired lease just
+/// means "needs reconciling", not "dead" — the caller decides by checking each Job's liveness.
+/// Bounded so one cycle is cheap (backed by the `tasks_reapable_idx` partial index).
 pub async fn list_reapable_tasks(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<ReapableTask>, sqlx::Error> {
     sqlx::query_as::<_, ReapableTask>(
         "SELECT id, job_name, attempts FROM tasks \
-         WHERE status = 'running' AND lease_expires_at < now() \
+         WHERE status IN ('running', 'posting_result') AND lease_expires_at < now() \
          ORDER BY started_at NULLS FIRST \
          LIMIT $1",
     )
@@ -272,12 +273,12 @@ pub async fn list_reapable_tasks(
     .await
 }
 
-/// Extend a running task's lease — the reaper's heartbeat for a Job it confirmed is still live, so a
-/// long-running task isn't reclaimed. No-op (returns `false`) if the task is no longer `running`.
+/// Extend an active task's lease — the reaper's heartbeat for a Job it confirmed is still live, so a
+/// long-running task isn't reclaimed. No-op (returns `false`) if the task is no longer active.
 pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE tasks SET lease_expires_at = now() + ($2 * interval '1 second') \
-         WHERE id = $1 AND status = 'running'",
+         WHERE id = $1 AND status IN ('running', 'posting_result')",
     )
     .bind(id)
     .bind(lease.as_secs_f64())
