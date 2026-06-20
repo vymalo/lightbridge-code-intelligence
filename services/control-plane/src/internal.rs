@@ -514,7 +514,7 @@ pub async fn post_review(
     // Outcome-label flags from the **in-scope** findings (those on changed files), computed before
     // `validate` consumes the submission. A leading `./` or `/` is stripped to match the diff paths.
     let in_scope = |f: &crate::review::Finding| {
-        let normalized = f.file.replace('\\', "/");
+        let normalized = f.file.replace('\\', "/").trim_start_matches("./").trim_start_matches('/');
         let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
         commentable.contains_key(trimmed)
     };
