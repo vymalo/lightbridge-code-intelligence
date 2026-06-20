@@ -37,6 +37,7 @@ pub struct AgentSection {
     /// mount at `/etc/lightbridge` so the runner reads its file config. `None` → not mounted.
     pub config_configmap: Option<String>,
     /// The Job's `activeDeadlineSeconds` runtime cap.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub job_deadline_seconds: Option<i64>,
     /// Legacy passthrough: inline reviewer prompt injected as `REVIEW_SYSTEM_PROMPT`. Prefer mounting
     /// the template via `config_configmap` instead.
@@ -51,9 +52,13 @@ pub struct AgentSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatcherSection {
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub claim_lease_seconds: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub poll_fallback_seconds: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub launch_backoff_seconds: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub reap_interval_seconds: Option<u64>,
 }
 

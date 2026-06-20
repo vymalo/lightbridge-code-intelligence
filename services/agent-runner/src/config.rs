@@ -44,6 +44,7 @@ pub struct ReviewFile {
     pub model: String,
     /// Path to the reviewer's system-prompt template (a mounted file); its contents are env-subst'd.
     pub system_prompt_file: Option<String>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_diff_chars: Option<usize>,
 }
 
@@ -185,12 +186,16 @@ impl ReviewConfig {
             }
             Ok(value.to_string())
         };
+        // Prompt source: the mounted template file when set, else the dispatcher-injected
+        // `REVIEW_SYSTEM_PROMPT` env (legacy passthrough), else None (built-in default guidance).
         let system_prompt = match &r.system_prompt_file {
             Some(path) if !path.trim().is_empty() => Some(
                 lightbridge_config::load_template(Path::new(path))
                     .with_context(|| format!("loading review.system_prompt_file {path}"))?,
             ),
-            _ => None,
+            _ => std::env::var("REVIEW_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         };
         Ok(Some(Self {
             base_url: required("base_url", &r.base_url)?,

@@ -105,6 +105,50 @@ pub fn load_template(path: &Path) -> anyhow::Result<String> {
     Ok(substitute_env(&raw))
 }
 
+/// `serde` field deserializers that accept **a number or a numeric string**. Substitution always
+/// yields strings, so a numeric config field written as `"{env:DEADLINE:-3600}"` arrives as the
+/// string `"3600"`; these let it deserialize anyway (while a literal JSON number still works). Empty
+/// / null → `None`. Annotate numeric `Option` fields with
+/// `#[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]`.
+pub mod de {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrStr {
+        Int(i64),
+        Str(String),
+    }
+
+    fn parse_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        match Option::<IntOrStr>::deserialize(d)? {
+            None => Ok(None),
+            Some(IntOrStr::Int(n)) => Ok(Some(n)),
+            Some(IntOrStr::Str(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    trimmed.parse::<i64>().map(Some).map_err(D::Error::custom)
+                }
+            }
+        }
+    }
+
+    pub fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        parse_opt(d)
+    }
+
+    pub fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Ok(parse_opt(d)?.map(|n| n.max(0) as u64))
+    }
+
+    pub fn opt_usize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+        Ok(parse_opt(d)?.map(|n| n.max(0) as usize))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +211,28 @@ mod tests {
         assert_eq!(v["review"]["model"], "default-model");
         assert_eq!(v["list"][0], "5");
         assert_eq!(v["list"][1], "plain");
+    }
+
+    #[test]
+    fn numeric_fields_accept_env_substituted_strings() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Cfg {
+            #[serde(default, deserialize_with = "de::opt_u64")]
+            timeout: Option<u64>,
+            #[serde(default, deserialize_with = "de::opt_usize")]
+            size: Option<usize>,
+        }
+        // A `{env:…}`-substituted numeric field arrives as a string; it must still deserialize.
+        let dir = std::env::temp_dir().join("lbcfg-num");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        std::fs::write(&path, r#"{ "timeout": "{env:T:-45}", "size": 1000 }"#).unwrap();
+
+        let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
+        assert_eq!(cfg.timeout, Some(45), "numeric string from default coerces");
+        assert_eq!(cfg.size, Some(1000), "literal number still works");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
