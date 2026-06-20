@@ -137,9 +137,14 @@ async fn create_pr_task(state: &crate::AppState, payload: &serde_json::Value, de
         Ok(Some(task_id)) => {
             crate::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task");
-            // Acknowledge on the PR that the review has started (👀). Best-effort — never fail the
-            // webhook over a reaction.
-            react_seen(state, owner, name, installation_id, task.target_id).await;
+            // Acknowledge on the PR that the review has started (👀). Spawned, not awaited: the
+            // reaction makes external GitHub calls, and the webhook handler must return well within
+            // GitHub's ~10s delivery timeout. Best-effort — never fails the webhook.
+            let state = state.clone();
+            let (owner, repo, pr) = (owner.to_string(), name.to_string(), task.target_id);
+            tokio::spawn(async move {
+                react_seen(&state, &owner, &repo, installation_id, pr).await;
+            });
         }
         Ok(None) => {
             // Idempotency index hit: an equivalent task for this PR head already exists.
