@@ -128,8 +128,22 @@ pub async fn index_graph(
 /// otherwise have that stale/foreign graph merged into ours, or its node count could trip Graphify's
 /// shrink-guard and block our rebuild — so we never read or write the repository's artifact.
 async fn run_graphify(checkout: &Path) -> anyhow::Result<String> {
-    // Sibling of the checkout (the workdir), so it's outside the repo and per-Job isolated.
-    let out_dir = checkout.parent().unwrap_or(checkout).join("graphify-run");
+    // GRAPHIFY_OUT MUST be absolute: graphify resolves its output as `watch_path / GRAPHIFY_OUT`, so a
+    // *relative* value (e.g. when WORKDIR is relative for local/dev) would make graphify write under
+    // the checkout while we read the sibling dir → graph silently skipped. Canonicalize the checkout
+    // (it exists — we just cloned it) and hang the output dir off its parent (the workdir), outside
+    // the repo and per-Job isolated. An absolute GRAPHIFY_OUT wins the join, so both sides agree.
+    let checkout_abs = tokio::fs::canonicalize(checkout)
+        .await
+        .with_context(|| format!("canonicalizing {}", checkout.display()))?;
+    let out_dir = checkout_abs
+        .parent()
+        .unwrap_or(&checkout_abs)
+        .join("graphify-run");
+    // Create it up front — graphify won't necessarily mkdir its output dir.
+    tokio::fs::create_dir_all(&out_dir)
+        .await
+        .with_context(|| format!("creating {}", out_dir.display()))?;
     let status = tokio::process::Command::new("graphify")
         .arg("update")
         .arg(checkout)
