@@ -66,3 +66,17 @@ binary; no Node runtime).
   already has.
 - **A default model baked in** — rejected for the same reason as embeddings (ADR-0018): fail loud on
   misconfig; the operator picks the model.
+
+## Amendment (2026-06-20): PR-scoped, diff-grounded prompt
+
+The first live review audited the whole repository and surfaced findings on files the PR didn't
+touch (scope leak), with no concrete fixes. The prompt is now a **pull-request** review:
+
+- The runner computes `git diff <base>..<head>` over the checkout (best-effort; `clone::pr_diff`)
+  and pastes the changed-file list + unified diff into the prompt. The agent is told to raise
+  findings **only on lines the diff changes**, using the repo + MCP tools as impact context.
+- The `summary` is shaped around the AI-governance lens: intent/scope · correctness · security ·
+  tests. Severities are `error|warning|info`.
+- `ReviewFinding` gains an optional `suggestion` (exact replacement for the line) so the model can
+  offer a concrete fix; slice 6 (ADR-0022) renders it as a committable GitHub ```suggestion block.
+- No diff available (non-PR run, or base commit unfetched) → falls back to an unscoped review.

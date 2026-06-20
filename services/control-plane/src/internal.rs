@@ -512,7 +512,11 @@ pub async fn post_review(
     };
 
     let validated = crate::review::validate(submission.findings, &commentable);
-    let body = crate::review::render_body(&submission.summary, &validated.deferred);
+    let body = crate::review::render_body(
+        &submission.summary,
+        &validated.deferred,
+        validated.out_of_scope,
+    );
     let comments: Vec<crate::github::ReviewComment> = validated
         .inline
         .iter()
@@ -524,14 +528,18 @@ pub async fn post_review(
         })
         .collect();
 
-    let (inline_n, deferred_n) = (comments.len(), validated.deferred.len());
+    let (inline_n, deferred_n, out_of_scope_n) = (
+        comments.len(),
+        validated.deferred.len(),
+        validated.out_of_scope,
+    );
     match app
         .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
         .await
     {
         Ok(()) => {
-            tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, "review posted");
-            Json(serde_json::json!({ "inline": inline_n, "deferred": deferred_n })).into_response()
+            tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review posted");
+            Json(serde_json::json!({ "inline": inline_n, "deferred": deferred_n, "out_of_scope": out_of_scope_n })).into_response()
         }
         Err(error) => {
             tracing::error!(%error, task_id = %id, "posting PR review failed");

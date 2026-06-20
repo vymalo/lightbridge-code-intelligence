@@ -16,6 +16,11 @@ pub struct ReviewFinding {
     pub severity: String,
     pub title: String,
     pub body: String,
+    /// Optional concrete fix: the exact replacement source for `line` (no diff markers). When present
+    /// and the line is in the PR diff, the control plane renders it as a committable GitHub
+    /// ```suggestion block. Omitted by the model when it has no precise fix to offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 /// The structured review the agent produces.
@@ -78,6 +83,20 @@ After more investigation, here is my final review:\n\
         assert_eq!(result.findings[0].file, "src/auth/session.rs");
         assert_eq!(result.findings[0].line, 44);
         assert_eq!(result.findings[0].severity, "error");
+    }
+
+    #[test]
+    fn parses_an_optional_suggestion() {
+        let output = "```json\n{\"summary\": \"s\", \"findings\": [\
+            {\"file\": \"a.rs\", \"line\": 7, \"severity\": \"warning\", \"title\": \"t\", \"body\": \"b\", \"suggestion\": \"let x = 1;\"},\
+            {\"file\": \"a.rs\", \"line\": 8, \"severity\": \"info\", \"title\": \"t2\", \"body\": \"b2\"}\
+        ]}\n```";
+        let result = parse_review(output).expect("parse");
+        assert_eq!(result.findings[0].suggestion.as_deref(), Some("let x = 1;"));
+        assert_eq!(
+            result.findings[1].suggestion, None,
+            "absent → None, not error"
+        );
     }
 
     #[test]
