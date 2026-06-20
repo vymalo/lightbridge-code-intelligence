@@ -153,6 +153,38 @@ impl GithubApp {
         Ok(())
     }
 
+    /// Fetch a PR's base + head SHAs. Used by the `@mention` re-review path, where the
+    /// `issue_comment` payload has no SHAs (unlike the `pull_request` event).
+    pub async fn pull_request_shas(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        pr: i64,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use anyhow::Context;
+        let value: serde_json::Value = self
+            .http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("fetching pull request")?
+            .error_for_status()
+            .context("github rejected the pull request fetch")?
+            .json()
+            .await
+            .context("parsing pull request")?;
+        let base = value["base"]["sha"].as_str().map(str::to_string);
+        let head = value["head"]["sha"].as_str().map(str::to_string);
+        Ok((base, head))
+    }
+
     /// React to a PR/issue body (the "description") with one of GitHub's 8 reaction contents
     /// (`eyes`, `hooray`, `confused`, …). Used as lightweight review-lifecycle feedback. Adding the
     /// same reaction twice is a no-op on GitHub's side, so this is safe to retry.

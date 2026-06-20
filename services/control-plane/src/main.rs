@@ -67,6 +67,10 @@ pub struct AppState {
     /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
     /// (else defaults). Held here so the webhook + internal handlers can react/label.
     pub review: Arc<config::ReviewSection>,
+    /// The GitHub App's handle (e.g. `lightbridge-assistant`), from `GITHUB_APP_HANDLE`. A PR comment
+    /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
+    /// open). Default `lightbridge-assistant`.
+    pub app_handle: Arc<String>,
 }
 
 impl AppState {
@@ -119,6 +123,12 @@ impl AppState {
             neo4j,
             metrics,
             review: Arc::new(review),
+            app_handle: Arc::new(
+                std::env::var("GITHUB_APP_HANDLE")
+                    .ok()
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or_else(|| "lightbridge-assistant".to_string()),
+            ),
         })
     }
 }
