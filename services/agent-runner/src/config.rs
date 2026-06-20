@@ -63,6 +63,10 @@ pub struct ReviewConfig {
     pub api_key: String,
     /// Chat model id, referenced by opencode as `eaig/<model>`.
     pub model: String,
+    /// Operator override for the reviewer's *guidance* (persona + what to focus on), from
+    /// `REVIEW_SYSTEM_PROMPT`. `None` → the runner's built-in default guidance. The non-negotiable
+    /// output-format contract is always appended regardless, so an override can't break parsing.
+    pub system_prompt: Option<String>,
 }
 
 impl ReviewConfig {
@@ -80,6 +84,9 @@ impl ReviewConfig {
             base_url: require("LLM_BASE_URL")?,
             api_key: require("LLM_API_KEY")?,
             model: require("LLM_MODEL")?,
+            system_prompt: std::env::var("REVIEW_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }))
     }
 }

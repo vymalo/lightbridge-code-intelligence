@@ -1,6 +1,6 @@
 //! Parsing OpenCode's output into a structured [`ReviewResult`] (ADR-0021).
 //!
-//! The agent is instructed to end with a single fenced ```json block (see `REVIEW_PROMPT`). We
+//! The agent is instructed to end with a single fenced ```json block (see `OUTPUT_CONTRACT`). We
 //! extract the last such block — robust to leading prose, tool-call chatter, and log lines — and
 //! deserialize it. The control plane re-validates line refs before any write-back (slice 6), so the
 //! parser is lenient about content and strict only about shape.
