@@ -113,15 +113,16 @@ async fn handle_pull_request(
         return;
     }
     let repo = &payload["repository"];
-    let (Some(github_repo_id), Some(owner), Some(name), Some(default_branch)) = (
+    let (Some(github_repo_id), Some(owner), Some(name), Some(default_branch), Some(pr_number)) = (
         repo["id"].as_i64(),
         repo["owner"]["login"].as_str(),
         repo["name"].as_str(),
         repo["default_branch"].as_str(),
+        payload["pull_request"]["number"].as_i64(),
     ) else {
         tracing::warn!(
             delivery_id,
-            "pull_request payload missing repo fields; skipping"
+            "pull_request payload missing repo/number fields; skipping"
         );
         return;
     };
@@ -134,9 +135,6 @@ async fn handle_pull_request(
                 return;
             }
         };
-    let pr_number = payload["pull_request"]["number"]
-        .as_i64()
-        .unwrap_or_default();
 
     match action {
         "opened" => {
@@ -205,12 +203,14 @@ async fn handle_issue_comment(
         Some(name),
         Some(default_branch),
         Some(installation_id),
+        Some(pr_number),
     ) = (
         repo["id"].as_i64(),
         repo["owner"]["login"].as_str(),
         repo["name"].as_str(),
         repo["default_branch"].as_str(),
         payload["installation"]["id"].as_i64(),
+        payload["issue"]["number"].as_i64(),
     )
     else {
         tracing::warn!(
@@ -219,7 +219,6 @@ async fn handle_issue_comment(
         );
         return;
     };
-    let pr_number = payload["issue"]["number"].as_i64().unwrap_or_default();
 
     let Some(app) = state.github.as_ref() else {
         tracing::warn!(
