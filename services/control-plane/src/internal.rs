@@ -667,7 +667,11 @@ pub async fn set_status(
             // A terminal failure gets 😕 on the PR (best-effort). Success is acknowledged by the
             // review post (🎉) in `post_review`, so we don't double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {
-                react_failure(&state, pool, id).await;
+                let state = state.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    react_failure(&state, &pool, id).await;
+                });
             }
             StatusCode::NO_CONTENT.into_response()
         }
