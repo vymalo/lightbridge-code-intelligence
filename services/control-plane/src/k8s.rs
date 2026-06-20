@@ -146,11 +146,18 @@ fn job_manifest(
         env.push(json!({ "name": "HEAD_SHA", "value": head_sha }));
     }
 
-    // Internal CA: when configured, mount the gateway's CA and point the embeddings client at it so
-    // it can verify the HTTPS eaig endpoint (ADR-0018; the gateway's cert is from a private issuer).
+    // Internal CA: when configured, mount the gateway's CA so the Job can verify the HTTPS eaig
+    // endpoint (the gateway's cert is from a private issuer, ClusterIssuer/self-signed-ca).
+    //   - `EMBEDDINGS_CA_CERT`: the runner's reqwest client adds it via `add_root_certificate`
+    //     (ADR-0018).
+    //   - `NODE_EXTRA_CA_CERTS`: OpenCode (slice 5, ADR-0021) is a Bun binary whose TLS list is
+    //     bundled-roots + system + this env (verified). It must be a process env var (Bun freezes the
+    //     CA list on first TLS use), so the agent inherits it from the Job rather than us setting it
+    //     on the spawned process.
     let (volumes, volume_mounts) = match ca_secret {
         Some(secret) => {
             env.push(json!({ "name": "EMBEDDINGS_CA_CERT", "value": "/etc/internal-ca/ca.crt" }));
+            env.push(json!({ "name": "NODE_EXTRA_CA_CERTS", "value": "/etc/internal-ca/ca.crt" }));
             (
                 json!([{ "name": "internal-ca", "secret": { "secretName": secret } }]),
                 json!([{ "name": "internal-ca", "mountPath": "/etc/internal-ca", "readOnly": true }]),
@@ -291,9 +298,14 @@ mod tests {
             "review LLM is optional so the Job starts without it"
         );
 
-        // The internal CA is mounted and the embeddings client is pointed at it.
+        // The internal CA is mounted and both the runner (reqwest) and OpenCode (Bun) are pointed
+        // at it.
         assert_eq!(
             value_of("EMBEDDINGS_CA_CERT").as_deref(),
+            Some("/etc/internal-ca/ca.crt")
+        );
+        assert_eq!(
+            value_of("NODE_EXTRA_CA_CERTS").as_deref(),
             Some("/etc/internal-ca/ca.crt")
         );
         let mount = container
