@@ -152,6 +152,66 @@ impl GithubApp {
             .context("github rejected the PR review")?;
         Ok(())
     }
+
+    /// React to a PR/issue body (the "description") with one of GitHub's 8 reaction contents
+    /// (`eyes`, `hooray`, `confused`, …). Used as lightweight review-lifecycle feedback. Adding the
+    /// same reaction twice is a no-op on GitHub's side, so this is safe to retry.
+    pub async fn add_reaction(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        issue: i64,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        self.http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/issues/{issue}/reactions"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await
+            .context("posting reaction")?
+            .error_for_status()
+            .context("github rejected the reaction")?;
+        Ok(())
+    }
+
+    /// Add labels to a PR/issue. GitHub creates any label that doesn't exist yet (default colour),
+    /// and adding an already-present label is idempotent.
+    pub async fn add_labels(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        issue: i64,
+        labels: &[String],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        if labels.is_empty() {
+            return Ok(());
+        }
+        self.http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/issues/{issue}/labels"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&serde_json::json!({ "labels": labels }))
+            .send()
+            .await
+            .context("adding labels")?
+            .error_for_status()
+            .context("github rejected the labels")?;
+        Ok(())
+    }
 }
 
 /// A changed file in a PR, as returned by the PR-files API. `patch` is absent for binary/huge files.

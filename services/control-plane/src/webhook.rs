@@ -73,10 +73,8 @@ pub async fn github_webhook(
 
     // Route actionable events to a task. For now: a pull_request opened/synchronize/reopened
     // becomes a review task. Other events are persisted only. (issue_comment commands: follow-up.)
-    if let Some(pool) = &state.db {
-        if event == "pull_request" {
-            create_pr_task(pool, &payload, &delivery_id).await;
-        }
+    if state.db.is_some() && event == "pull_request" {
+        create_pr_task(&state, &payload, &delivery_id).await;
     }
 
     (StatusCode::ACCEPTED, "accepted")
@@ -84,7 +82,10 @@ pub async fn github_webhook(
 
 /// Create a review task from a `pull_request` webhook (best-effort; logs and skips on malformed
 /// payloads — the delivery is already persisted, so nothing is lost).
-async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delivery_id: &str) {
+async fn create_pr_task(state: &crate::AppState, payload: &serde_json::Value, delivery_id: &str) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
     let action = payload["action"].as_str().unwrap_or_default();
     if !matches!(action, "opened" | "synchronize" | "reopened") {
         return;
@@ -135,7 +136,15 @@ async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delive
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
             crate::metrics::task_created();
-            tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task")
+            tracing::info!(delivery_id, %task_id, pr = task.target_id, "created review task");
+            // Acknowledge on the PR that the review has started (👀). Spawned, not awaited: the
+            // reaction makes external GitHub calls, and the webhook handler must return well within
+            // GitHub's ~10s delivery timeout. Best-effort — never fails the webhook.
+            let state = state.clone();
+            let (owner, repo, pr) = (owner.to_string(), name.to_string(), task.target_id);
+            tokio::spawn(async move {
+                react_seen(&state, &owner, &repo, installation_id, pr).await;
+            });
         }
         Ok(None) => {
             // Idempotency index hit: an equivalent task for this PR head already exists.
@@ -146,6 +155,33 @@ async fn create_pr_task(pool: &sqlx::PgPool, payload: &serde_json::Value, delive
             )
         }
         Err(error) => tracing::error!(%error, delivery_id, "failed to create task"),
+    }
+}
+
+/// Best-effort 👀 on the PR to acknowledge a review has started. Never fails the webhook: a missing
+/// App, a token-mint error, or a GitHub hiccup is logged and ignored.
+async fn react_seen(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    installation_id: i64,
+    pr: i64,
+) {
+    if !state.review.reactions_enabled() {
+        return;
+    }
+    let Some(app) = state.github.as_ref() else {
+        return;
+    };
+    let token = match app.installation_token(installation_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(%error, pr, "react 👀: could not mint token (non-fatal)");
+            return;
+        }
+    };
+    if let Err(error) = app.add_reaction(&token, owner, repo, pr, "eyes").await {
+        tracing::warn!(%error, pr, "react 👀 failed (non-fatal)");
     }
 }
 

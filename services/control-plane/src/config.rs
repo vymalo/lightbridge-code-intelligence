@@ -21,6 +21,29 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/lightbridge/control-plane.json";
 pub struct FileConfig {
     pub agent: AgentSection,
     pub dispatcher: DispatcherSection,
+    pub review: ReviewSection,
+}
+
+/// Review-feedback knobs the control plane applies to the PR: lifecycle reactions and outcome labels.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewSection {
+    /// React to the PR description across the review lifecycle (👀 started → 🎉 done / 😕 errored).
+    /// Defaults to enabled when unset.
+    pub reactions: Option<bool>,
+    /// Label added whenever a review is posted (e.g. `lightbridge-reviewed`). `None` → not added.
+    pub label_reviewed: Option<String>,
+    /// Label added when the review has ≥1 finding of any severity (e.g. `needs-review`).
+    pub label_findings: Option<String>,
+    /// Label added when the review has ≥1 `error`-severity finding (e.g. `bug`).
+    pub label_error: Option<String>,
+}
+
+impl ReviewSection {
+    /// Reactions are on unless explicitly disabled.
+    pub fn reactions_enabled(&self) -> bool {
+        self.reactions.unwrap_or(true)
+    }
 }
 
 /// Knobs for the per-task agent Job the dispatcher launches (mirrors `KubeLauncher`).

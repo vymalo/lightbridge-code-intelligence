@@ -494,7 +494,7 @@ pub async fn post_review(
     };
 
     // Validate finding lines against the PR diff: only diff lines are commentable inline.
-    let commentable = match app
+    let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> = match app
         .list_pr_files(&token, &context.owner, &context.name, pr)
         .await
     {
@@ -510,6 +510,19 @@ pub async fn post_review(
             return (StatusCode::BAD_GATEWAY, "could not fetch PR files").into_response();
         }
     };
+
+    // Outcome-label flags from the **in-scope** findings (those on changed files), computed before
+    // `validate` consumes the submission. A leading `./` or `/` is stripped to match the diff paths.
+    let in_scope = |f: &crate::review::Finding| {
+        let normalized = f.file.replace('\\', "/").trim_start_matches("./").trim_start_matches('/');
+        let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
+        commentable.contains_key(trimmed)
+    };
+    let label_has_findings = submission.findings.iter().any(in_scope);
+    let label_has_error = submission
+        .findings
+        .iter()
+        .any(|f| f.severity.eq_ignore_ascii_case("error") && in_scope(f));
 
     let validated = crate::review::validate(submission.findings, &commentable);
     let body = crate::review::render_body(
@@ -533,17 +546,95 @@ pub async fn post_review(
         validated.deferred.len(),
         validated.out_of_scope,
     );
+    let target = ReviewTarget {
+        token: &token,
+        owner: &context.owner,
+        repo: &context.name,
+        pr,
+    };
     match app
         .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
         .await
     {
         Ok(()) => {
             tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review posted");
+            // Review delivered: 🎉 + outcome labels (best-effort).
+            react(app, &state.review, &target, "hooray").await;
+            add_review_labels(
+                app,
+                &state.review,
+                &target,
+                label_has_findings,
+                label_has_error,
+            )
+            .await;
             Json(serde_json::json!({ "inline": inline_n, "deferred": deferred_n, "out_of_scope": out_of_scope_n })).into_response()
         }
         Err(error) => {
             tracing::error!(%error, task_id = %id, "posting PR review failed");
+            // Review couldn't be posted: 😕 (best-effort).
+            react(app, &state.review, &target, "confused").await;
             (StatusCode::BAD_GATEWAY, "could not post review").into_response()
+        }
+    }
+}
+
+/// Where a review reaction/label is applied: the minted token + the PR coordinates.
+struct ReviewTarget<'a> {
+    token: &'a str,
+    owner: &'a str,
+    repo: &'a str,
+    pr: i64,
+}
+
+/// Best-effort PR reaction for review lifecycle feedback (👀 started / 🎉 done / 😕 errored). A
+/// disabled toggle or any GitHub error is a no-op — review delivery never fails over a reaction.
+async fn react(
+    app: &crate::github::GithubApp,
+    review: &crate::config::ReviewSection,
+    target: &ReviewTarget<'_>,
+    content: &str,
+) {
+    if !review.reactions_enabled() {
+        return;
+    }
+    if let Err(error) = app
+        .add_reaction(target.token, target.owner, target.repo, target.pr, content)
+        .await
+    {
+        tracing::warn!(%error, pr = target.pr, content, "review reaction failed (non-fatal)");
+    }
+}
+
+/// Best-effort outcome labels from config: `label_reviewed` always (when set), `label_findings` when
+/// the review had in-scope findings, `label_error` when any were `error`-severity.
+async fn add_review_labels(
+    app: &crate::github::GithubApp,
+    review: &crate::config::ReviewSection,
+    target: &ReviewTarget<'_>,
+    has_findings: bool,
+    has_error: bool,
+) {
+    let mut labels = Vec::new();
+    if let Some(label) = &review.label_reviewed {
+        labels.push(label.clone());
+    }
+    if has_findings {
+        if let Some(label) = &review.label_findings {
+            labels.push(label.clone());
+        }
+    }
+    if has_error {
+        if let Some(label) = &review.label_error {
+            labels.push(label.clone());
+        }
+    }
+    if !labels.is_empty() {
+        if let Err(error) = app
+            .add_labels(target.token, target.owner, target.repo, target.pr, &labels)
+            .await
+        {
+            tracing::warn!(%error, pr = target.pr, "adding review labels failed (non-fatal)");
         }
     }
 }
@@ -573,11 +664,49 @@ pub async fn set_status(
         tracing::info!(task_id = %id, status = %update.status, detail, "runner status report");
     }
     match crate::db::set_task_status(pool, id, &update.status).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A terminal failure gets 😕 on the PR (best-effort). Success is acknowledged by the
+            // review post (🎉) in `post_review`, so we don't double-react here.
+            if matches!(update.status.as_str(), "failed" | "timed_out") {
+                let state = state.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    react_failure(&state, &pool, id).await;
+                });
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "task not found").into_response(),
         Err(error) => {
             tracing::error!(%error, task_id = %id, "set task status failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "update error").into_response()
         }
+    }
+}
+
+/// Best-effort 😕 on the PR when a review task fails. Loads the task's PR context + mints a token;
+/// any error (no App, non-PR task, GitHub hiccup) is logged and ignored.
+async fn react_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
+    if !state.review.reactions_enabled() {
+        return;
+    }
+    let Some(app) = state.github.as_ref() else {
+        return;
+    };
+    let context = match crate::db::get_task_context(pool, id).await {
+        Ok(Some(context)) if context.target_type == "pull_request" => context,
+        _ => return,
+    };
+    match app.installation_token(context.installation_id).await {
+        Ok(token) => {
+            let target = ReviewTarget {
+                token: &token,
+                owner: &context.owner,
+                repo: &context.name,
+                pr: context.target_id,
+            };
+            react(app, &state.review, &target, "confused").await;
+        }
+        Err(error) => tracing::warn!(%error, task_id = %id, "react 😕: could not mint token"),
     }
 }

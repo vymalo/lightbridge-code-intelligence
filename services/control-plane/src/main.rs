@@ -64,11 +64,22 @@ pub struct AppState {
     pub neo4j: Option<Arc<neo4rs::Graph>>,
     /// Prometheus render handle backing `/metrics` (scraped by Alloy for the Operations dashboard).
     pub metrics: PrometheusHandle,
+    /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
+    /// (else defaults). Held here so the webhook + internal handlers can react/label.
+    pub review: Arc<config::ReviewSection>,
 }
 
 impl AppState {
     async fn from_env() -> anyhow::Result<Self> {
         let metrics = metrics::install();
+        // The file config is optional (ConfigMap-mounted); the `review` section drives PR feedback.
+        let review = config::load_file_config()
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "invalid control-plane config file; using defaults");
+                None
+            })
+            .map(|f| f.review)
+            .unwrap_or_default();
         let db = db::connect_from_env().await?;
         let neo4j = match neo4j::connect_from_env().await {
             Ok(handle) => handle.map(Arc::new),
@@ -107,6 +118,7 @@ impl AppState {
                 .map(Arc::new),
             neo4j,
             metrics,
+            review: Arc::new(review),
         })
     }
 }
