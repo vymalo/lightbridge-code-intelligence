@@ -60,9 +60,25 @@ against the PR diff and posts a single PR review.**
 - **Post every finding inline, no validation** — one out-of-diff line ref fails the entire review.
 - **Body-only (no inline comments)** — loses the precise line anchoring that makes a review useful.
 
+## Amendment (2026-06-20): scope to the diff, structured body, GitHub suggestions
+
+The original shaping **deferred** every non-anchorable finding into the body — including findings on
+files the PR never touched, which read as a whole-repo audit. `validate` now scopes to the PR:
+
+- finding on a changed line → **inline** comment, and if it carries a `suggestion` (ADR-0021
+  amendment), the comment includes a committable ```suggestion block;
+- finding on a changed *file* but an unpinnable line → **body** (`### Notes on changed files`);
+- finding on a file **not** in the PR's changed set → **out of scope**, dropped and counted (a
+  transparency line in the body says how many were omitted).
+- Safety valve: if the changed-file set can't be determined (empty `commentable`), defer rather than
+  drop, so a transient failure never silently empties the review.
+- The body carries the working-agreement disclosure: AI-generated, untrusted, a human owns the
+  decision.
+
 ## Follow-ups
 
 - Cross-run dedup (don't repost on re-run).
 - `list_pr_files` pagination for very large PRs.
 - PR overlay / incremental indexing (index only changed files for a PR) — the remaining item from
   the epic-#5 acceptance criteria, an optimization separate from write-back.
+- Multi-line suggestions (the current ```suggestion block replaces a single anchored line).

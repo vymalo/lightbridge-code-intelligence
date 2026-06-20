@@ -51,6 +51,55 @@ pub async fn checkout(ctx: &TaskContext, workdir: &str) -> anyhow::Result<PathBu
     Ok(dir)
 }
 
+/// The PR's change set: the unified diff (base→head) and the list of changed file paths. Used to
+/// scope the review to *what the PR actually changed* rather than auditing the whole repository.
+pub struct PrDiff {
+    /// `git diff <base>..<head>` output (unified, no color).
+    pub diff: String,
+    /// Paths (repo-root-relative) that the PR touches — the only files a finding may land on.
+    pub files: Vec<String>,
+}
+
+/// Compute the PR diff between the task's base and head commits in `checkout`.
+///
+/// Best-effort: returns `None` when we lack both SHAs, they're equal, the base commit isn't present
+/// (its fetch is itself best-effort in [`checkout`]), or git produces an empty diff — in every such
+/// case the caller falls back to an unscoped review rather than failing the task.
+pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
+    let base = ctx.base_sha.as_deref()?;
+    let head = ctx.head_sha.as_deref()?;
+    if base == head {
+        return None;
+    }
+    let range = format!("{base}..{head}");
+
+    let patch = match git(checkout, &["diff", "--no-color", &range], &ctx.token).await {
+        Ok(out) => out,
+        Err(error) => {
+            tracing::warn!(%error, "could not compute PR diff (non-fatal; review unscoped)");
+            return None;
+        }
+    };
+    let diff = String::from_utf8_lossy(&patch.stdout).trim().to_string();
+    if diff.is_empty() {
+        return None;
+    }
+
+    // `-z`: NUL-separated, and crucially *unquoted* — without it git quotes/escapes paths with
+    // spaces or non-ASCII bytes, which would corrupt the changed-file set used to scope the review.
+    let names = git(checkout, &["diff", "--name-only", "-z", &range], &ctx.token)
+        .await
+        .ok()?;
+    let files = String::from_utf8_lossy(&names.stdout)
+        .split('\0')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    Some(PrDiff { diff, files })
+}
+
 /// Run a `git` subcommand in `dir`, returning an error whose message has `token` redacted.
 async fn git(dir: &Path, args: &[&str], token: &str) -> anyhow::Result<Output> {
     let output = tokio::process::Command::new("git")

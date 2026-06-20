@@ -1,10 +1,13 @@
 //! Review validation + write-back shaping (epic #5, slice 6).
 //!
 //! The runner submits a structured review (summary + findings). The control plane owns GitHub write
-//! access (trust boundary, ADR-0002), so it validates the findings here before posting: a finding's
-//! `(file, line)` can only become an **inline** PR comment if that line is part of the PR diff
-//! (GitHub rejects the whole review otherwise). Findings that don't anchor to a diff line are still
-//! reported — folded into the review body — so nothing the agent found is lost.
+//! access (trust boundary, ADR-0002), so it validates the findings here before posting, and — since
+//! this is a *pull-request* review — scopes them to the PR's change set:
+//! - a finding on a changed line becomes an **inline** comment (GitHub only accepts inline comments
+//!   on diff lines), carrying a committable ```suggestion block when the finding proposes a fix;
+//! - a finding on a changed *file* but an unpinnable line is folded into the review **body**;
+//! - a finding on a file the PR doesn't touch is **out of scope** and dropped (counted for
+//!   transparency in the body), so the review stays about the change rather than the whole repo.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -18,6 +21,10 @@ pub struct Finding {
     pub severity: String,
     pub title: String,
     pub body: String,
+    /// Optional exact replacement for `line`; rendered as a committable GitHub ```suggestion block
+    /// when the finding anchors inline.
+    #[serde(default)]
+    pub suggestion: Option<String>,
 }
 
 /// Body for `POST /internal/tasks/{id}/review`.
@@ -36,12 +43,14 @@ pub struct InlineComment {
     pub body: String,
 }
 
-/// The result of validating findings against the PR diff: comments to anchor inline, plus findings
-/// that couldn't be anchored (rendered into the review body instead).
+/// The result of validating findings against the PR diff: comments to anchor inline, findings on a
+/// changed file that couldn't anchor to an exact line (rendered into the body), and the count of
+/// findings dropped for landing outside the PR's changed files (out of scope for a PR review).
 #[derive(Debug, Default)]
 pub struct ValidatedReview {
     pub inline: Vec<InlineComment>,
     pub deferred: Vec<Finding>,
+    pub out_of_scope: usize,
 }
 
 /// The RIGHT-side (new file) line numbers that are commentable for one file's unified-diff `patch` —
@@ -82,20 +91,40 @@ fn parse_hunk_new_start(line: &str) -> Option<u32> {
     num.parse().ok()
 }
 
-/// Validate findings against the PR's changed files. `commentable` maps file path → its commentable
-/// line set (from [`commentable_lines`]). Dedups by `(file, line, title)`. A finding whose file isn't
-/// in the diff, or whose line isn't commentable, is deferred to the body rather than dropped.
+/// Validate findings against the PR's changed files. `commentable` maps each **changed** file path →
+/// its commentable line set (from [`commentable_lines`]). Dedups by `(file, line, title)`.
+///
+/// Scoping (a PR review reviews the PR, not the whole repo):
+/// - file is in the diff **and** the line is commentable → **inline** comment (with a ```suggestion
+///   block when the finding carries one);
+/// - file is in the diff but the line isn't anchorable → **deferred** to the body (still part of the
+///   change, just not pinnable);
+/// - file is **not** in the diff → **out of scope**, dropped (counted, not posted).
+///
+/// Safety valve: when `commentable` is empty we couldn't determine the change set (e.g. no patchable
+/// files), so we don't know what's in scope — fall back to deferring everything rather than dropping
+/// the whole review.
 pub fn validate(
     findings: Vec<Finding>,
     commentable: &HashMap<String, BTreeSet<u32>>,
 ) -> ValidatedReview {
+    let scope_known = !commentable.is_empty();
     let mut seen: HashSet<(String, u32, String)> = HashSet::new();
     let mut review = ValidatedReview::default();
 
-    for finding in findings {
+    for mut finding in findings {
+        // Normalize the model's path to the repo-root-relative, forward-slash form GitHub uses for
+        // the `commentable` keys — otherwise `./src/x`, `/src/x` or `src\x` would miss the lookup and
+        // a valid finding would be wrongly dropped as out of scope.
+        finding.file = normalize_path(&finding.file);
         let key = (finding.file.clone(), finding.line, finding.title.clone());
         if !seen.insert(key) {
             continue; // duplicate
+        }
+        let in_changed_file = commentable.contains_key(&finding.file);
+        if scope_known && !in_changed_file {
+            review.out_of_scope += 1; // outside the PR diff — not this PR's concern
+            continue;
         }
         let anchorable = commentable
             .get(&finding.file)
@@ -104,10 +133,7 @@ pub fn validate(
             review.inline.push(InlineComment {
                 path: finding.file.clone(),
                 line: finding.line,
-                body: format!(
-                    "**{}** ({})\n\n{}",
-                    finding.title, finding.severity, finding.body
-                ),
+                body: inline_body(&finding),
             });
         } else {
             review.deferred.push(finding);
@@ -116,12 +142,40 @@ pub fn validate(
     review
 }
 
-/// Render the review body: the agent's summary, then any findings that couldn't be anchored inline
-/// (so they're still visible), grouped under a heading.
-pub fn render_body(summary: &str, deferred: &[Finding]) -> String {
+/// Render an inline comment body: the titled, severity-tagged finding, plus a committable GitHub
+/// ```suggestion block when the finding proposes a replacement. A *present but empty* suggestion is
+/// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
+/// (Some vs None), not on emptiness.
+fn inline_body(finding: &Finding) -> String {
+    let mut body = format!(
+        "**{}** ({})\n\n{}",
+        finding.title, finding.severity, finding.body
+    );
+    if let Some(suggestion) = finding.suggestion.as_deref().map(str::trim_end) {
+        body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
+    }
+    body
+}
+
+/// Normalize a model-supplied path toward the repo-root-relative, forward-slash form GitHub uses:
+/// backslashes → `/`, and any leading `./` or `/` stripped.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+/// Render the review body in the AI-governance shape: the agent's scoped assessment, any findings on
+/// changed files that couldn't be pinned to an inline line, a transparency note when out-of-scope
+/// findings were omitted, and the working-agreement disclosure (AI output is untrusted; a human owns
+/// the decision).
+pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: usize) -> String {
     let mut body = format!("## Lightbridge review\n\n{summary}");
+
     if !deferred.is_empty() {
-        body.push_str("\n\n### Additional findings\n");
+        body.push_str("\n\n### Notes on changed files\n");
+        body.push_str("_Findings on this PR's changes that couldn't be pinned to a diff line._\n");
         for f in deferred {
             body.push_str(&format!(
                 "\n- **{}** ({}) — `{}:{}`\n  {}",
@@ -129,6 +183,17 @@ pub fn render_body(summary: &str, deferred: &[Finding]) -> String {
             ));
         }
     }
+
+    if out_of_scope > 0 {
+        body.push_str(&format!(
+            "\n\n_{out_of_scope} observation(s) about code outside this PR's diff were omitted to keep the review scoped to the change._"
+        ));
+    }
+
+    body.push_str(
+        "\n\n---\n_🤖 AI-generated review — treat it as untrusted, verify before acting; a human \
+         owns the final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._",
+    );
     body
 }
 
@@ -154,19 +219,20 @@ mod tests {
             severity: "warning".into(),
             title: title.into(),
             body: "b".into(),
+            suggestion: None,
         }
     }
 
     #[test]
-    fn validate_anchors_in_diff_defers_out_of_diff_and_dedups() {
+    fn validate_anchors_in_diff_defers_unanchored_drops_out_of_scope_and_dedups() {
         let mut commentable = HashMap::new();
         commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
 
         let findings = vec![
-            finding("src/main.rs", 2, "on a changed line"), // anchorable
+            finding("src/main.rs", 2, "on a changed line"), // anchorable → inline
             finding("src/main.rs", 2, "on a changed line"), // duplicate → dropped
-            finding("src/main.rs", 99, "line not in diff"), // deferred
-            finding("other.rs", 1, "file not in diff"),     // deferred
+            finding("src/main.rs", 99, "changed file, line not in diff"), // deferred
+            finding("other.rs", 1, "file not in PR"),       // out of scope → dropped
         ];
         let review = validate(findings, &commentable);
 
@@ -176,16 +242,79 @@ mod tests {
         assert!(review.inline[0].body.contains("on a changed line"));
         assert_eq!(
             review.deferred.len(),
-            2,
-            "out-of-diff findings deferred, not dropped"
+            1,
+            "unanchored finding on a changed file is kept in the body"
+        );
+        assert_eq!(
+            review.out_of_scope, 1,
+            "finding on a file the PR doesn't touch is dropped as out of scope"
         );
     }
 
     #[test]
-    fn render_body_includes_summary_and_deferred() {
-        let body = render_body("Looks risky.", &[finding("a.rs", 5, "Issue")]);
+    fn validate_renders_suggestion_block_for_anchored_finding() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 2, "Fix it");
+        f.suggestion = Some("    let b = 4;".into());
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1);
+        assert!(
+            review.inline[0]
+                .body
+                .contains("```suggestion\n    let b = 4;\n```"),
+            "anchored finding renders a committable suggestion block"
+        );
+    }
+
+    #[test]
+    fn validate_normalizes_path_so_dotslash_still_anchors() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+
+        // The model returned a `./`-prefixed path; it must still match the diff, not be dropped.
+        let review = validate(vec![finding("./src/main.rs", 2, "x")], &commentable);
+        assert_eq!(review.out_of_scope, 0, "normalized path is in scope");
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(
+            review.inline[0].path, "src/main.rs",
+            "posted path is normalized"
+        );
+    }
+
+    #[test]
+    fn validate_renders_empty_suggestion_as_a_deletion() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 2, "Delete this");
+        f.suggestion = Some(String::new()); // intentional line deletion
+
+        let review = validate(vec![f], &commentable);
+        assert!(
+            review.inline[0].body.contains("```suggestion\n\n```"),
+            "an empty suggestion is kept as a delete-line block"
+        );
+    }
+
+    #[test]
+    fn validate_unknown_scope_defers_instead_of_dropping() {
+        // Empty `commentable` = we couldn't determine the change set → defer, don't drop.
+        let review = validate(vec![finding("a.rs", 1, "x")], &HashMap::new());
+        assert_eq!(review.out_of_scope, 0);
+        assert_eq!(review.deferred.len(), 1);
+    }
+
+    #[test]
+    fn render_body_includes_summary_deferred_scope_note_and_disclosure() {
+        let body = render_body("Looks risky.", &[finding("a.rs", 5, "Issue")], 3);
         assert!(body.contains("Looks risky."));
         assert!(body.contains("Issue"));
         assert!(body.contains("`a.rs:5`"));
+        assert!(body.contains("3 observation(s)"), "out-of-scope note shown");
+        assert!(
+            body.contains("AI-generated review"),
+            "governance disclosure"
+        );
     }
 }

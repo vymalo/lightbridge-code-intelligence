@@ -121,28 +121,33 @@ async fn run(
     // (slice 5 produces the review, slice 6 submits it; the control plane validates against the PR
     // diff and posts). Runs only when the LLM is configured; non-fatal (indexing already landed).
     let review_summary = match review_config {
-        Some(review) => match review::run_review(&checkout, review, &context.command).await {
-            Ok(result) => {
-                tracing::info!(
-                    findings = result.findings.len(),
-                    summary = result.summary,
-                    "review complete"
-                );
-                // Submit for validation + write-back (slice 6). Non-fatal: a post failure (e.g.
-                // GitHub hiccup) shouldn't fail a task whose indexing + review already succeeded.
-                match client.submit_review(config.task_id, &result).await {
-                    Ok(()) => format!("{} findings posted", result.findings.len()),
-                    Err(error) => {
-                        tracing::warn!(%error, "submitting review failed (non-fatal)");
-                        format!("{} findings (post failed)", result.findings.len())
+        Some(review) => {
+            // Scope the review to the PR's change set when we can compute it (best-effort; an
+            // unavailable base commit just yields an unscoped review).
+            let diff = clone::pr_diff(&checkout, &context).await;
+            match review::run_review(&checkout, review, &context.command, diff.as_ref()).await {
+                Ok(result) => {
+                    tracing::info!(
+                        findings = result.findings.len(),
+                        summary = result.summary,
+                        "review complete"
+                    );
+                    // Submit for validation + write-back (slice 6). Non-fatal: a post failure (e.g.
+                    // GitHub hiccup) shouldn't fail a task whose indexing + review already succeeded.
+                    match client.submit_review(config.task_id, &result).await {
+                        Ok(()) => format!("{} findings posted", result.findings.len()),
+                        Err(error) => {
+                            tracing::warn!(%error, "submitting review failed (non-fatal)");
+                            format!("{} findings (post failed)", result.findings.len())
+                        }
                     }
                 }
+                Err(error) => {
+                    tracing::warn!(%error, "review failed (non-fatal)");
+                    "review failed".to_string()
+                }
             }
-            Err(error) => {
-                tracing::warn!(%error, "review failed (non-fatal)");
-                "review failed".to_string()
-            }
-        },
+        }
         None => "review disabled".to_string(),
     };
 
