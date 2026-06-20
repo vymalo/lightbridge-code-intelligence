@@ -112,7 +112,11 @@ pub fn validate(
     let mut seen: HashSet<(String, u32, String)> = HashSet::new();
     let mut review = ValidatedReview::default();
 
-    for finding in findings {
+    for mut finding in findings {
+        // Normalize the model's path to the repo-root-relative, forward-slash form GitHub uses for
+        // the `commentable` keys — otherwise `./src/x`, `/src/x` or `src\x` would miss the lookup and
+        // a valid finding would be wrongly dropped as out of scope.
+        finding.file = normalize_path(&finding.file);
         let key = (finding.file.clone(), finding.line, finding.title.clone());
         if !seen.insert(key) {
             continue; // duplicate
@@ -139,21 +143,27 @@ pub fn validate(
 }
 
 /// Render an inline comment body: the titled, severity-tagged finding, plus a committable GitHub
-/// ```suggestion block when the finding proposes a concrete replacement.
+/// ```suggestion block when the finding proposes a replacement. A *present but empty* suggestion is
+/// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
+/// (Some vs None), not on emptiness.
 fn inline_body(finding: &Finding) -> String {
     let mut body = format!(
         "**{}** ({})\n\n{}",
         finding.title, finding.severity, finding.body
     );
-    if let Some(suggestion) = finding
-        .suggestion
-        .as_deref()
-        .map(str::trim_end)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(suggestion) = finding.suggestion.as_deref().map(str::trim_end) {
         body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
     }
     body
+}
+
+/// Normalize a model-supplied path toward the repo-root-relative, forward-slash form GitHub uses:
+/// backslashes → `/`, and any leading `./` or `/` stripped.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// Render the review body in the AI-governance shape: the agent's scoped assessment, any findings on
@@ -255,6 +265,35 @@ mod tests {
                 .body
                 .contains("```suggestion\n    let b = 4;\n```"),
             "anchored finding renders a committable suggestion block"
+        );
+    }
+
+    #[test]
+    fn validate_normalizes_path_so_dotslash_still_anchors() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+
+        // The model returned a `./`-prefixed path; it must still match the diff, not be dropped.
+        let review = validate(vec![finding("./src/main.rs", 2, "x")], &commentable);
+        assert_eq!(review.out_of_scope, 0, "normalized path is in scope");
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(
+            review.inline[0].path, "src/main.rs",
+            "posted path is normalized"
+        );
+    }
+
+    #[test]
+    fn validate_renders_empty_suggestion_as_a_deletion() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 2, "Delete this");
+        f.suggestion = Some(String::new()); // intentional line deletion
+
+        let review = validate(vec![f], &commentable);
+        assert!(
+            review.inline[0].body.contains("```suggestion\n\n```"),
+            "an empty suggestion is kept as a delete-line block"
         );
     }
 

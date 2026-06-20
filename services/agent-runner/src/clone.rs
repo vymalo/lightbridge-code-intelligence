@@ -85,13 +85,16 @@ pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
         return None;
     }
 
-    let names = git(checkout, &["diff", "--name-only", &range], &ctx.token)
+    // `-z`: NUL-separated, and crucially *unquoted* — without it git quotes/escapes paths with
+    // spaces or non-ASCII bytes, which would corrupt the changed-file set used to scope the review.
+    let names = git(checkout, &["diff", "--name-only", "-z", &range], &ctx.token)
         .await
         .ok()?;
     let files = String::from_utf8_lossy(&names.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
+        .split('\0')
+        .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(str::to_string)
         .collect();
 
     Some(PrDiff { diff, files })
