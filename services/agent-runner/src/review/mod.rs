@@ -27,10 +27,6 @@ use crate::config::ReviewConfig;
 /// `eaig/<model>`.
 pub const PROVIDER_ID: &str = "eaig";
 
-/// Upper bound on the diff we paste into the prompt; beyond this we truncate and tell the model so it
-/// reviews what it can rather than blowing the context window on a huge PR.
-const MAX_DIFF_CHARS: usize = 60_000;
-
 /// The default reviewer **guidance** — persona + what to optimise for. Operators can replace this
 /// via `REVIEW_SYSTEM_PROMPT` (see [`ReviewConfig`]); the fixed [`OUTPUT_CONTRACT`] is always appended
 /// afterwards, so an override changes *behaviour* without ever breaking the machine-readable result.
@@ -90,7 +86,7 @@ pub async fn run_review(
         .system_prompt
         .as_deref()
         .unwrap_or(DEFAULT_REVIEW_GUIDANCE);
-    let prompt = build_prompt(guidance, command, diff);
+    let prompt = build_prompt(guidance, command, diff, review.max_diff_chars);
 
     let output = tokio::process::Command::new("opencode")
         .arg("run")
@@ -121,7 +117,12 @@ pub async fn run_review(
 /// (a non-PR run, or the base commit wasn't available) we fall back to an unscoped review over the
 /// checkout, still steered by the command. The contract goes last so it's the final instruction the
 /// model sees regardless of how long the guidance or diff are.
-fn build_prompt(guidance: &str, command: &str, diff: Option<&PrDiff>) -> String {
+fn build_prompt(
+    guidance: &str,
+    command: &str,
+    diff: Option<&PrDiff>,
+    max_diff_chars: usize,
+) -> String {
     let mut prompt = format!("{guidance}\n\nRequested review command: {command}");
     match diff {
         Some(pr) => {
@@ -135,9 +136,9 @@ fn build_prompt(guidance: &str, command: &str, diff: Option<&PrDiff>) -> String 
                     .join("\n"),
             ));
             prompt.push_str("\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n");
-            if pr.diff.len() > MAX_DIFF_CHARS {
+            if pr.diff.len() > max_diff_chars {
                 // Truncate on a char boundary so we never slice through a multi-byte sequence.
-                let mut end = MAX_DIFF_CHARS;
+                let mut end = max_diff_chars;
                 while !pr.diff.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -182,7 +183,7 @@ mod tests {
 
     #[test]
     fn default_prompt_carries_guidance_and_the_fixed_contract() {
-        let prompt = build_prompt(DEFAULT_REVIEW_GUIDANCE, "review", None);
+        let prompt = build_prompt(DEFAULT_REVIEW_GUIDANCE, "review", None, 60_000);
         assert!(
             prompt.contains("expert pull-request reviewer"),
             "uses default guidance"
@@ -206,7 +207,7 @@ mod tests {
             diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
             files: vec!["src/x.rs".to_string()],
         };
-        let prompt = build_prompt("CUSTOM PERSONA", "review", Some(&diff));
+        let prompt = build_prompt("CUSTOM PERSONA", "review", Some(&diff), 60_000);
         assert!(prompt.contains("CUSTOM PERSONA"), "operator guidance used");
         assert!(
             !prompt.contains("expert pull-request reviewer"),

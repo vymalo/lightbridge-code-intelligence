@@ -38,6 +38,11 @@ pub struct KubeLauncher {
     /// `REVIEW_SYSTEM_PROMPT` so operators can tune review behaviour without a rebuild. `None` → the
     /// runner uses its built-in default guidance.
     review_system_prompt: Option<String>,
+    /// ConfigMap (agents namespace) with the runner's `agent.json` + prompt templates, mounted at
+    /// `/etc/lightbridge` in each Job. `None` → not mounted (runner falls back to env).
+    agent_config_map: Option<String>,
+    /// The runner container's `resources` block (requests/limits), set verbatim when present.
+    resources: Option<Value>,
 }
 
 /// The default Job runtime cap when `AGENT_JOB_DEADLINE_SECONDS` is unset or unparseable.
@@ -51,29 +56,70 @@ fn parse_deadline_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_JOB_DEADLINE_SECONDS)
 }
 
+/// A config value: the file's value (if non-empty) wins, else the env var, else `default`.
+fn pick(file: Option<&str>, env: &str, default: &str) -> String {
+    file.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Like [`pick`] but optional: file value, else env var, else `None`.
+fn pick_opt(file: Option<&str>, env: &str) -> Option<String> {
+    file.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+}
+
 impl KubeLauncher {
-    /// Build from the ambient Kubernetes config (in-cluster service account, or local kubeconfig).
-    pub async fn from_env() -> anyhow::Result<Self> {
+    /// Build from the ambient Kubernetes config, taking each knob from the file config's `agent`
+    /// section when set, else the matching env var, else a built-in default (RFC-0001 / ADR-0021).
+    pub async fn resolve(agent: Option<&crate::config::AgentSection>) -> anyhow::Result<Self> {
         let client = Client::try_default().await?;
-        let namespace =
-            std::env::var("AGENT_NAMESPACE").unwrap_or_else(|_| "lightbridge-agents".to_string());
-        let image = std::env::var("AGENT_RUNNER_IMAGE")
-            .unwrap_or_else(|_| "ghcr.io/vymalo/lightbridge-agent-runner:latest".to_string());
-        let service_account = std::env::var("AGENT_SERVICE_ACCOUNT")
-            .unwrap_or_else(|_| "lightbridge-agent".to_string());
+        let namespace = pick(
+            agent.and_then(|a| a.namespace.as_deref()),
+            "AGENT_NAMESPACE",
+            "lightbridge-agents",
+        );
+        let image = pick(
+            agent.and_then(|a| a.runner_image.as_deref()),
+            "AGENT_RUNNER_IMAGE",
+            "ghcr.io/vymalo/lightbridge-agent-runner:latest",
+        );
+        let service_account = pick(
+            agent.and_then(|a| a.service_account.as_deref()),
+            "AGENT_SERVICE_ACCOUNT",
+            "lightbridge-agent",
+        );
         // Where the runner calls back. Defaults to the in-cluster Service name the ai-helm chart
-        // gives the serve role; override per environment with CONTROL_PLANE_INTERNAL_URL.
-        let control_plane_url = std::env::var("CONTROL_PLANE_INTERNAL_URL")
-            .unwrap_or_else(|_| "http://lightbridge-ci-control-plane:8080".to_string());
+        // gives the serve role; override via config or CONTROL_PLANE_INTERNAL_URL.
+        let control_plane_url = pick(
+            agent.and_then(|a| a.control_plane_url.as_deref()),
+            "CONTROL_PLANE_INTERNAL_URL",
+            "http://lightbridge-ci-control-plane:8080",
+        );
         let runner_token = std::env::var("AGENT_RUNNER_TOKEN").unwrap_or_default();
-        let ca_secret = std::env::var("AGENT_CA_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let active_deadline_seconds =
-            parse_deadline_secs(std::env::var("AGENT_JOB_DEADLINE_SECONDS").ok().as_deref());
-        let review_system_prompt = std::env::var("REVIEW_SYSTEM_PROMPT")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        let ca_secret = pick_opt(
+            agent.and_then(|a| a.ca_secret.as_deref()),
+            "AGENT_CA_SECRET",
+        );
+        let active_deadline_seconds = agent
+            .and_then(|a| a.job_deadline_seconds)
+            .filter(|&secs| secs > 0)
+            .unwrap_or_else(|| {
+                parse_deadline_secs(std::env::var("AGENT_JOB_DEADLINE_SECONDS").ok().as_deref())
+            });
+        let review_system_prompt = pick_opt(
+            agent.and_then(|a| a.review_system_prompt.as_deref()),
+            "REVIEW_SYSTEM_PROMPT",
+        );
+        let agent_config_map = pick_opt(
+            agent.and_then(|a| a.config_configmap.as_deref()),
+            "AGENT_CONFIG_CONFIGMAP",
+        );
+        let resources = agent.and_then(|a| a.resources.clone());
         Ok(Self {
             jobs: Api::namespaced(client, &namespace),
             image,
@@ -83,6 +129,8 @@ impl KubeLauncher {
             ca_secret,
             active_deadline_seconds,
             review_system_prompt,
+            agent_config_map,
+            resources,
         })
     }
 }
@@ -100,6 +148,8 @@ impl TaskLauncher for KubeLauncher {
                 ca_secret: self.ca_secret.as_deref(),
                 active_deadline_seconds: self.active_deadline_seconds,
                 review_system_prompt: self.review_system_prompt.as_deref(),
+                agent_config_map: self.agent_config_map.as_deref(),
+                resources: self.resources.as_ref(),
             },
             task,
         );
@@ -134,6 +184,8 @@ struct JobConfig<'a> {
     ca_secret: Option<&'a str>,
     active_deadline_seconds: i64,
     review_system_prompt: Option<&'a str>,
+    agent_config_map: Option<&'a str>,
+    resources: Option<&'a Value>,
 }
 
 /// The per-task agent Job manifest (mirrors docs/kubernetes-deployment.md): `restartPolicy: Never`,
@@ -148,6 +200,8 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         ca_secret,
         active_deadline_seconds,
         review_system_prompt,
+        agent_config_map,
+        resources,
     } = cfg;
     // Pass the claimed task's context so the runner knows what to act on (target + SHAs) and how to
     // report back: the task id, plus where to call (CONTROL_PLANE_URL) and the shared bearer it
@@ -201,19 +255,29 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     //     bundled-roots + system + this env (verified). It must be a process env var (Bun freezes the
     //     CA list on first TLS use), so the agent inherits it from the Job rather than us setting it
     //     on the spawned process.
-    let (volumes, volume_mounts) = match ca_secret {
-        Some(secret) => {
-            env.push(json!({ "name": "EMBEDDINGS_CA_CERT", "value": "/etc/internal-ca/ca.crt" }));
-            env.push(json!({ "name": "NODE_EXTRA_CA_CERTS", "value": "/etc/internal-ca/ca.crt" }));
-            (
-                json!([{ "name": "internal-ca", "secret": { "secretName": secret } }]),
-                json!([{ "name": "internal-ca", "mountPath": "/etc/internal-ca", "readOnly": true }]),
-            )
-        }
-        None => (json!([]), json!([])),
-    };
+    let mut volumes: Vec<Value> = Vec::new();
+    let mut volume_mounts: Vec<Value> = Vec::new();
+    if let Some(secret) = ca_secret {
+        env.push(json!({ "name": "EMBEDDINGS_CA_CERT", "value": "/etc/internal-ca/ca.crt" }));
+        env.push(json!({ "name": "NODE_EXTRA_CA_CERTS", "value": "/etc/internal-ca/ca.crt" }));
+        volumes.push(json!({ "name": "internal-ca", "secret": { "secretName": secret } }));
+        volume_mounts.push(
+            json!({ "name": "internal-ca", "mountPath": "/etc/internal-ca", "readOnly": true }),
+        );
+    }
+    // The runner's file config + prompt templates (ADR-0021): mount the ConfigMap at /etc/lightbridge
+    // and point `AGENT_CONFIG` at it so the runner reads `agent.json` instead of legacy env vars.
+    if let Some(config_map) = agent_config_map {
+        env.push(json!({ "name": "AGENT_CONFIG", "value": "/etc/lightbridge/agent.json" }));
+        volumes.push(json!({ "name": "agent-config", "configMap": { "name": config_map } }));
+        volume_mounts.push(
+            json!({ "name": "agent-config", "mountPath": "/etc/lightbridge", "readOnly": true }),
+        );
+    }
+    let volumes = Value::Array(volumes);
+    let volume_mounts = Value::Array(volume_mounts);
 
-    json!({
+    let mut manifest = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
@@ -254,7 +318,12 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
                 }
             }
         }
-    })
+    });
+    // Operator-configurable container resources (requests/limits), set verbatim when present.
+    if let Some(resources) = resources {
+        manifest["spec"]["template"]["spec"]["containers"][0]["resources"] = resources.clone();
+    }
+    manifest
 }
 
 #[cfg(test)]
@@ -297,6 +366,11 @@ mod tests {
                 ca_secret: Some("lightbridge-agent-ca"),
                 active_deadline_seconds: 1800,
                 review_system_prompt: Some("Be a terse reviewer."),
+                agent_config_map: Some("lightbridge-agent-config"),
+                resources: Some(&json!({
+                    "requests": { "cpu": "500m", "memory": "1Gi" },
+                    "limits": { "memory": "2Gi" }
+                })),
             },
             &task,
         );
@@ -313,6 +387,16 @@ mod tests {
 
         let container = &pod.containers[0];
         assert_eq!(container.image.as_deref(), Some("img:tag"));
+        // Operator-configured resources are set on the runner container.
+        let resources = container.resources.as_ref().expect("resources set");
+        assert_eq!(
+            resources
+                .requests
+                .as_ref()
+                .and_then(|r| r.get("cpu"))
+                .map(|q| q.0.as_str()),
+            Some("500m")
+        );
         let env = container.env.as_ref().expect("env");
         let value_of = |name: &str| {
             env.iter()
@@ -385,6 +469,27 @@ mod tests {
             value_of("REVIEW_SYSTEM_PROMPT").as_deref(),
             Some("Be a terse reviewer.")
         );
+
+        // The agent ConfigMap is mounted at /etc/lightbridge and AGENT_CONFIG points at it.
+        assert_eq!(
+            value_of("AGENT_CONFIG").as_deref(),
+            Some("/etc/lightbridge/agent.json")
+        );
+        let cfg_mount = container
+            .volume_mounts
+            .as_ref()
+            .and_then(|m| m.iter().find(|m| m.name == "agent-config"))
+            .expect("agent-config volumeMount");
+        assert_eq!(cfg_mount.mount_path, "/etc/lightbridge");
+        let cfg_vol = pod
+            .volumes
+            .as_ref()
+            .and_then(|v| v.iter().find(|v| v.name == "agent-config"))
+            .expect("agent-config volume");
+        assert_eq!(
+            cfg_vol.config_map.as_ref().map(|c| c.name.as_str()),
+            Some("lightbridge-agent-config")
+        );
     }
 
     #[test]
@@ -400,6 +505,8 @@ mod tests {
                 ca_secret: None,
                 active_deadline_seconds: 3600,
                 review_system_prompt: None,
+                agent_config_map: None,
+                resources: None,
             },
             &task,
         );

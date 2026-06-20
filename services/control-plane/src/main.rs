@@ -6,6 +6,7 @@
 //! the validated JWT claims (see ADR-0014). Persistence is Postgres via hand-written SQLx
 //! (cratestack codegen deferred — ADR-0005).
 
+mod config;
 mod db;
 mod dispatcher;
 mod github;
@@ -332,10 +333,15 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
     // The dispatcher has no main HTTP server, so stand up a tiny one just for /metrics (+ health)
     // so Alloy can scrape it like the serve pods.
     spawn_metrics_server(state.metrics.clone());
-    let launcher = k8s::KubeLauncher::from_env().await?;
+    // Optional file config (ConfigMap-mounted); file-when-present-else-env for the agent-Job knobs
+    // and dispatcher timings.
+    let file_config = config::load_file_config()?;
+    let launcher = k8s::KubeLauncher::resolve(file_config.as_ref().map(|f| &f.agent)).await?;
+    let dispatcher_config =
+        dispatcher::DispatcherConfig::from_file(file_config.as_ref().map(|f| &f.dispatcher));
     // The pod name is a natural, unique lease owner; fall back to a generic label off-cluster.
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "dispatcher".to_string());
-    dispatcher::run(pool, launcher, owner).await
+    dispatcher::run(pool, launcher, owner, dispatcher_config).await
 }
 
 /// Serve `/metrics` (+ `/healthz`) on `METRICS_ADDR` for roles without a main HTTP server.

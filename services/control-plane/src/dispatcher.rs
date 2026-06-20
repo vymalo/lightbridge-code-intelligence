@@ -3,7 +3,7 @@
 //! The loop drains all currently-due tasks, then blocks until a `LISTEN/NOTIFY` wakeup or a short
 //! poll fallback — the poll covers a missed notification so work is never stranded. Claiming uses
 //! `SELECT … FOR UPDATE SKIP LOCKED`, so any number of dispatcher replicas can run concurrently
-//! without ever claiming the same task.
+//! without ever claiming the same task. Loop timings come from the file config (else defaults).
 
 use std::time::Duration;
 
@@ -13,23 +13,67 @@ use sqlx::PgPool;
 use crate::db;
 use crate::k8s::TaskLauncher;
 
-/// How long a claim lease lasts before the scheduler's reaper may reclaim it (Phase 2). Kept short:
-/// it only needs to cover Job creation, not the Job's whole runtime.
-const CLAIM_LEASE: Duration = Duration::from_secs(60);
-/// Backoff before a task whose Job failed to launch is retried.
-const LAUNCH_BACKOFF: Duration = Duration::from_secs(30);
-/// Fallback poll cadence in case a `NOTIFY` is missed (e.g. enqueued while we were busy).
-const POLL_FALLBACK: Duration = Duration::from_secs(5);
+/// Defaults for the dispatcher timings when the file config doesn't set them.
+const DEFAULT_CLAIM_LEASE_SECS: u64 = 60;
+const DEFAULT_POLL_FALLBACK_SECS: u64 = 5;
+const DEFAULT_LAUNCH_BACKOFF_SECS: u64 = 30;
+
+/// Tunable dispatcher loop timings.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatcherConfig {
+    /// Claim lease before the reaper may reconcile a task (Phase 2). Kept short: it only covers Job
+    /// creation, not the Job's whole runtime.
+    pub claim_lease: Duration,
+    /// Fallback poll cadence in case a `NOTIFY` is missed (e.g. enqueued while we were busy).
+    pub poll_fallback: Duration,
+    /// Backoff before a task whose Job failed to launch is retried.
+    pub launch_backoff: Duration,
+}
+
+impl DispatcherConfig {
+    /// Resolve from the file config's `dispatcher` section; each unset (or zero) field uses its
+    /// default.
+    pub fn from_file(section: Option<&crate::config::DispatcherSection>) -> Self {
+        let secs = |value: Option<u64>, default: u64| {
+            Duration::from_secs(value.filter(|&s| s > 0).unwrap_or(default))
+        };
+        Self {
+            claim_lease: secs(
+                section.and_then(|s| s.claim_lease_seconds),
+                DEFAULT_CLAIM_LEASE_SECS,
+            ),
+            poll_fallback: secs(
+                section.and_then(|s| s.poll_fallback_seconds),
+                DEFAULT_POLL_FALLBACK_SECS,
+            ),
+            launch_backoff: secs(
+                section.and_then(|s| s.launch_backoff_seconds),
+                DEFAULT_LAUNCH_BACKOFF_SECS,
+            ),
+        }
+    }
+}
+
+impl Default for DispatcherConfig {
+    fn default() -> Self {
+        Self::from_file(None)
+    }
+}
 
 /// Run the dispatcher until cancelled. `owner` identifies this replica in the lease (e.g. the pod
 /// name) for observability and Phase-2 reaping.
-pub async fn run<L: TaskLauncher>(pool: PgPool, launcher: L, owner: String) -> anyhow::Result<()> {
+pub async fn run<L: TaskLauncher>(
+    pool: PgPool,
+    launcher: L,
+    owner: String,
+    cfg: DispatcherConfig,
+) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen(db::TASK_QUEUED_CHANNEL).await?;
     tracing::info!(owner, "dispatcher started");
 
     loop {
-        drain(&pool, &launcher, &owner).await;
+        drain(&pool, &launcher, &owner, &cfg).await;
 
         // Wait for an enqueue notification or the poll fallback, whichever comes first.
         tokio::select! {
@@ -37,19 +81,19 @@ pub async fn run<L: TaskLauncher>(pool: PgPool, launcher: L, owner: String) -> a
                 if let Err(error) = recv {
                     // The listener connection dropped; log and let the poll cadence drive recovery.
                     tracing::warn!(%error, "notify listener error; falling back to polling");
-                    tokio::time::sleep(POLL_FALLBACK).await;
+                    tokio::time::sleep(cfg.poll_fallback).await;
                 }
             }
-            _ = tokio::time::sleep(POLL_FALLBACK) => {}
+            _ = tokio::time::sleep(cfg.poll_fallback) => {}
         }
     }
 }
 
 /// Claim and dispatch every task that is due right now, then return so the caller can wait.
-async fn drain<L: TaskLauncher>(pool: &PgPool, launcher: &L, owner: &str) {
+async fn drain<L: TaskLauncher>(pool: &PgPool, launcher: &L, owner: &str, cfg: &DispatcherConfig) {
     loop {
-        match db::claim_next_task(pool, owner, CLAIM_LEASE).await {
-            Ok(Some(task)) => dispatch(pool, launcher, &task).await,
+        match db::claim_next_task(pool, owner, cfg.claim_lease).await {
+            Ok(Some(task)) => dispatch(pool, launcher, &task, cfg).await,
             Ok(None) => return,
             Err(error) => {
                 tracing::error!(%error, "failed to claim next task");
@@ -61,7 +105,12 @@ async fn drain<L: TaskLauncher>(pool: &PgPool, launcher: &L, owner: &str) {
 
 /// Launch a claimed task's Job and record it; on failure, requeue with backoff so the work is not
 /// lost (the claim already moved it out of `queued`).
-async fn dispatch<L: TaskLauncher>(pool: &PgPool, launcher: &L, task: &db::ClaimedTask) {
+async fn dispatch<L: TaskLauncher>(
+    pool: &PgPool,
+    launcher: &L,
+    task: &db::ClaimedTask,
+    cfg: &DispatcherConfig,
+) {
     let started = std::time::Instant::now();
     match launcher.launch(task).await {
         Ok(job_name) => {
@@ -79,7 +128,7 @@ async fn dispatch<L: TaskLauncher>(pool: &PgPool, launcher: &L, task: &db::Claim
         Err(error) => {
             crate::metrics::dispatch_outcome("failed");
             tracing::error!(%error, task_id = %task.id, "failed to launch job; requeueing");
-            if let Err(release_error) = db::release_task(pool, task.id, LAUNCH_BACKOFF).await {
+            if let Err(release_error) = db::release_task(pool, task.id, cfg.launch_backoff).await {
                 tracing::error!(%release_error, task_id = %task.id, "failed to requeue task");
             }
         }

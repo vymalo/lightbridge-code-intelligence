@@ -1,0 +1,16 @@
+[package]
+name = "lightbridge-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared config loader: JSON files + `{env:VAR:-default}` substitution + mounted templates."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

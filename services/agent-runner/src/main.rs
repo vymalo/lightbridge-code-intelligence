@@ -38,7 +38,19 @@ async fn main() -> std::process::ExitCode {
     };
     let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token);
 
-    let embeddings_config = match EmbeddingsConfig::from_env() {
+    // Optional JSON config file (ConfigMap-mounted); when absent, each config falls back to env. A
+    // malformed file is a misconfiguration we surface as a failed task rather than silently ignore.
+    let file_config = match agent_runner::config::load_file_config() {
+        Ok(file_config) => file_config,
+        Err(error) => {
+            let detail = error.to_string();
+            tracing::error!(%detail, "invalid agent config file");
+            report(&client, &config, "failed", Some(&detail)).await;
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let embeddings_config = match EmbeddingsConfig::resolve(file_config.as_ref()) {
         Ok(cfg) => cfg,
         Err(error) => {
             // The task is already `running` at this point; report failed so the dispatcher
@@ -55,8 +67,8 @@ async fn main() -> std::process::ExitCode {
         &embeddings_config.model,
     );
 
-    // Review is optional (no `LLM_MODEL` → indexing-only). But if it's half-configured, surface it.
-    let review_config = match ReviewConfig::from_env() {
+    // Review is optional (no model → indexing-only). But if it's half-configured, surface it.
+    let review_config = match ReviewConfig::resolve(file_config.as_ref()) {
         Ok(cfg) => cfg,
         Err(error) => {
             let detail = error.to_string();
