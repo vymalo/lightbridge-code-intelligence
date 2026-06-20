@@ -7,6 +7,7 @@ name = "agent-runner"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "lightbridge-config",
  "reqwest",
  "rmcp",
  "serde",
@@ -296,6 +297,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
+ "lightbridge-config",
  "metrics",
  "metrics-exporter-prometheus",
  "neo4rs",
@@ -1343,6 +1345,16 @@ checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "lightbridge-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

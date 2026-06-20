@@ -3,7 +3,62 @@
 //! control plane lives here; the actual task context (repo, SHAs, command) is fetched from the
 //! control plane at runtime rather than trusted from env, so the env stays minimal.
 
+use std::path::Path;
+
+use anyhow::Context;
+use serde::Deserialize;
 use uuid::Uuid;
+
+/// Where the runner looks for its JSON config file (mounted from a ConfigMap). Overridable via
+/// `AGENT_CONFIG`. When the file is absent the runner falls back to legacy env vars, so a Job keeps
+/// working before the chart mounts the ConfigMap.
+const DEFAULT_AGENT_CONFIG_PATH: &str = "/etc/lightbridge/agent.json";
+
+/// Default ceiling on the diff pasted into the review prompt (chars).
+pub const DEFAULT_MAX_DIFF_CHARS: usize = 60_000;
+
+/// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
+/// only what it sets, and an absent file means "use env + defaults everywhere". String values support
+/// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
+/// URLs, and template paths live declaratively in the ConfigMap.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileConfig {
+    pub embeddings: Option<EmbeddingsFile>,
+    pub review: Option<ReviewFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingsFile {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewFile {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Path to the reviewer's system-prompt template (a mounted file); its contents are env-subst'd.
+    pub system_prompt_file: Option<String>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_diff_chars: Option<usize>,
+}
+
+/// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
+/// it exists but is malformed — a misconfiguration we want surfaced, not silently ignored.
+pub fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
+    let path =
+        std::env::var("AGENT_CONFIG").unwrap_or_else(|_| DEFAULT_AGENT_CONFIG_PATH.to_string());
+    let path = Path::new(&path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    lightbridge_config::load::<FileConfig>(path).map(Some)
+}
 
 /// Everything the runner needs to start: which task it is, and how to reach the control plane.
 #[derive(Debug, Clone)]
@@ -50,6 +105,27 @@ impl EmbeddingsConfig {
             model: require("EMBEDDINGS_MODEL")?,
         })
     }
+
+    /// Resolve from the file config when it carries an `embeddings` block, else from env. All three
+    /// fields are required either way (no default model — a misconfig fails loud).
+    pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Self> {
+        match file.and_then(|f| f.embeddings.as_ref()) {
+            Some(e) => {
+                let required = |name: &str, value: &str| -> anyhow::Result<String> {
+                    if value.trim().is_empty() {
+                        anyhow::bail!("config embeddings.{name} is required but empty");
+                    }
+                    Ok(value.to_string())
+                };
+                Ok(Self {
+                    base_url: required("base_url", &e.base_url)?,
+                    api_key: required("api_key", &e.api_key)?,
+                    model: required("model", &e.model)?,
+                })
+            }
+            None => Self::from_env(),
+        }
+    }
 }
 
 /// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
@@ -63,6 +139,13 @@ pub struct ReviewConfig {
     pub api_key: String,
     /// Chat model id, referenced by opencode as `eaig/<model>`.
     pub model: String,
+    /// Operator override for the reviewer's *guidance* (persona + what to focus on). From the
+    /// `review.system_prompt_file` template (file config) or `REVIEW_SYSTEM_PROMPT` (env). `None` →
+    /// the runner's built-in default guidance. The non-negotiable output-format contract is always
+    /// appended regardless, so an override can't break parsing.
+    pub system_prompt: Option<String>,
+    /// Ceiling on the diff pasted into the prompt; from `review.max_diff_chars` or the default.
+    pub max_diff_chars: usize,
 }
 
 impl ReviewConfig {
@@ -80,6 +163,46 @@ impl ReviewConfig {
             base_url: require("LLM_BASE_URL")?,
             api_key: require("LLM_API_KEY")?,
             model: require("LLM_MODEL")?,
+            system_prompt: std::env::var("REVIEW_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
+        }))
+    }
+
+    /// Resolve from the file config when it carries a `review` block (with a non-empty model), else
+    /// from env. The system prompt comes from the `system_prompt_file` template (env-subst'd) when
+    /// set. A `review` block whose model is empty disables review, same as an unset `LLM_MODEL`.
+    pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Option<Self>> {
+        let Some(r) = file.and_then(|f| f.review.as_ref()) else {
+            return Self::from_env();
+        };
+        if r.model.trim().is_empty() {
+            return Ok(None); // review explicitly disabled
+        }
+        let required = |name: &str, value: &str| -> anyhow::Result<String> {
+            if value.trim().is_empty() {
+                anyhow::bail!("config review.{name} is required but empty");
+            }
+            Ok(value.to_string())
+        };
+        // Prompt source: the mounted template file when set, else the dispatcher-injected
+        // `REVIEW_SYSTEM_PROMPT` env (legacy passthrough), else None (built-in default guidance).
+        let system_prompt = match &r.system_prompt_file {
+            Some(path) if !path.trim().is_empty() => Some(
+                lightbridge_config::load_template(Path::new(path))
+                    .with_context(|| format!("loading review.system_prompt_file {path}"))?,
+            ),
+            _ => std::env::var("REVIEW_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        };
+        Ok(Some(Self {
+            base_url: required("base_url", &r.base_url)?,
+            api_key: required("api_key", &r.api_key)?,
+            model: required("model", &r.model)?,
+            system_prompt,
+            max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
         }))
     }
 }

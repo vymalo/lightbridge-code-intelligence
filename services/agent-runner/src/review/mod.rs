@@ -27,35 +27,40 @@ use crate::config::ReviewConfig;
 /// `eaig/<model>`.
 pub const PROVIDER_ID: &str = "eaig";
 
-/// Upper bound on the diff we paste into the prompt; beyond this we truncate and tell the model so it
-/// reviews what it can rather than blowing the context window on a huge PR.
-const MAX_DIFF_CHARS: usize = 60_000;
-
-/// The system instruction handed to the review agent. It must end by emitting the structured result
-/// (parsed by [`parse_review`]) so the runner gets machine-readable findings, not prose.
+/// The default reviewer **guidance** — persona + what to optimise for. Operators can replace this
+/// via `REVIEW_SYSTEM_PROMPT` (see [`ReviewConfig`]); the fixed [`OUTPUT_CONTRACT`] is always appended
+/// afterwards, so an override changes *behaviour* without ever breaking the machine-readable result.
 ///
-/// Per the AI-governance working agreement, this is a *pull-request* review: scoped to the change,
-/// grounded in evidence, severity-tagged, and offering concrete fixes — not a whole-repo audit.
-pub const REVIEW_PROMPT: &str = "\
-You are Lightbridge, a precise pull-request reviewer. You review the PULL REQUEST described by the \
-unified diff below — NOT the whole repository.\n\n\
-Rules:\n\
-- **Scope:** every finding MUST land on a line the diff adds or changes (a `+` line in a hunk). Use \
-the rest of the repository and the tools only as CONTEXT to judge the change's impact — never raise \
-a finding about code this PR does not touch.\n\
-- **Ground every claim** with the tools; do not speculate about code you have not looked up:\n\
+/// It is tuned for the human on the other end: high-signal, terse, skimmable. The goal is the most
+/// useful review a person can act on in seconds — not the longest one.
+pub const DEFAULT_REVIEW_GUIDANCE: &str = "\
+You are Lightbridge, an expert pull-request reviewer. Review ONLY the change in the unified diff \
+below; use the rest of the repository and the tools as CONTEXT to judge its impact, never as review \
+targets.\n\n\
+Optimise for the reviewer's time — a human should grasp each finding in seconds:\n\
+- Report only what matters: correctness bugs, security issues, data loss, and mismatches with the \
+change's stated intent. Skip style/nits unless they cause real harm.\n\
+- Be brief and concrete. Title ≤ ~8 words. Body 1–2 sentences: what's wrong and why it matters — no \
+restating the code, no hedging, no praise.\n\
+- Favour a few high-confidence findings over many shallow ones. If the change is sound, say so in \
+one line and return no findings — silence is better than noise.\n\
+- Ground every claim with the tools; do not speculate about code you have not looked up:\n\
   - `lightbridge_vector_semantic_search` — find related code by meaning,\n\
   - `lightbridge_graph_find_symbol` / `lightbridge_graph_get_callers` — trace structure and impact.\n\
-- **Compare old vs new:** reason about what each hunk changed and what it breaks or improves.\n\
-- Prefer a few high-confidence findings over many shallow ones. You may not edit files or run \
-commands.\n\n\
-Shape your `summary` around: (1) does the change match its stated intent/scope, (2) correctness, \
-(3) security, (4) tests/verification. For each finding set `severity` to `error` (must fix), \
-`warning` (should fix), or `info` (note). When you can propose a concrete fix, include a \
-`suggestion` field containing the EXACT replacement source for that one line (no diff markers, no \
-fences) so it can be applied as a GitHub suggestion.\n\n\
-When done, output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
-{\n  \"summary\": \"assessment covering intent/scope, correctness, security, tests\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"explanation grounded in the tools\", \"suggestion\": \"optional exact replacement for line 42\"}\n  ]\n}";
+- Reason old-vs-new per hunk. When a fix is clear, give the exact replacement so the author applies \
+it in one click. You may not edit files or run commands.\n\n\
+Keep `summary` to 1–3 sentences: does the change do what it intends, and is it correct and safe?";
+
+/// The fixed output contract appended after the guidance and the diff. The parser ([`parse_review`])
+/// and the control plane's scope-and-suggestion handling depend on this exact shape, so it is NOT
+/// operator-overridable.
+pub const OUTPUT_CONTRACT: &str = "\
+Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; never \
+comment on untouched code. Set `severity` to `error` (must fix), `warning` (should fix), or `info` \
+(minor/FYI). When you propose a fix, put the EXACT replacement source for that one line in \
+`suggestion` (no diff markers, no fences) so it applies as a GitHub suggestion.\n\n\
+Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
+{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"why it matters\", \"suggestion\": \"optional exact replacement for line 42\"}\n  ]\n}";
 
 /// Run the OpenCode review over `checkout` and return the parsed structured result.
 ///
@@ -77,7 +82,11 @@ pub async fn run_review(
         .with_context(|| format!("writing {}", cfg_path.display()))?;
 
     let model = format!("{PROVIDER_ID}/{}", review.model);
-    let prompt = build_prompt(command, diff);
+    let guidance = review
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_REVIEW_GUIDANCE);
+    let prompt = build_prompt(guidance, command, diff, review.max_diff_chars);
 
     let output = tokio::process::Command::new("opencode")
         .arg("run")
@@ -103,12 +112,18 @@ pub async fn run_review(
     parse_review(&stdout).context("parsing the review result from opencode output")
 }
 
-/// Assemble the full agent prompt: the system instruction, the requested command, and — when we have
-/// it — the changed-file list plus the unified diff that scopes the review. Without a diff (e.g. a
-/// non-PR run, or the base commit wasn't available) we fall back to an unscoped review over the
-/// checkout, still steered by the command.
-fn build_prompt(command: &str, diff: Option<&PrDiff>) -> String {
-    let mut prompt = format!("{REVIEW_PROMPT}\n\nRequested review command: {command}");
+/// Assemble the full agent prompt: the (configurable) `guidance`, the requested command, the changed
+/// files + unified diff when we have them, and the fixed [`OUTPUT_CONTRACT`] last. Without a diff
+/// (a non-PR run, or the base commit wasn't available) we fall back to an unscoped review over the
+/// checkout, still steered by the command. The contract goes last so it's the final instruction the
+/// model sees regardless of how long the guidance or diff are.
+fn build_prompt(
+    guidance: &str,
+    command: &str,
+    diff: Option<&PrDiff>,
+    max_diff_chars: usize,
+) -> String {
+    let mut prompt = format!("{guidance}\n\nRequested review command: {command}");
     match diff {
         Some(pr) => {
             prompt.push_str(&format!(
@@ -121,9 +136,9 @@ fn build_prompt(command: &str, diff: Option<&PrDiff>) -> String {
                     .join("\n"),
             ));
             prompt.push_str("\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n");
-            if pr.diff.len() > MAX_DIFF_CHARS {
+            if pr.diff.len() > max_diff_chars {
                 // Truncate on a char boundary so we never slice through a multi-byte sequence.
-                let mut end = MAX_DIFF_CHARS;
+                let mut end = max_diff_chars;
                 while !pr.diff.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -139,6 +154,10 @@ fn build_prompt(command: &str, diff: Option<&PrDiff>) -> String {
              change and keep findings grounded in the tools.",
         ),
     }
+    // The fixed contract is always last so it's the final instruction, even after a long custom
+    // guidance or a large diff.
+    prompt.push_str("\n\n");
+    prompt.push_str(OUTPUT_CONTRACT);
     prompt
 }
 
@@ -156,4 +175,51 @@ fn mcp_env() -> Vec<(String, String)> {
     .iter()
     .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prompt_carries_guidance_and_the_fixed_contract() {
+        let prompt = build_prompt(DEFAULT_REVIEW_GUIDANCE, "review", None, 60_000);
+        assert!(
+            prompt.contains("expert pull-request reviewer"),
+            "uses default guidance"
+        );
+        assert!(prompt.contains("Requested review command: review"));
+        assert!(
+            prompt.contains("No diff is available"),
+            "unscoped fallback note"
+        );
+        // The machine contract is always present and last.
+        assert!(prompt.contains("Scope rule (non-negotiable)"));
+        assert!(
+            prompt.trim_end().ends_with("]\n}"),
+            "ends with the JSON shape"
+        );
+    }
+
+    #[test]
+    fn custom_guidance_overrides_but_contract_and_diff_remain() {
+        let diff = PrDiff {
+            diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
+            files: vec!["src/x.rs".to_string()],
+        };
+        let prompt = build_prompt("CUSTOM PERSONA", "review", Some(&diff), 60_000);
+        assert!(prompt.contains("CUSTOM PERSONA"), "operator guidance used");
+        assert!(
+            !prompt.contains("expert pull-request reviewer"),
+            "default not appended"
+        );
+        assert!(prompt.contains("This PR changes 1 file(s)") && prompt.contains("src/x.rs"));
+        assert!(prompt.contains("+new"), "diff is included");
+        // The contract still wins the last word, so parsing stays intact under any override.
+        let contract_at = prompt
+            .find("Scope rule (non-negotiable)")
+            .expect("contract present");
+        let diff_at = prompt.find("+new").expect("diff present");
+        assert!(contract_at > diff_at, "contract comes after the diff");
+    }
 }

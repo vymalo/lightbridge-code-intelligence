@@ -70,6 +70,8 @@ mod tests {
             base_url: "https://gw.example/v1".to_string(),
             api_key: "secret".to_string(),
             model: "qwen-coder".to_string(),
+            system_prompt: None,
+            max_diff_chars: 60_000,
         }
     }
 

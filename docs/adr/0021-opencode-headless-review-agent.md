@@ -80,3 +80,16 @@ touch (scope leak), with no concrete fixes. The prompt is now a **pull-request**
 - `ReviewFinding` gains an optional `suggestion` (exact replacement for the line) so the model can
   offer a concrete fix; slice 6 (ADR-0022) renders it as a committable GitHub ```suggestion block.
 - No diff available (non-PR run, or base commit unfetched) → falls back to an unscoped review.
+
+## Amendment (2026-06-20): configurable prompt + tunable Job deadline
+
+The prompt is now two parts: a **default guidance** (`DEFAULT_REVIEW_GUIDANCE`) tuned for high-signal,
+*terse, human-skimmable* output (report only what matters, ≤8-word titles, 1–2-sentence bodies,
+silence over noise), and a **fixed output contract** (`OUTPUT_CONTRACT`) carrying the scope rule +
+JSON shape + suggestion format. Operators override only the guidance via **`REVIEW_SYSTEM_PROMPT`**
+(plumbed: dispatcher env → injected into the agent Job → `ReviewConfig`); the contract is always
+appended last, so an override tunes behaviour without ever breaking parsing or diff-scoping.
+
+Separately, the agent Job's runtime cap is now **`AGENT_JOB_DEADLINE_SECONDS`** (dispatcher env,
+default 3600; a bad/zero value falls back to the default rather than disabling the cap), replacing the
+hardcoded 1h from #51.
