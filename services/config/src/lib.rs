@@ -232,7 +232,7 @@ mod tests {
         let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
         assert_eq!(cfg.timeout, Some(45), "numeric string from default coerces");
         assert_eq!(cfg.size, Some(1000), "literal number still works");
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -254,6 +254,6 @@ mod tests {
 
         let cfg2: Cfg = load_with(&path, &env_of(&[("M", "real")])).unwrap();
         assert_eq!(cfg2.model, "real");
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

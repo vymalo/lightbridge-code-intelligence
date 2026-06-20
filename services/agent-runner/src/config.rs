@@ -110,22 +110,23 @@ impl EmbeddingsConfig {
     /// fields are required either way (no default model — a misconfig fails loud).
     pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Self> {
         match file.and_then(|f| f.embeddings.as_ref()) {
-            Some(e) => {
-                let required = |name: &str, value: &str| -> anyhow::Result<String> {
-                    if value.trim().is_empty() {
-                        anyhow::bail!("config embeddings.{name} is required but empty");
-                    }
-                    Ok(value.to_string())
-                };
-                Ok(Self {
-                    base_url: required("base_url", &e.base_url)?,
-                    api_key: required("api_key", &e.api_key)?,
-                    model: required("model", &e.model)?,
-                })
-            }
+            Some(e) => Ok(Self {
+                base_url: require_field("embeddings", "base_url", &e.base_url)?,
+                api_key: require_field("embeddings", "api_key", &e.api_key)?,
+                model: require_field("embeddings", "model", &e.model)?,
+            }),
             None => Self::from_env(),
         }
     }
+}
+
+/// Validate a required config field is non-empty (after `{env:}` substitution), naming the section +
+/// field in the error so a misconfigured ConfigMap is diagnosable from the first log line.
+fn require_field(section: &str, name: &str, value: &str) -> anyhow::Result<String> {
+    if value.trim().is_empty() {
+        anyhow::bail!("config {section}.{name} is required but empty");
+    }
+    Ok(value.to_string())
 }
 
 /// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
@@ -180,12 +181,6 @@ impl ReviewConfig {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
-        let required = |name: &str, value: &str| -> anyhow::Result<String> {
-            if value.trim().is_empty() {
-                anyhow::bail!("config review.{name} is required but empty");
-            }
-            Ok(value.to_string())
-        };
         // Prompt source: the mounted template file when set, else the dispatcher-injected
         // `REVIEW_SYSTEM_PROMPT` env (legacy passthrough), else None (built-in default guidance).
         let system_prompt = match &r.system_prompt_file {
@@ -198,9 +193,9 @@ impl ReviewConfig {
                 .filter(|s| !s.trim().is_empty()),
         };
         Ok(Some(Self {
-            base_url: required("base_url", &r.base_url)?,
-            api_key: required("api_key", &r.api_key)?,
-            model: required("model", &r.model)?,
+            base_url: require_field("review", "base_url", &r.base_url)?,
+            api_key: require_field("review", "api_key", &r.api_key)?,
+            model: require_field("review", "model", &r.model)?,
             system_prompt,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
         }))

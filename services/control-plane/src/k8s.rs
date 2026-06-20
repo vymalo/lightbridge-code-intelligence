@@ -6,6 +6,7 @@
 //! its shape without a cluster.
 
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use serde_json::{json, Value};
@@ -62,6 +63,11 @@ pub struct KubeLauncher {
     agent_config_map: Option<String>,
     /// The runner container's `resources` block (requests/limits), set verbatim when present.
     resources: Option<Value>,
+    /// An `ownerReference` (to the agent ServiceAccount) stamped on every Job for k8s GC + traceability.
+    /// `None` when the SA UID couldn't be read (e.g. missing RBAC) — Jobs are then created un-owned,
+    /// as before. Owner must be same-namespace as the Job (k8s forbids cross-namespace ownerRefs), so
+    /// the same-ns ServiceAccount is the anchor rather than the cross-ns dispatcher.
+    owner_reference: Option<Value>,
 }
 
 /// The default Job runtime cap when `AGENT_JOB_DEADLINE_SECONDS` is unset or unparseable.
@@ -139,6 +145,9 @@ impl KubeLauncher {
             "AGENT_CONFIG_CONFIGMAP",
         );
         let resources = agent.and_then(|a| a.resources.clone());
+        // Best-effort: read the agent SA's UID so each Job can carry an ownerReference to it (same
+        // namespace, stable). No UID (missing RBAC / SA) → Jobs are created un-owned, as before.
+        let owner_reference = owner_reference(&client, &namespace, &service_account).await;
         Ok(Self {
             jobs: Api::namespaced(client, &namespace),
             image,
@@ -150,7 +159,32 @@ impl KubeLauncher {
             review_system_prompt,
             agent_config_map,
             resources,
+            owner_reference,
         })
+    }
+}
+
+/// Read the agent ServiceAccount's UID and shape it into a Job `ownerReference`. Best-effort: a
+/// failure (RBAC, missing SA) is logged and yields `None` so Job creation still works un-owned.
+async fn owner_reference(client: &Client, namespace: &str, sa_name: &str) -> Option<Value> {
+    let sas: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    match sas.get(sa_name).await {
+        Ok(sa) => sa.metadata.uid.map(|uid| {
+            json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "name": sa_name,
+                "uid": uid,
+                // Not a controlling owner (the reaper/TTL manage lifecycle); just a GC + trace link
+                // that must not block the SA's own deletion.
+                "controller": false,
+                "blockOwnerDeletion": false,
+            })
+        }),
+        Err(error) => {
+            tracing::warn!(%error, sa_name, "could not read agent ServiceAccount uid; Jobs will have no ownerReference");
+            None
+        }
     }
 }
 
@@ -169,6 +203,7 @@ impl TaskLauncher for KubeLauncher {
                 review_system_prompt: self.review_system_prompt.as_deref(),
                 agent_config_map: self.agent_config_map.as_deref(),
                 resources: self.resources.as_ref(),
+                owner_reference: self.owner_reference.as_ref(),
             },
             task,
         );
@@ -240,6 +275,7 @@ struct JobConfig<'a> {
     review_system_prompt: Option<&'a str>,
     agent_config_map: Option<&'a str>,
     resources: Option<&'a Value>,
+    owner_reference: Option<&'a Value>,
 }
 
 /// The per-task agent Job manifest (mirrors docs/kubernetes-deployment.md): `restartPolicy: Never`,
@@ -256,6 +292,7 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         review_system_prompt,
         agent_config_map,
         resources,
+        owner_reference,
     } = cfg;
     // Pass the claimed task's context so the runner knows what to act on (target + SHAs) and how to
     // report back: the task id, plus where to call (CONTROL_PLANE_URL) and the shared bearer it
@@ -377,6 +414,10 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     if let Some(resources) = resources {
         manifest["spec"]["template"]["spec"]["containers"][0]["resources"] = resources.clone();
     }
+    // ownerReference (to the agent ServiceAccount) for k8s GC + traceability, when we have the UID.
+    if let Some(owner) = owner_reference {
+        manifest["metadata"]["ownerReferences"] = json!([owner]);
+    }
     manifest
 }
 
@@ -425,6 +466,10 @@ mod tests {
                     "requests": { "cpu": "500m", "memory": "1Gi" },
                     "limits": { "memory": "2Gi" }
                 })),
+                owner_reference: Some(&json!({
+                    "apiVersion": "v1", "kind": "ServiceAccount", "name": "lightbridge-agent",
+                    "uid": "sa-uid-123", "controller": false, "blockOwnerDeletion": false
+                })),
             },
             &task,
         );
@@ -434,6 +479,15 @@ mod tests {
         let spec = job.spec.expect("job spec");
         let pod = spec.template.spec.expect("pod spec");
         assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        // The Job carries an ownerReference to the agent ServiceAccount (k8s GC + traceability).
+        let owner = &job
+            .metadata
+            .owner_references
+            .as_ref()
+            .expect("ownerReferences")[0];
+        assert_eq!(owner.kind, "ServiceAccount");
+        assert_eq!(owner.name, "lightbridge-agent");
+        assert_eq!(owner.uid, "sa-uid-123");
         // The runtime cap is the value the launcher passes (from AGENT_JOB_DEADLINE_SECONDS).
         assert_eq!(spec.active_deadline_seconds, Some(1800));
         assert_eq!(spec.ttl_seconds_after_finished, Some(900));
@@ -561,6 +615,7 @@ mod tests {
                 review_system_prompt: None,
                 agent_config_map: None,
                 resources: None,
+                owner_reference: None,
             },
             &task,
         );
