@@ -1,9 +1,11 @@
-//! Dispatcher role (RFC-0001 Phase 1): claim queued tasks and launch one Kubernetes Job per task.
+//! Dispatcher role (RFC-0001 Phase 1 + Phase 2 reaper): claim queued tasks, launch one Kubernetes
+//! Job per task, and reconcile stuck tasks.
 //!
-//! The loop drains all currently-due tasks, then blocks until a `LISTEN/NOTIFY` wakeup or a short
-//! poll fallback — the poll covers a missed notification so work is never stranded. Claiming uses
-//! `SELECT … FOR UPDATE SKIP LOCKED`, so any number of dispatcher replicas can run concurrently
-//! without ever claiming the same task. Loop timings come from the file config (else defaults).
+//! The loop drains all currently-due tasks, then blocks until a `LISTEN/NOTIFY` wakeup, the reap
+//! tick, or a short poll fallback — the poll covers a missed notification so work is never stranded.
+//! Claiming uses `SELECT … FOR UPDATE SKIP LOCKED`, so any number of dispatcher replicas can run
+//! concurrently without ever claiming the same task. Loop timings come from the file config (else
+//! defaults). The reaper shares this loop (singleton today; idempotent writes keep it correct on N).
 
 use std::time::Duration;
 
@@ -12,22 +14,26 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::k8s::TaskLauncher;
+use crate::reaper;
 
 /// Defaults for the dispatcher timings when the file config doesn't set them.
 const DEFAULT_CLAIM_LEASE_SECS: u64 = 60;
 const DEFAULT_POLL_FALLBACK_SECS: u64 = 5;
 const DEFAULT_LAUNCH_BACKOFF_SECS: u64 = 30;
+const DEFAULT_REAP_INTERVAL_SECS: u64 = 30;
 
 /// Tunable dispatcher loop timings.
 #[derive(Debug, Clone, Copy)]
 pub struct DispatcherConfig {
     /// Claim lease before the reaper may reconcile a task (Phase 2). Kept short: it only covers Job
-    /// creation, not the Job's whole runtime.
+    /// creation; the reaper renews it while the Job is live.
     pub claim_lease: Duration,
     /// Fallback poll cadence in case a `NOTIFY` is missed (e.g. enqueued while we were busy).
     pub poll_fallback: Duration,
     /// Backoff before a task whose Job failed to launch is retried.
     pub launch_backoff: Duration,
+    /// How often the reaper reconciles stuck (lease-expired) tasks against their Jobs.
+    pub reap_interval: Duration,
 }
 
 impl DispatcherConfig {
@@ -50,6 +56,10 @@ impl DispatcherConfig {
                 section.and_then(|s| s.launch_backoff_seconds),
                 DEFAULT_LAUNCH_BACKOFF_SECS,
             ),
+            reap_interval: secs(
+                section.and_then(|s| s.reap_interval_seconds),
+                DEFAULT_REAP_INTERVAL_SECS,
+            ),
         }
     }
 }
@@ -70,18 +80,27 @@ pub async fn run<L: TaskLauncher>(
 ) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen(db::TASK_QUEUED_CHANNEL).await?;
+    // The reaper shares this loop (the dispatcher is a singleton today); its writes are idempotent
+    // and active-status-guarded, so it stays correct even if more than one replica runs it.
+    let mut reap_tick = tokio::time::interval(cfg.reap_interval);
+    reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(owner, "dispatcher started");
 
     loop {
         drain(&pool, &launcher, &owner, &cfg).await;
 
-        // Wait for an enqueue notification or the poll fallback, whichever comes first.
+        // Wait for an enqueue notification, the reap tick, or the poll fallback — whichever fires.
         tokio::select! {
             recv = listener.recv() => {
                 if let Err(error) = recv {
                     // The listener connection dropped; log and let the poll cadence drive recovery.
                     tracing::warn!(%error, "notify listener error; falling back to polling");
                     tokio::time::sleep(cfg.poll_fallback).await;
+                }
+            }
+            _ = reap_tick.tick() => {
+                if let Err(error) = reaper::reap_once(&pool, &launcher).await {
+                    tracing::error!(%error, "reaper cycle failed");
                 }
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}

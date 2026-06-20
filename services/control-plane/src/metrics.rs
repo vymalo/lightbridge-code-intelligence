@@ -71,6 +71,12 @@ pub fn dispatch_launch_seconds(seconds: f64) {
     histogram!("lci_dispatch_launch_seconds").record(seconds);
 }
 
+/// A reaper reconciliation outcome for a stuck task (RFC-0001 Phase 2): `renewed`, `succeeded`,
+/// `requeued`, or `failed`. String literals → zero-allocation.
+pub fn reap_outcome(outcome: &'static str) {
+    counter!("lci_reaper_tasks_total", "outcome" => outcome).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

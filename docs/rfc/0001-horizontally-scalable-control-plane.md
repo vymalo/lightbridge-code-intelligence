@@ -248,7 +248,8 @@ be raised; workers/dispatchers can later get an HPA on queue depth (`COUNT(*) WH
   N `serve` replicas. No queue, no Redis, no role split.
 - **Phase 1** — Add the queue columns + idempotency index; add the `dispatcher` subcommand and the
   `SKIP LOCKED` dequeue; `serve` becomes enqueue-and-`202`.
-- **Phase 2** — Add the `scheduler` subcommand: periodic pulls + reaper.
+- **Phase 2** — Add the `scheduler` subcommand: periodic pulls + reaper. **(reaper shipped
+  2026-06-20 — see Implementation note below; periodic pulls still pending.)**
 - **Phase 3** — Add Redis for GitHub-API / installation-token caching and rate limiting (pure
   performance; correctness does not depend on it).
 - **Phase 4** — Raise replica counts in `ai-helm`; add an HPA on queue depth.
@@ -278,6 +279,24 @@ be raised; workers/dispatchers can later get an HPA on queue depth (`COUNT(*) WH
   per-task Jobs and only adds the dispatcher in front of them.
 - **Do nothing.** The control plane stays single-replica: no rolling-deploy redundancy, a single
   point of failure for webhook ingress, and no horizontal headroom. Not acceptable for production.
+
+## Implementation note (2026-06-20): reaper shipped, hosted in the dispatcher
+
+The stuck-task **reaper** landed (`services/control-plane/src/reaper.rs`, ticket #56) ahead of a
+dedicated `scheduler` role: it runs as a 30s-interval branch inside the existing dispatcher loop. The
+dispatcher is a singleton today, and every reaper write is idempotent and `status = 'running'`-guarded,
+so it stays correct if it ever runs on N replicas — moving it into a separate `scheduler` (with the
+periodic pulls) is a later refactor, not a correctness fix. Resolved choices:
+
+- **Liveness via the Kubernetes API** (`Api::<Job>::get_opt` + the Job's `Complete`/`Failed`
+  conditions), not a mirrored Postgres field — simpler and authoritative. A transient API error skips
+  the task that cycle (never reclaims a maybe-live Job).
+- **Decision matrix** (pure `decide()`): `Active` → renew lease (the heartbeat); `Succeeded` (Job
+  `Complete`, report lost) → mark `succeeded` (no re-run); `Failed`/`Gone`/`job_name` null → delete
+  the dead Job and requeue with exponential backoff while `attempts < MAX_ATTEMPTS` (5), else `failed`.
+- **Constants:** claim lease 60s, reaper interval 30s, lease renewal 120s, backoff 15s→×2→cap 600s.
+  The lease is renewed *by the reaper* (not the dispatcher) for live Jobs, so it need not be pre-sized
+  to a task's worst-case runtime.
 
 ## Unresolved questions
 

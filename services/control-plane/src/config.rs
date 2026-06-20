@@ -54,6 +54,7 @@ pub struct DispatcherSection {
     pub claim_lease_seconds: Option<u64>,
     pub poll_fallback_seconds: Option<u64>,
     pub launch_backoff_seconds: Option<u64>,
+    pub reap_interval_seconds: Option<u64>,
 }
 
 /// Load the control-plane config file if it exists. `Ok(None)` when absent (use env); `Err` when it

@@ -6,16 +6,35 @@
 //! its shape without a cluster.
 
 use k8s_openapi::api::batch::v1::Job;
-use kube::api::PostParams;
+use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use serde_json::{json, Value};
 
 use crate::db::ClaimedTask;
 
-/// Launches the execution of a claimed task and returns the created Job's name.
+/// Liveness of a task's Kubernetes Job, as the reaper reads it (RFC-0001 Phase 2). The Job — not a
+/// timer — is the source of truth for whether a `running` task is still doing work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobLiveness {
+    /// Still running or pending — do not reclaim.
+    Active,
+    /// Finished successfully (Job condition `Complete`).
+    Succeeded,
+    /// Finished unsuccessfully (Job condition `Failed` — e.g. `DeadlineExceeded`, backoff exhausted).
+    Failed,
+    /// No Job by that name exists (deleted, TTL-expired, or never created).
+    Gone,
+}
+
+/// Launches the execution of a claimed task and returns the created Job's name; also lets the reaper
+/// inspect and clean up Jobs by name.
 #[allow(async_fn_in_trait)] // crate-internal trait; never used across crates or as `dyn`.
 pub trait TaskLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String>;
+    /// Current liveness of a previously-launched Job (by name).
+    async fn job_liveness(&self, job_name: &str) -> anyhow::Result<JobLiveness>;
+    /// Delete a Job (background propagation). A missing Job is success — the call is idempotent.
+    async fn delete_job(&self, job_name: &str) -> anyhow::Result<()>;
 }
 
 /// Creates one Kubernetes Job per task via the cluster API.
@@ -164,6 +183,41 @@ impl TaskLauncher for KubeLauncher {
                 tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
                 Ok(name)
             }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn job_liveness(&self, job_name: &str) -> anyhow::Result<JobLiveness> {
+        let Some(job) = self.jobs.get_opt(job_name).await? else {
+            return Ok(JobLiveness::Gone);
+        };
+        // Terminal state is carried in the Job's status conditions (`Complete` / `Failed`, status
+        // "True"); absent either, it's still active.
+        let conditions = job.status.as_ref().and_then(|s| s.conditions.as_ref());
+        let is_true = |cond_type: &str| {
+            conditions.is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == cond_type && c.status == "True")
+            })
+        };
+        Ok(if is_true("Complete") {
+            JobLiveness::Succeeded
+        } else if is_true("Failed") {
+            JobLiveness::Failed
+        } else {
+            JobLiveness::Active
+        })
+    }
+
+    async fn delete_job(&self, job_name: &str) -> anyhow::Result<()> {
+        match self
+            .jobs
+            .delete(job_name, &DeleteParams::background())
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Already gone — that's the desired end state.
+            Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
