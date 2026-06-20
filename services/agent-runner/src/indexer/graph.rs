@@ -122,11 +122,19 @@ pub async fn index_graph(
 }
 
 /// Spawn `graphify update <checkout> --no-cluster` (AST-only, no LLM) and return the graph.json.
+///
+/// Output goes to a **private dir outside the checkout** via `GRAPHIFY_OUT` (an absolute path), not
+/// the repo-owned `graphify-out/`. A cloned repo that commits its own `graphify-out/graph.json` would
+/// otherwise have that stale/foreign graph merged into ours, or its node count could trip Graphify's
+/// shrink-guard and block our rebuild — so we never read or write the repository's artifact.
 async fn run_graphify(checkout: &Path) -> anyhow::Result<String> {
+    // Sibling of the checkout (the workdir), so it's outside the repo and per-Job isolated.
+    let out_dir = checkout.parent().unwrap_or(checkout).join("graphify-run");
     let status = tokio::process::Command::new("graphify")
         .arg("update")
         .arg(checkout)
         .arg("--no-cluster")
+        .env("GRAPHIFY_OUT", &out_dir)
         // `update` is AST-only and needs no key; strip any so a stray key can't change behaviour
         // or trigger paid calls.
         .env_remove("ANTHROPIC_API_KEY")
@@ -140,8 +148,8 @@ async fn run_graphify(checkout: &Path) -> anyhow::Result<String> {
         anyhow::bail!("graphify update exited with {status}");
     }
 
-    // `update` writes `<path>/graphify-out/graph.json`.
-    let graph_path = checkout.join("graphify-out").join("graph.json");
+    // With `GRAPHIFY_OUT` set, graphify writes `<GRAPHIFY_OUT>/graph.json` directly.
+    let graph_path = out_dir.join("graph.json");
     tokio::fs::read_to_string(&graph_path)
         .await
         .with_context(|| format!("reading {}", graph_path.display()))
