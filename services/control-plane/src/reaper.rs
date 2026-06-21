@@ -266,7 +266,7 @@ mod tests {
     /// Claim a freshly-created task and then expire its lease + record a Job name, simulating a Job
     /// that was launched and then went quiet. Returns the task id.
     async fn stuck_running_task(pool: &PgPool) -> Uuid {
-        let repo_id = db::upsert_repository(pool, 1, "octo", "repo", "main")
+        let repo_id = db::upsert_repository(pool, 1, "octo", "repo", "main", None)
             .await
             .unwrap();
         db::record_delivery(pool, "d1", "pull_request", &serde_json::json!({}))

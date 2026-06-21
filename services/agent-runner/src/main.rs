@@ -132,7 +132,9 @@ async fn run(
     // ── Review: OpenCode over the MCP tools → validated GitHub write-back ────────────────────
     // (slice 5 produces the review, slice 6 submits it; the control plane validates against the PR
     // diff and posts). Runs only when the LLM is configured; non-fatal (indexing already landed).
-    let review_summary = match review_config {
+    // A standalone `index` task (target_type `repository`, Epic #75) indexes the default branch only —
+    // there's no PR to review, so skip the review step regardless of LLM config.
+    let review_summary = match review_config.filter(|_| context.command != "index") {
         Some(review) => {
             // Scope the review to the PR's change set when we can compute it (best-effort; an
             // unavailable base commit just yields an unscoped review).
