@@ -95,7 +95,7 @@ motion stays at the current budget plus reduced-motion-safe disclosures.
    bar (status · repo · search) ADR-0016 specified. Both views client-side over the existing list API.
 
 2. **Run detail — findings & logs (Lovable disclosure + #103).** Findings as disclosure rows: collapsed
-   `severity badge · title · file:line`; expanded body + ```suggestion + Resources. Logs get a filter
+   `severity badge · title · file:line`; expanded body + a `suggestion` block + Resources. Logs get a filter
    bar (level + search + copy/download) and disclosure rows for structured lines. Keep the live stream
    and the terminal `kubectl` snippet (#99).
 
