@@ -211,7 +211,10 @@ fn app(state: AppState) -> Router {
         .route("/admin/repositories/{id}/deny", post(admin::deny))
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
-        .route("/internal/tasks/{id}/status", post(internal::set_status))
+        .route(
+            "/internal/tasks/{id}/status",
+            post(internal::set_status).get(internal::get_status),
+        )
         // Chunk batches can be large: 32 chunks × 1536-dim embeddings as JSON ~600 KB plus
         // content. Raise the body limit to 16 MiB on this route only.
         .route(

@@ -190,6 +190,29 @@ impl ControlPlaneClient {
         Ok(context)
     }
 
+    /// `GET /internal/tasks/{id}/status` — the task's current status, for the self-cancel poll.
+    pub async fn task_status(&self, task_id: Uuid) -> anyhow::Result<String> {
+        use anyhow::Context;
+        #[derive(serde::Deserialize)]
+        struct StatusResponse {
+            status: String,
+        }
+        let url = format!("{}/internal/tasks/{task_id}/status", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("requesting task status")?
+            .error_for_status()
+            .context("control plane rejected the task-status request")?
+            .json::<StatusResponse>()
+            .await
+            .context("parsing task status")?;
+        Ok(resp.status)
+    }
+
     /// `POST /internal/tasks/{id}/chunks` — submit a batch of indexed code chunks.
     pub async fn submit_chunks(&self, task_id: Uuid, batch: ChunkBatch) -> anyhow::Result<()> {
         use anyhow::Context;

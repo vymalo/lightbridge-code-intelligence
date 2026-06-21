@@ -46,6 +46,25 @@ async fn get_context_sends_bearer_and_parses_the_response() {
 }
 
 #[tokio::test]
+async fn task_status_sends_bearer_and_parses_status() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/tasks/{task_id}/status")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
+        )
+        .mount(&server)
+        .await;
+
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
+    let status = client.task_status(task_id).await.expect("status");
+    assert_eq!(status, "cancelled");
+}
+
+#[tokio::test]
 async fn report_status_posts_the_status_with_bearer() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
