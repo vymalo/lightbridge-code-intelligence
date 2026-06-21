@@ -20,6 +20,24 @@ pub async fn purge_repository_data(
     neo4j: Option<&neo4rs::Graph>,
     repository_id: i64,
 ) {
+    // Guard against a re-approve/re-register racing ahead of this spawned purge: only purge if the
+    // repo is still `disabled` (a missing row is fine — nothing to keep). Otherwise we'd wipe a
+    // freshly re-approved repo's new tasks/index.
+    match crate::db::repository_status(pool, repository_id).await {
+        Ok(Some(status)) if status != "disabled" => {
+            tracing::warn!(
+                repository_id,
+                status,
+                "purge aborted: repository is no longer disabled (re-approved/re-added)"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, repository_id, "purge aborted: status check failed");
+            return;
+        }
+        _ => {} // disabled, or row gone → proceed
+    }
     let cancelled = match crate::db::cancel_active_tasks_for_repo(pool, repository_id).await {
         Ok(ids) => ids.len(),
         Err(error) => {

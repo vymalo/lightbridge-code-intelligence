@@ -550,15 +550,21 @@ pub async fn register_pending_repository(
     Ok(affected.rows_affected() > 0)
 }
 
+/// A repository's approval status (`pending`/`approved`/`disabled`), or `None` if no such repo.
+pub async fn repository_status(
+    pool: &PgPool,
+    repository_id: i64,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT status FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Is this repository approved for work? The gate the webhook handlers check before creating any
 /// review/index task. A missing repo (shouldn't happen — callers upsert first) reads as not approved.
 pub async fn repository_approved(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
-    let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM repositories WHERE id = $1")
-            .bind(repository_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(status.as_deref() == Some("approved"))
+    Ok(repository_status(pool, repository_id).await?.as_deref() == Some("approved"))
 }
 
 /// Set a repository's approval status by its **GitHub** id (webhook path — e.g. mark `disabled` when

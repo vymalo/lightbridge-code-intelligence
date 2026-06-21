@@ -104,10 +104,17 @@ pub async fn upsert_graph(
 /// already-clean repo).
 pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
     use anyhow::Context;
+    // Count BEFORE deleting: a `RETURN count(s)` after `DETACH DELETE s` is unreliable (the nodes are
+    // gone from the query context). Collect + count first, then delete via FOREACH.
     let mut rows = graph
         .execute(
-            query("MATCH (s:Symbol {repo_id: $repo}) DETACH DELETE s RETURN count(s) AS deleted")
-                .param("repo", repository_id),
+            query(
+                "MATCH (s:Symbol {repo_id: $repo}) \
+                 WITH collect(s) AS nodes, count(s) AS deleted \
+                 FOREACH (n IN nodes | DETACH DELETE n) \
+                 RETURN deleted",
+            )
+            .param("repo", repository_id),
         )
         .await
         .context("delete repo graph")?;
