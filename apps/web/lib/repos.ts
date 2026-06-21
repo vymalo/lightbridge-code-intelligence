@@ -3,6 +3,8 @@
  * `/repositories` payload (`RepositoryRow` in `services/control-plane/src/db.rs`). Edge-safe.
  */
 
+import type { StatusVariant } from "@/lib/tasks";
+
 /** A connected repository plus its run-activity summary. */
 export interface Repository {
   id: number;
@@ -23,4 +25,23 @@ export interface Repository {
 /** `owner/name` slug. */
 export function repoSlug(repo: Repository): string {
   return `${repo.owner}/${repo.name}`;
+}
+
+/** GitHub URL of the repository. */
+export function repoUrl(repo: Repository): string {
+  return `https://github.com/${repo.owner}/${repo.name}`;
+}
+
+/** Map the approval `status` (Epic #75) to a status-pill variant + label (ADR-0015/0016 tokens). */
+export function approvalVisual(repo: Repository): { variant: StatusVariant; label: string } {
+  switch (repo.status) {
+    case "approved":
+      return { variant: "success", label: "Approved" };
+    case "disabled":
+      return { variant: "muted", label: "Disabled" };
+    case "pending":
+      return { variant: "pending", label: "Pending approval" };
+    default:
+      return { variant: "pending", label: repo.status };
+  }
 }

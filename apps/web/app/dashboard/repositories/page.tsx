@@ -1,9 +1,9 @@
-import { GitBranch } from "lucide-react";
-import { ApiErrorLine, EmptyState, StatusLine } from "@/components/states";
+import { ExternalLink, GitBranch } from "lucide-react";
+import { ApiErrorLine, EmptyState } from "@/components/states";
 import { Card } from "@/components/ui/card";
 import { listRepositories } from "@/lib/api";
 import { githubAppInstallUrl } from "@/lib/config";
-import { repoSlug } from "@/lib/repos";
+import { approvalVisual, type Repository, repoSlug, repoUrl } from "@/lib/repos";
 import { relativeTime } from "@/lib/tasks";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +17,7 @@ export default async function Repositories() {
       <div>
         <h1 className="text-lg font-medium tracking-tight">Repositories</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Repositories the GitHub App is connected to, with their run activity.
+          Repositories the GitHub App is connected to, with their approval and run activity.
         </p>
       </div>
 
@@ -43,33 +43,49 @@ export default async function Repositories() {
           pull request).
         </EmptyState>
       ) : (
-        <Card className="overflow-hidden">
-          <div className="divide-y divide-border">
-            {result.data.map((repo) => (
-              <div key={repo.id} className="flex items-center gap-3 px-4 py-3">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
-                  <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-                    <span className="inline-flex items-center gap-1">
-                      <GitBranch className="size-3" />
-                      {repo.default_branch}
-                    </span>
-                    <span>
-                      {repo.task_count} {repo.task_count === 1 ? "run" : "runs"}
-                    </span>
-                    {repo.last_task_at && <span>last {relativeTime(repo.last_task_at, now)}</span>}
-                  </div>
-                </div>
-                {/* Index status is honest: the indexer that fills repo_index is a later step. */}
-                <span className="status-pill status-pending shrink-0">Not indexed</span>
-              </div>
-            ))}
-          </div>
-          <StatusLine>
-            Index health (graph + vector freshness, ADR-0016) appears here once the indexer lands.
-          </StatusLine>
-        </Card>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {result.data.map((repo) => (
+            <RepoCard key={repo.id} repo={repo} now={now} />
+          ))}
+        </div>
       )}
     </div>
+  );
+}
+
+function RepoCard({ repo, now }: { repo: Repository; now: number }) {
+  const approval = approvalVisual(repo);
+  return (
+    <Card className="flex flex-col">
+      <div className="flex items-start justify-between gap-3 px-4 py-3">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1">
+              <GitBranch className="size-3" />
+              {repo.default_branch}
+            </span>
+            <span>
+              {repo.task_count} {repo.task_count === 1 ? "run" : "runs"}
+            </span>
+            {repo.last_task_at && <span>last {relativeTime(repo.last_task_at, now)}</span>}
+          </div>
+        </div>
+        <span className={`status-pill status-${approval.variant} shrink-0`}>{approval.label}</span>
+      </div>
+      <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs">
+        {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
+        <span className="text-muted-foreground">Not indexed yet</span>
+        <a
+          href={repoUrl(repo)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-accent transition-colors hover:underline"
+        >
+          View on GitHub
+          <ExternalLink className="size-3 shrink-0" />
+        </a>
+      </div>
+    </Card>
   );
 }
