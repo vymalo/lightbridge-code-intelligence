@@ -10,7 +10,11 @@ export interface Repository {
   owner: string;
   name: string;
   default_branch: string;
+  /** Approval gate (Epic #75): `pending` | `approved` | `disabled`. `active` mirrors `approved`. */
+  status: string;
   active: boolean;
+  approved_at: string | null;
+  approved_by: string | null;
   task_count: number;
   /** ISO timestamp of the most recent run, or null if none yet. */
   last_task_at: string | null;

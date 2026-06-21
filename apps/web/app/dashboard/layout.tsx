@@ -1,9 +1,14 @@
 import type { ReactNode } from "react";
 import { ConsoleShell } from "@/components/console-shell";
+import { isAdmin } from "@/lib/admin";
 import { currentClaims, displayName } from "@/lib/session";
 
 // `middleware.ts` already guarantees a valid session on /dashboard/*; we read it here for display.
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const claims = await currentClaims();
-  return <ConsoleShell user={claims ? displayName(claims) : "Signed in"}>{children}</ConsoleShell>;
+  return (
+    <ConsoleShell user={claims ? displayName(claims) : "Signed in"} admin={isAdmin(claims)}>
+      {children}
+    </ConsoleShell>
+  );
 }
