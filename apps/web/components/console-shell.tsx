@@ -3,6 +3,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { CommandPalette } from "@/components/command-palette";
 import { NavLink } from "@/components/nav-link";
+import { buttonClass } from "@/components/ui/button";
 import { githubAppInstallUrl } from "@/lib/config";
 
 /** The console chrome (ADR-0016; grouped nav + ⌘K palette in ADR-0024): a left sidebar nav split
@@ -61,10 +62,7 @@ export function ConsoleShell({
             <span className="truncate" title={user}>
               {user}
             </span>
-            <a
-              href="/api/auth/logout"
-              className="rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
-            >
+            <a href="/api/auth/logout" className={buttonClass("ghost", "xs")}>
               Sign out
             </a>
           </div>

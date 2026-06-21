@@ -5,6 +5,7 @@ import { CommandSnippet } from "@/components/command-snippet";
 import { ReviewOutput } from "@/components/review-output";
 import { RunLogs } from "@/components/run-logs";
 import { ApiErrorLine, StatusLine } from "@/components/states";
+import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusPill } from "@/components/ui/status-pill";
 import { hasPermission } from "@/lib/admin";
@@ -74,13 +75,10 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         {canCancel && (
           <form action={cancelRunAction} className="ml-auto">
             <input type="hidden" name="id" value={task.id} />
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
-            >
+            <Button type="submit" size="xs">
               <Ban className="size-3.5" />
               Cancel run
-            </button>
+            </Button>
           </form>
         )}
       </div>

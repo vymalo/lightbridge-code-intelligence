@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Insights } from "@/components/insights";
 import { RunRow } from "@/components/run-row";
 import { ApiErrorLine, EmptyState } from "@/components/states";
+import { buttonClass } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { listTasks } from "@/lib/api";
 import { githubAppInstallUrl } from "@/lib/config";
@@ -31,7 +32,7 @@ export default async function Overview() {
           title="No task runs yet"
           action={
             <a
-              className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
+              className={buttonClass("primary")}
               href={githubAppInstallUrl()}
               target="_blank"
               rel="noreferrer"

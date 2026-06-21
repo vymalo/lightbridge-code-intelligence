@@ -1,5 +1,6 @@
 import { ExternalLink } from "lucide-react";
 import Link from "next/link";
+import { buttonClass } from "@/components/ui/button";
 import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
 import { permissions } from "@/lib/admin";
 import { githubAppInstallUrl } from "@/lib/config";
@@ -45,7 +46,7 @@ export default async function Settings() {
               href={githubAppInstallUrl()}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
+              className={buttonClass("neutral")}
             >
               Open
               <ExternalLink className="size-3.5" />
@@ -67,10 +68,7 @@ export default async function Settings() {
           label="Automatic indexing"
           description="Repositories are indexed automatically once approved. Per-repository index health appears on the Repositories page."
           control={
-            <Link
-              href="/dashboard/repositories"
-              className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
-            >
+            <Link href="/dashboard/repositories" className={buttonClass("neutral")}>
               Repositories
             </Link>
           }
@@ -78,10 +76,7 @@ export default async function Settings() {
       </SettingsSection>
 
       <div>
-        <a
-          href="/api/auth/logout"
-          className="inline-flex items-center rounded-md border border-border px-3 py-1.5 text-sm transition-colors hover:bg-muted"
-        >
+        <a href="/api/auth/logout" className={buttonClass("neutral")}>
           Sign out
         </a>
       </div>

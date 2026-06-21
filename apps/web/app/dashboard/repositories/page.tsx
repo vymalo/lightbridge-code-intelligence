@@ -1,5 +1,6 @@
 import { RepoList } from "@/components/repo-list";
 import { ApiErrorLine, EmptyState } from "@/components/states";
+import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { listRepositories } from "@/lib/api";
 import { githubAppInstallUrl } from "@/lib/config";
@@ -28,7 +29,7 @@ export default async function Repositories() {
           title="No repositories yet"
           action={
             <a
-              className="inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
+              className={buttonClass("primary")}
               href={githubAppInstallUrl()}
               target="_blank"
               rel="noreferrer"

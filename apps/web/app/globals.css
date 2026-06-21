@@ -80,19 +80,9 @@
   --accent-foreground: var(--color-primary-content);
   --ring: var(--color-primary);
 
-  /* Status pills → daisyUI semantic colors. */
-  --status-pending: color-mix(in oklch, var(--color-base-content) 60%, transparent);
-  --status-pending-fill: var(--color-base-300);
-  --status-active: var(--color-info);
-  --status-active-fill: color-mix(in oklch, var(--color-info) 22%, transparent);
-  --status-success: var(--color-success);
-  --status-success-fill: color-mix(in oklch, var(--color-success) 22%, transparent);
+  /* Error ink for inline status lines / error-bordered cards (the run statuses themselves now use
+   * daisyUI `badge` colors — see components/ui/status-pill.tsx). */
   --status-error: var(--color-error);
-  --status-error-fill: color-mix(in oklch, var(--color-error) 22%, transparent);
-  --status-warn: var(--color-warning);
-  --status-warn-fill: color-mix(in oklch, var(--color-warning) 22%, transparent);
-  --status-muted: color-mix(in oklch, var(--color-base-content) 55%, transparent);
-  --status-muted-fill: var(--color-base-300);
 }
 
 @layer base {
@@ -104,68 +94,5 @@
     color: var(--color-base-content);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
-  }
-}
-
-/*
- * Status pills (ADR-0016 status model) — kept until the runs/detail surfaces move to daisyUI `badge`.
- * Capsule shape, tinted fill + status ink.
- */
-@layer components {
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.375rem;
-    border-radius: 9999px;
-    padding: 0.125rem 0.5rem;
-    font-size: 0.75rem;
-    font-weight: 500;
-    line-height: 1.25rem;
-    white-space: nowrap;
-  }
-  .status-pill::before {
-    content: "";
-    width: 0.4rem;
-    height: 0.4rem;
-    border-radius: 9999px;
-    background: currentColor;
-    flex: none;
-  }
-  .status-pending {
-    color: var(--status-pending);
-    background: var(--status-pending-fill);
-  }
-  .status-active {
-    color: var(--status-active);
-    background: var(--status-active-fill);
-  }
-  .status-active::before {
-    animation: status-pulse 1.6s ease-in-out infinite;
-  }
-  .status-success {
-    color: var(--status-success);
-    background: var(--status-success-fill);
-  }
-  .status-error {
-    color: var(--status-error);
-    background: var(--status-error-fill);
-  }
-  .status-warn {
-    color: var(--status-warn);
-    background: var(--status-warn-fill);
-  }
-  .status-muted {
-    color: var(--status-muted);
-    background: var(--status-muted-fill);
-  }
-}
-
-@keyframes status-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
   }
 }

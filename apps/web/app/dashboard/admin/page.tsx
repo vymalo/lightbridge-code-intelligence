@@ -1,6 +1,8 @@
 import { Check, X } from "lucide-react";
 import { ApiErrorLine, StatusLine } from "@/components/states";
+import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { Pill } from "@/components/ui/status-pill";
 import { hasPermission, listAdminRepos } from "@/lib/admin";
 import { approvalVisual, type Repository, repoSlug } from "@/lib/repos";
 import { currentClaims } from "@/lib/session";
@@ -135,31 +137,25 @@ function RepoRow({
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <span className={`status-pill status-${status.variant}`}>{status.label}</span>
+        <Pill variant={status.variant} label={status.label} />
         {/* Approve is available unless already approved; Deny unless already disabled — so any state
             is reachable from any other (the control plane enforces the permission per action). */}
         {canApprove && repo.status !== "approved" && (
           <form action={approveRepoAction}>
             <input type="hidden" name="id" value={repo.id} />
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-accent-foreground transition-opacity hover:opacity-90"
-            >
+            <Button type="submit" variant="primary" size="xs">
               <Check className="size-3.5" />
               Approve
-            </button>
+            </Button>
           </form>
         )}
         {canDeny && repo.status !== "disabled" && (
           <form action={denyRepoAction}>
             <input type="hidden" name="id" value={repo.id} />
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
-            >
+            <Button type="submit" size="xs">
               <X className="size-3.5" />
               Deny
-            </button>
+            </Button>
           </form>
         )}
       </div>

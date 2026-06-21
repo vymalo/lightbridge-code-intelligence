@@ -4,8 +4,10 @@ import { ChevronDown, ChevronUp } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
+import { Pagination } from "@/components/ui/pagination";
 import { StatusPill } from "@/components/ui/status-pill";
 import { cn } from "@/lib/cn";
+import { usePagination } from "@/lib/hooks/use-pagination";
 import {
   duration,
   durationSeconds,
@@ -45,9 +47,9 @@ function compare(key: SortKey, a: Task, b: Task, now: number): number {
   }
 }
 
-/** Dense, sortable, paginated table of runs (ADR-0024, Appwrite table pattern). Sort is local; the
- * page is owned by the parent (URL state via nuqs) and reset by the parent on filter changes. `now`
- * comes from the server so relative times don't drift on hydration. */
+/** Dense, sortable, paginated table of runs (ADR-0024, daisyUI `table` in ADR-0027). Sort is local;
+ * the page is owned by the parent (URL state via nuqs) and reset by the parent on filter changes.
+ * `now` comes from the server so relative times don't drift on hydration. */
 export function RunTable({
   tasks,
   now,
@@ -67,11 +69,7 @@ export function RunTable({
     return sort.dir === "desc" ? out.reverse() : out;
   }, [tasks, sort, now]);
 
-  // Clamp the page when the filtered set shrinks beneath the current offset.
-  const pageCount = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
-  const current = Math.min(page, pageCount - 1);
-  const start = current * PAGE_SIZE;
-  const rows = sorted.slice(start, start + PAGE_SIZE);
+  const { rows, pageCount, current, rangeLabel } = usePagination(sorted, PAGE_SIZE, page);
 
   const toggle = (key: SortKey) =>
     setSort((s) =>
@@ -81,13 +79,13 @@ export function RunTable({
   return (
     <div>
       <div className="overflow-x-auto">
-        <table className="w-full border-collapse text-sm">
+        <table className="table table-sm">
           <thead>
-            <tr className="border-b border-border text-left text-xs text-muted-foreground">
+            <tr className="text-muted-foreground">
               <Th label="Status" sortKey="status" sort={sort} onSort={toggle} />
               <Th label="Trigger" sortKey="trigger" sort={sort} onSort={toggle} />
               <Th label="Repository" sortKey="repo" sort={sort} onSort={toggle} />
-              <th className="px-4 py-2 font-medium">Branch</th>
+              <th className="font-medium">Branch</th>
               <Th label="Created" sortKey="created" sort={sort} onSort={toggle} align="right" />
               <Th label="Duration" sortKey="duration" sort={sort} onSort={toggle} align="right" />
             </tr>
@@ -104,12 +102,12 @@ export function RunTable({
                     if (e.metaKey || e.ctrlKey || e.shiftKey) return;
                     router.push(`/dashboard/runs/${task.id}`);
                   }}
-                  className="cursor-pointer border-b border-border transition-colors last:border-0 hover:bg-muted/60"
+                  className="cursor-pointer transition-colors hover:bg-base-300/60"
                 >
-                  <td className="px-4 py-2.5">
+                  <td>
                     <StatusPill status={task.status} />
                   </td>
-                  <td className="max-w-xs truncate px-4 py-2.5 font-medium">
+                  <td className="max-w-xs truncate font-medium">
                     {/* A real Link keeps the row keyboard-accessible + client-side nav; the row
                         onClick is mouse sugar. Foreground (not accent) to match the timeline RunRow
                         trigger — both views of the same list. */}
@@ -121,22 +119,20 @@ export function RunTable({
                       {triggerLabel(task)}
                     </Link>
                   </td>
-                  <td className="max-w-[12rem] truncate px-4 py-2.5 text-muted-foreground">
+                  <td className="max-w-[12rem] truncate text-muted-foreground">
                     {repoLabel(task)}
                   </td>
-                  <td className="px-4 py-2.5 text-muted-foreground">
+                  <td className="text-muted-foreground">
                     {task.repo_default_branch ??
                       (sha ? <span className="font-mono">{sha}</span> : "—")}
                   </td>
                   <td
-                    className="whitespace-nowrap px-4 py-2.5 text-right text-muted-foreground"
+                    className="whitespace-nowrap text-right text-muted-foreground"
                     title={task.created_at}
                   >
                     {relativeTime(task.created_at, now)}
                   </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">
-                    {dur ?? "—"}
-                  </td>
+                  <td className="text-right font-mono text-muted-foreground">{dur ?? "—"}</td>
                 </tr>
               );
             })}
@@ -144,25 +140,13 @@ export function RunTable({
         </table>
       </div>
 
-      <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
-        <span>
-          {sorted.length === 0
-            ? "No runs"
-            : `${start + 1}–${Math.min(start + PAGE_SIZE, sorted.length)} of ${sorted.length}`}
-        </span>
-        <div className="flex items-center gap-1">
-          {/* page 0 → null so nuqs drops the param (clean URL on the first page). */}
-          <PageButton disabled={current <= 0} onClick={() => onPageChange(current - 1 || null)}>
-            Prev
-          </PageButton>
-          <span className="px-1 tabular-nums">
-            {current + 1} / {pageCount}
-          </span>
-          <PageButton disabled={current >= pageCount - 1} onClick={() => onPageChange(current + 1)}>
-            Next
-          </PageButton>
-        </div>
-      </div>
+      <Pagination
+        current={current}
+        pageCount={pageCount}
+        rangeLabel={rangeLabel}
+        onPageChange={onPageChange}
+        className="flex items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-xs text-muted-foreground"
+      />
     </div>
   );
 }
@@ -182,7 +166,7 @@ function Th({
 }) {
   const active = sort.key === sortKey;
   return (
-    <th className={cn("px-4 py-2 font-medium", align === "right" && "text-right")}>
+    <th className={cn("font-medium", align === "right" && "text-right")}>
       <button
         type="button"
         onClick={() => onSort(sortKey)}
@@ -201,26 +185,5 @@ function Th({
           ))}
       </button>
     </th>
-  );
-}
-
-function PageButton({
-  disabled,
-  onClick,
-  children,
-}: {
-  disabled: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className="rounded-md border border-border px-2 py-1 transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
-    >
-      {children}
-    </button>
   );
 }
