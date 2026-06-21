@@ -1,9 +1,12 @@
 import { GitPullRequest, LayoutGrid, ListChecks, Settings, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { CommandPalette } from "@/components/command-palette";
 import { NavLink } from "@/components/nav-link";
+import { githubAppInstallUrl } from "@/lib/config";
 
-/** The console chrome (ADR-0016): a left sidebar nav + a slim top bar around contained content.
+/** The console chrome (ADR-0016; grouped nav + ⌘K palette in ADR-0024): a left sidebar nav split
+ * into hairline-separated groups + a slim top bar with a command palette, around contained content.
  * `admin` reveals the approval screen's nav entry (Epic #75) — the control plane still enforces it. */
 export function ConsoleShell({
   user,
@@ -23,31 +26,38 @@ export function ConsoleShell({
           </span>
           <span className="text-sm font-medium tracking-tight">Lightbridge</span>
         </Link>
-        <nav className="flex flex-col gap-0.5">
-          <NavLink href="/dashboard" exact icon={<LayoutGrid className="size-4" />}>
-            Overview
-          </NavLink>
-          <NavLink href="/dashboard/runs" icon={<ListChecks className="size-4" />}>
-            Runs
-          </NavLink>
-          <NavLink href="/dashboard/repositories" icon={<GitPullRequest className="size-4" />}>
-            Repositories
-          </NavLink>
-          {admin && (
-            <NavLink href="/dashboard/admin" icon={<ShieldCheck className="size-4" />}>
-              Approvals
+        <nav className="flex flex-col gap-3">
+          <div className="flex flex-col gap-0.5">
+            <NavLink href="/dashboard" exact icon={<LayoutGrid className="size-4" />}>
+              Overview
             </NavLink>
-          )}
-          <NavLink href="/dashboard/settings" icon={<Settings className="size-4" />}>
-            Settings
-          </NavLink>
+            <NavLink href="/dashboard/runs" icon={<ListChecks className="size-4" />}>
+              Runs
+            </NavLink>
+            <NavLink href="/dashboard/repositories" icon={<GitPullRequest className="size-4" />}>
+              Repositories
+            </NavLink>
+          </div>
+          {/* Hairline separator between the primary group and the system/admin group. */}
+          <div className="mx-2.5 border-t border-border" />
+          <div className="flex flex-col gap-0.5">
+            {admin && (
+              <NavLink href="/dashboard/admin" icon={<ShieldCheck className="size-4" />}>
+                Approvals
+              </NavLink>
+            )}
+            <NavLink href="/dashboard/settings" icon={<Settings className="size-4" />}>
+              Settings
+            </NavLink>
+          </div>
         </nav>
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="flex h-12 items-center justify-between gap-4 border-b border-border bg-surface px-4">
+        <header className="flex h-12 items-center gap-4 border-b border-border bg-surface px-4">
           <span className="text-sm font-medium tracking-tight md:hidden">Lightbridge</span>
-          <div className="flex flex-1 items-center justify-end gap-3 text-sm text-muted-foreground">
+          <CommandPalette admin={Boolean(admin)} githubAppUrl={githubAppInstallUrl()} />
+          <div className="ml-auto flex items-center gap-3 text-sm text-muted-foreground">
             <span className="truncate" title={user}>
               {user}
             </span>
