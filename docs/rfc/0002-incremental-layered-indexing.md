@@ -119,6 +119,23 @@ The webhook handler maps events to queue tasks:
 - Graph overlays are trickier than chunk overlays (cross-file edges may reference base nodes); Phase 2
   must define how an overlay edge to an unchanged symbol resolves (likely: resolve against the base
   layer by symbol id).
+- **Deleted files** need an explicit *tombstone* in the overlay. The shadow rule ("overlay wins for
+  files it touches") only fires when a file *appears* in the overlay — but a file the PR **deletes**
+  produces no overlay rows, so retrieval would fall back to the base and still surface the removed
+  code. The overlay must record the PR's deleted paths and retrieval must exclude base rows for those
+  paths, not just for paths that have overlay rows. Enumerate deletions with **`git diff --no-renames
+  --diff-filter=D`** — `--no-renames` decomposes a rename into delete-old + add-new, so the *old* path
+  of a renamed file is tombstoned (a plain `--diff-filter=D` with rename detection on would miss it,
+  leaving the pre-rename file retrievable from the base).
+- **Reverse graph edges (base → overlay).** An unchanged base file may call a symbol the PR *changed*;
+  the base edge still physically points at the now-shadowed base node, so a normal traversal
+  `(caller)-[:REL]->(target)` never reaches the overlay node. Resolving this purely at query time (join
+  on symbol id instead of traversing the relationship) sacrifices Neo4j's index-free adjacency and
+  turns traversals into pointer-chasing joins. Phase 2 should therefore **rewrite the boundary edges
+  at overlay-ingestion time** — when an overlay node shadows a base symbol, re-point (virtualize) the
+  incoming base edges to the overlay node within the query scope — preserving traversal performance,
+  rather than relying on a query-time symbol-id lookup. Either way overlay-precedence by symbol id is
+  the resolution rule; the trade-off is *when* it's applied.
 
 ## Alternatives considered
 
