@@ -72,6 +72,32 @@ pub async fn purge_repository_data(
     );
 }
 
+/// How many leftover repos the reconciler purges per cycle (bounds one tick's work).
+const PURGE_RECONCILE_BATCH: i64 = 20;
+
+/// Durable backstop for the data purge: re-purge any `disabled` repo that still has index data.
+/// [`spawn_purge`] is prompt but best-effort — a control-plane restart mid-purge loses the spawned
+/// task. Run on the dispatcher's periodic loop, this guarantees the purge eventually completes. It's
+/// the right home for this (not a per-repo k8s Job): purge writes to Postgres + Neo4j directly, and
+/// only the control plane holds those credentials (ADR-0020/0002). Idempotent.
+pub async fn reconcile_purges(pool: &PgPool, neo4j: Option<&neo4rs::Graph>) {
+    let repos = match crate::db::list_disabled_repos_needing_purge(pool, PURGE_RECONCILE_BATCH).await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "purge reconcile: listing disabled repos failed");
+            return;
+        }
+    };
+    if repos.is_empty() {
+        return;
+    }
+    tracing::info!(count = repos.len(), "purge reconcile: re-purging repos with leftover data");
+    for repository_id in repos {
+        purge_repository_data(pool, neo4j, repository_id).await;
+    }
+}
+
 /// Spawn [`purge_repository_data`] so destructive cleanup never blocks a webhook (its ~10s budget) or
 /// an admin request. No-op without a database.
 pub fn spawn_purge(state: &AppState, repository_id: i64) {

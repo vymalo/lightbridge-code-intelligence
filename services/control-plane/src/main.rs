@@ -400,7 +400,8 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         dispatcher::DispatcherConfig::from_file(file_config.as_ref().map(|f| &f.dispatcher));
     // The pod name is a natural, unique lease owner; fall back to a generic label off-cluster.
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "dispatcher".to_string());
-    dispatcher::run(pool, launcher, owner, dispatcher_config).await
+    // Pass Neo4j so the dispatcher's loop can run the durable purge reconciler (graph + pg cleanup).
+    dispatcher::run(pool, launcher, owner, dispatcher_config, state.neo4j.clone()).await
 }
 
 /// Serve `/metrics` (+ `/healthz`) on `METRICS_ADDR` for roles without a main HTTP server.

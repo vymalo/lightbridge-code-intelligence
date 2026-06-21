@@ -148,8 +148,11 @@ deletes the **pgvector `code_chunks`**, the **`repo_index`** bookkeeping, and th
 (`neo4j::delete_repo_graph`). The repository row is kept (`disabled`) for audit. Purge is idempotent
 and guarded against a re-approve racing ahead of it.
 
-> Today purge runs as a best-effort async task in the control plane (`spawn_purge`); hardening it into
-> a durable, observable Job/reconciler (survives a control-plane restart) is planned.
+Purge runs two ways: a **prompt** spawned task on the remove/deny event (`spawn_purge`), and a
+**durable reconciler** on the dispatcher loop (`reconcile_purges`, every reap tick) that re-purges any
+`disabled` repo still carrying index data — so a purge lost to a control-plane restart still completes.
+It lives in the control plane (not a per-repo k8s Job) because purge writes to Postgres + Neo4j
+directly, and only the control plane holds those credentials (ADR-0020/0002).
 
 ## Indexing strategy: review reuses the base index (ADR-0025)
 

@@ -436,6 +436,25 @@ pub async fn delete_repo_index_rows(pool: &PgPool, repository_id: i64) -> Result
     Ok(result.rows_affected())
 }
 
+/// Disabled repositories that still have index data (leftover `code_chunks` or `repo_index` rows) —
+/// the purge reconciler re-purges these so a cleanup lost to a control-plane restart still completes.
+/// (Neo4j leftovers accompany `code_chunks`, so this also catches graph data to purge.)
+pub async fn list_disabled_repos_needing_purge(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT r.id FROM repositories r \
+         WHERE r.status = 'disabled' \
+           AND (EXISTS (SELECT 1 FROM code_chunks c WHERE c.repository_id = r.id) \
+                OR EXISTS (SELECT 1 FROM repo_index ri WHERE ri.repository_id = r.id)) \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Cancelled tasks that still have a Kubernetes Job to clean up (the reaper deletes the Job, then
 /// clears `job_name` so the row isn't returned again).
 pub async fn list_cancelled_with_job(
