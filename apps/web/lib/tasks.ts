@@ -8,7 +8,8 @@ export interface Task {
   id: string;
   repository_id: number;
   installation_id: number;
-  github_delivery_id: string;
+  /** `null` for admin-initiated tasks (e.g. index-on-approve) that had no originating webhook. */
+  github_delivery_id: string | null;
   target_type: string;
   target_id: number;
   command_text: string;
@@ -58,6 +59,27 @@ export function statusVisual(status: string): { variant: StatusVariant; label: s
 export function repoLabel(task: Task): string {
   if (task.repo_owner && task.repo_name) return `${task.repo_owner}/${task.repo_name}`;
   return `repo #${task.repository_id}`;
+}
+
+/** GitHub URL of the task's repository, or `null` when the repo identity join came back empty. */
+export function repoUrl(task: Task): string | null {
+  if (!task.repo_owner || !task.repo_name) return null;
+  return `https://github.com/${task.repo_owner}/${task.repo_name}`;
+}
+
+/** GitHub URL of the run's target — the PR or issue — for a deep link; `null` when not applicable
+ * (e.g. a `repository` index task, which has no PR/issue) or the repo identity is missing. */
+export function targetUrl(task: Task): string | null {
+  const base = repoUrl(task);
+  if (!base) return null;
+  switch (task.target_type) {
+    case "pull_request":
+      return `${base}/pull/${task.target_id}`;
+    case "issue":
+      return `${base}/issues/${task.target_id}`;
+    default:
+      return null;
+  }
 }
 
 /** What triggered the run, e.g. `review · PR #123`. */
