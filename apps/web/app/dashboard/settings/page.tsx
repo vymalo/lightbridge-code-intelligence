@@ -1,6 +1,7 @@
 import { ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
+import { permissions } from "@/lib/admin";
 import { githubAppInstallUrl } from "@/lib/config";
 import { currentClaims, displayName } from "@/lib/session";
 
@@ -56,8 +57,8 @@ export default async function Settings() {
       <SettingsSection title="Access">
         <SettingsRow
           label="Permissions"
-          description="Access is governed by the permissions in your identity token and managed by your identity provider — there is nothing to configure here."
-          control={<Value>Managed by your IdP</Value>}
+          description="Granted by the permissions in your identity token (ADR-0023) and managed by your identity provider — there is nothing to configure here."
+          control={<PermissionList perms={permissions(claims)} />}
         />
       </SettingsSection>
 
@@ -93,5 +94,24 @@ function Value({ children, mono }: { children: React.ReactNode; mono?: boolean }
     <span className={`break-all text-foreground ${mono ? "font-mono text-xs" : ""}`}>
       {children}
     </span>
+  );
+}
+
+/** The signed-in user's effective permissions from the token claim, as chips. */
+function PermissionList({ perms }: { perms: string[] }) {
+  if (perms.length === 0) {
+    return <Value>No permissions in your token</Value>;
+  }
+  return (
+    <div className="flex max-w-xs flex-wrap justify-end gap-1">
+      {perms.map((p) => (
+        <code
+          key={p}
+          className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
+        >
+          {p}
+        </code>
+      ))}
+    </div>
   );
 }
