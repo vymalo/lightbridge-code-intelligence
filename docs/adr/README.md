@@ -47,3 +47,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0025](0025-review-reuses-base-index.md) | Review reuses the base index instead of re-indexing every run (perf) | Accepted |
 | [0026](0026-native-review-agent.md) | Native Rust review agent with structured tool calls; drop OpenCode (robust output + control tools) | Accepted |
 | [0027](0027-daisyui-design-system.md) | Adopt daisyUI (dracula theme) as the component layer; supersede ADR-0015's bespoke component/token mechanism | Proposed |
+| [0028](0028-agent-job-control-sidecar-external-pipeline.md) | Agent Job as a control sidecar + heavy main container, driven by an externally-defined pipeline (operator-composable steps/volumes) | Proposed |

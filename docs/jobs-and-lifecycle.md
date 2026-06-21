@@ -167,3 +167,14 @@ run for index jobs and cold-start reviews; warm reviews go straight to the revie
 Trade-off: the base index tracks the **default branch**, so it can go stale as that branch moves.
 Follow-up (not yet built): a periodic/push-driven re-index of the default branch, or incremental
 diff-only indexing for reviews, so search also covers brand-new PR symbols.
+
+## Future direction: control sidecar + externally-defined pipeline (ADR-0028, proposed)
+
+Today the runner's pipeline (clone → index → graph → review) is **hardcoded** in
+`agent-runner/src/main.rs:run()`, and the Job is a single container whose shape is built in
+`control-plane/src/k8s.rs:job_manifest()`. [ADR-0028](adr/0028-agent-job-control-sidecar-external-pipeline.md)
+(**proposed**) would restructure the Job into a small **control sidecar** (bootstrap, ordering,
+status, the self-cancel poll, log shipping) plus **heavy main container(s)**, with the **step list
+defined externally** (a ConfigMap now, a CRD later) so an operator can add a step (e.g. SAST) or a
+volume without code changes — while preserving the trust-boundary properties (ADR-0002/0017/0020/0022).
+One Job per task (ADR-0004) is unchanged.
