@@ -116,7 +116,9 @@ pub async fn run<L: TaskLauncher>(
     Ok(())
 }
 
-/// Resolves on SIGTERM (Kubernetes pod termination) or Ctrl-C, for a clean dispatcher shutdown.
+/// Resolves on SIGTERM (Kubernetes pod termination) or Ctrl-C, for a clean dispatcher shutdown. We
+/// run on Linux/macOS; the non-Unix arm falls back to Ctrl-C so the code still compiles.
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = match signal(SignalKind::terminate()) {
@@ -130,6 +132,14 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "could not install Ctrl-C handler");
+        std::future::pending::<()>().await;
     }
 }
 

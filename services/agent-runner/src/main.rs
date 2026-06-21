@@ -106,7 +106,9 @@ async fn main() -> std::process::ExitCode {
 }
 
 /// Resolves when the process receives SIGTERM (Kubernetes' pod-termination signal). If the signal
-/// can't be registered, it never resolves — the task then simply runs to completion.
+/// can't be registered, it never resolves — the task then simply runs to completion. We run on Linux
+/// (containers) / macOS (dev); the non-Unix arm falls back to Ctrl-C so the code still compiles.
+#[cfg(unix)]
 async fn terminated() {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
@@ -117,6 +119,14 @@ async fn terminated() {
             tracing::warn!(%error, "could not install SIGTERM handler; running uninterruptible");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminated() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "could not install Ctrl-C handler; running uninterruptible");
+        std::future::pending::<()>().await;
     }
 }
 
