@@ -37,7 +37,9 @@ export function RunLogs({ taskId }: { taskId: string }) {
         }
         if (!cancelled) setState("done");
       } catch {
-        if (!cancelled) setState((s) => (s === "streaming" ? "done" : s));
+        // A real fetch/stream failure (network/reset). Unmount aborts set `cancelled`, so this only
+        // marks an error for genuine failures.
+        if (!cancelled) setState("error");
       }
     })();
 
@@ -47,12 +49,14 @@ export function RunLogs({ taskId }: { taskId: string }) {
     };
   }, [taskId]);
 
-  // Keep the latest lines in view as they arrive. `text` is the intended trigger (not read in the
-  // body — we scroll the ref on each new chunk).
+  // Auto-scroll to the newest lines — but only if the user is already near the bottom, so scrolling
+  // up to read earlier output isn't yanked away. `text` is the intended trigger.
   // biome-ignore lint/correctness/useExhaustiveDependencies: text is the scroll trigger
   useEffect(() => {
     const el = preRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [text]);
 
   return (
