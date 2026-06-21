@@ -42,3 +42,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0020](0020-mcp-servers-via-control-plane.md) | MCP servers are thin clients of the control-plane retrieval API (no datastore creds in the Job) | Accepted |
 | [0021](0021-opencode-headless-review-agent.md) | OpenCode (headless `run`) is the review agent; generated opencode.json wires eaig + MCP | Accepted |
 | [0022](0022-review-writeback-control-plane.md) | Control plane validates findings against the PR diff and posts the review (no GitHub creds in the Job) | Accepted |
+| [0023](0023-db-backed-rbac.md) | DB-backed RBAC: roles from a custom token claim (aud still verified), permissions + role→permission mapping in Postgres, admin-managed | Proposed |
