@@ -9,11 +9,15 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 - [Architecture overview](architecture.md)
 - [Components and data models](components-and-data-models.md)
 - [GitHub App and Rust control plane](github-app-and-control-plane.md)
+- [Jobs and task lifecycle](jobs-and-lifecycle.md) — the two job kinds, state machine, cancellation + purge (with diagrams)
 - [Indexing and storage](indexing-and-storage.md)
 - [OpenCode ACP and MCP integration](opencode-acp-mcp.md)
 - [Kubernetes and deployment](kubernetes-deployment.md)
 - [Security, observability, testing, rollout](security-observability-testing-rollout.md)
 - [FAQ](faq.md)
+
+### Run it
+- [Local setup guide](local-setup.md) — compose deps, GitHub App + webhook proxy, manual trigger, multipass + k3s
 
 ### Decisions and process
 - [Architecture Decision Records (ADRs)](adr/README.md)
