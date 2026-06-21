@@ -133,7 +133,9 @@ pub struct TaskRow {
     pub id: Uuid,
     pub repository_id: i64,
     pub installation_id: i64,
-    pub github_delivery_id: String,
+    /// `None` for admin-initiated tasks (e.g. index-on-approve) that have no originating webhook
+    /// delivery; `Some` for webhook-created tasks. (Column is nullable since migration 0008.)
+    pub github_delivery_id: Option<String>,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
