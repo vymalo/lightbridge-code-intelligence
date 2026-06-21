@@ -34,6 +34,34 @@ pub struct Claims {
     pub name: Option<String>,
     /// Expiry (unix seconds) — validated by jsonwebtoken.
     pub exp: usize,
+    /// Keycloak realm roles (`realm_access.roles`). Used for the admin gate ([`Admin`]); absent for
+    /// non-Keycloak IdPs or tokens without a realm-role mapper.
+    #[serde(default)]
+    pub realm_access: Option<RealmAccess>,
+}
+
+/// Keycloak's `realm_access` claim — the realm-level roles assigned to the token's subject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealmAccess {
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+impl Claims {
+    /// True when the token carries `role` among its realm roles.
+    pub fn has_realm_role(&self, role: &str) -> bool {
+        self.realm_access
+            .as_ref()
+            .is_some_and(|ra| ra.roles.iter().any(|r| r == role))
+    }
+
+    /// A human-readable identity for audit (`approved_by`): username, else email, else subject.
+    pub fn identity(&self) -> &str {
+        self.preferred_username
+            .as_deref()
+            .or(self.email.as_deref())
+            .unwrap_or(&self.sub)
+    }
 }
 
 /// Resource-server token-validation config. Built from env; absent `OIDC_ISSUER` disables auth and
@@ -76,6 +104,8 @@ pub enum AuthError {
     JwksUnavailable,
     /// `OIDC_ISSUER` is not configured — the resource server cannot validate anything.
     Disabled,
+    /// Authenticated, but the caller lacks the required admin role.
+    Forbidden,
 }
 
 impl IntoResponse for AuthError {
@@ -85,6 +115,7 @@ impl IntoResponse for AuthError {
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid token"),
             AuthError::JwksUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "jwks unavailable"),
             AuthError::Disabled => (StatusCode::SERVICE_UNAVAILABLE, "oidc not configured"),
+            AuthError::Forbidden => (StatusCode::FORBIDDEN, "admin role required"),
         };
         (status, msg).into_response()
     }
@@ -189,6 +220,24 @@ impl FromRequestParts<AppState> for Claims {
     }
 }
 
+/// Extractor that authenticates AND authorizes an **admin** request: a valid token whose realm roles
+/// include the configured admin role (`state.admin_role`, from `ADMIN_ROLE`, default `lci-admin`).
+/// Wraps the verified [`Claims`]. 401 for a bad/missing token; 403 when authenticated but not an admin.
+pub struct Admin(pub Claims);
+
+impl FromRequestParts<AppState> for Admin {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, AuthError> {
+        let claims = Claims::from_request_parts(parts, state).await?;
+        if claims.has_realm_role(&state.admin_role) {
+            Ok(Admin(claims))
+        } else {
+            Err(AuthError::Forbidden)
+        }
+    }
+}
+
 fn bearer_token(parts: &Parts) -> Option<String> {
     parts
         .headers
@@ -279,6 +328,39 @@ mod tests {
         });
         let key = EncodingKey::from_rsa_pem(test_keys().0.as_bytes()).expect("test signing key");
         encode(&header, &claims, &key).expect("sign token")
+    }
+
+    #[test]
+    fn realm_role_gate_and_identity() {
+        let with_role = Claims {
+            sub: "u1".into(),
+            email: Some("a@b.c".into()),
+            preferred_username: Some("alice".into()),
+            name: None,
+            exp: 0,
+            realm_access: Some(RealmAccess {
+                roles: vec!["offline_access".into(), "lci-admin".into()],
+            }),
+        };
+        assert!(with_role.has_realm_role("lci-admin"));
+        assert!(!with_role.has_realm_role("other"));
+        assert_eq!(
+            with_role.identity(),
+            "alice",
+            "username preferred for audit"
+        );
+
+        // No realm_access (non-Keycloak token) → not an admin; identity falls back email → sub.
+        let none = Claims {
+            sub: "u2".into(),
+            email: Some("e@x".into()),
+            preferred_username: None,
+            name: None,
+            exp: 0,
+            realm_access: None,
+        };
+        assert!(!none.has_realm_role("lci-admin"));
+        assert_eq!(none.identity(), "e@x");
     }
 
     #[tokio::test]

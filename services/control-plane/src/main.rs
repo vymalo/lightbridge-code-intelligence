@@ -6,6 +6,7 @@
 //! the validated JWT claims (see ADR-0014). Persistence is Postgres via hand-written SQLx
 //! (cratestack codegen deferred — ADR-0005).
 
+mod admin;
 mod config;
 mod db;
 mod dispatcher;
@@ -71,6 +72,9 @@ pub struct AppState {
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
     pub app_handle: Arc<String>,
+    /// Keycloak realm role required for the admin API (approval gate, Epic #75), from `ADMIN_ROLE`.
+    /// Default `lci-admin`. A token must carry this in `realm_access.roles` to reach `/admin/*`.
+    pub admin_role: Arc<String>,
 }
 
 impl AppState {
@@ -145,6 +149,12 @@ impl AppState {
                     .filter(|h| !h.trim().is_empty())
                     .unwrap_or_else(|| "lightbridge-assistant".to_string()),
             ),
+            admin_role: Arc::new(
+                std::env::var("ADMIN_ROLE")
+                    .ok()
+                    .filter(|r| !r.trim().is_empty())
+                    .unwrap_or_else(|| "lci-admin".to_string()),
+            ),
         })
     }
 }
@@ -193,6 +203,10 @@ fn app(state: AppState) -> Router {
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/repositories", get(tasks::list_repositories))
+        // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
+        .route("/admin/repositories", get(admin::list_repositories))
+        .route("/admin/repositories/{id}/approve", post(admin::approve))
+        .route("/admin/repositories/{id}/deny", post(admin::deny))
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
         .route("/internal/tasks/{id}/status", post(internal::set_status))

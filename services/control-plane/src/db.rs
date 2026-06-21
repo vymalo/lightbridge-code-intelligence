@@ -447,23 +447,123 @@ pub struct RepositoryRow {
     pub owner: String,
     pub name: String,
     pub default_branch: String,
+    /// Approval gate (Epic #75): `pending` | `approved` | `disabled`. `active` mirrors
+    /// `status = 'approved'` for the existing dashboard; `status` is the source of truth.
+    pub status: String,
     pub active: bool,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub approved_at: Option<OffsetDateTime>,
+    pub approved_by: Option<String>,
     pub task_count: i64,
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_task_at: Option<OffsetDateTime>,
 }
 
-/// All connected repositories, most-recently-active first. Aggregates each repo's task activity in
-/// one query so the Repositories list needs no per-row round-trip.
-pub async fn list_repositories(pool: &PgPool) -> Result<Vec<RepositoryRow>, sqlx::Error> {
+/// Connected repositories, most-recently-active first, optionally filtered by approval `status`
+/// (e.g. `Some("pending")` for the admin approval queue). Aggregates each repo's task activity in one
+/// query so the list needs no per-row round-trip.
+pub async fn list_repositories(
+    pool: &PgPool,
+    status: Option<&str>,
+) -> Result<Vec<RepositoryRow>, sqlx::Error> {
     sqlx::query_as::<_, RepositoryRow>(
-        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.active, \
+        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.status, \
+           (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
            COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
          FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
+         WHERE ($1::text IS NULL OR r.status = $1) \
          GROUP BY r.id \
          ORDER BY last_task_at DESC NULLS LAST, r.owner, r.name",
     )
+    .bind(status)
     .fetch_all(pool)
+    .await
+}
+
+/// Register a repository seen via an `installation` / `installation_repositories` webhook as
+/// **pending** approval. Insert-only (`ON CONFLICT DO NOTHING`) so it never disturbs an
+/// already-approved repo's status or its real `default_branch`. The installation payload doesn't
+/// carry `default_branch`, so a placeholder is fine — the first PR webhook (or the index task) fills
+/// it in. Returns `true` if a new pending row was inserted.
+pub async fn register_pending_repository(
+    pool: &PgPool,
+    github_repo_id: i64,
+    owner: &str,
+    name: &str,
+    default_branch: &str,
+) -> Result<bool, sqlx::Error> {
+    let inserted = sqlx::query(
+        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, status) \
+         VALUES ($1, $2, $3, $4, 'pending') \
+         ON CONFLICT (github_repo_id) DO NOTHING",
+    )
+    .bind(github_repo_id)
+    .bind(owner)
+    .bind(name)
+    .bind(default_branch)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() > 0)
+}
+
+/// Is this repository approved for work? The gate the webhook handlers check before creating any
+/// review/index task. A missing repo (shouldn't happen — callers upsert first) reads as not approved.
+pub async fn repository_approved(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(status.as_deref() == Some("approved"))
+}
+
+/// Set a repository's approval status by its **GitHub** id (webhook path — e.g. mark `disabled` when
+/// removed from the installation). No-op if the repo isn't known locally.
+pub async fn set_repository_status_by_github_id(
+    pool: &PgPool,
+    github_repo_id: i64,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE repositories SET status = $2 WHERE github_repo_id = $1")
+        .bind(github_repo_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Admin action: set a repository's approval status by its **local** id, recording who/when on
+/// approval. Returns the updated row, or `None` if no such repo. `approved_by` is the admin's
+/// identity (OIDC subject/username); cleared for non-approved transitions.
+pub async fn set_repository_status_by_id(
+    pool: &PgPool,
+    id: i64,
+    status: &str,
+    approved_by: Option<&str>,
+) -> Result<Option<RepositoryRow>, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE repositories SET status = $2, \
+           approved_at = CASE WHEN $2 = 'approved' THEN now() ELSE NULL END, \
+           approved_by = CASE WHEN $2 = 'approved' THEN $3 ELSE NULL END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(approved_by)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    sqlx::query_as::<_, RepositoryRow>(
+        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.status, \
+           (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
+           COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
+         FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
+         WHERE r.id = $1 GROUP BY r.id",
+    )
+    .bind(id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -913,8 +1013,9 @@ mod tests {
             .unwrap();
         }
 
-        let repos = list_repositories(&pool).await.unwrap();
+        let repos = list_repositories(&pool, None).await.unwrap();
         assert_eq!(repos.len(), 2);
+        // (approval-gate behaviour is covered by `repo_approval_status_transitions`)
 
         // Active repo (has tasks) sorts first by last_task_at.
         assert_eq!(repos[0].id, active);
@@ -924,6 +1025,71 @@ mod tests {
         let idle_row = repos.iter().find(|r| r.id == idle).unwrap();
         assert_eq!(idle_row.task_count, 0);
         assert!(idle_row.last_task_at.is_none());
+    }
+
+    /// The approval gate (Epic #75): new repos are pending; register_pending is insert-only;
+    /// approve/deny flip the gate + record the approver; the status filter scopes the list.
+    #[sqlx::test]
+    async fn repo_approval_status_transitions(pool: PgPool) {
+        // A repo seen via the normal upsert path defaults to pending → gated.
+        let id = upsert_repository(&pool, 4242, "o", "r", "main")
+            .await
+            .unwrap();
+        assert!(
+            !repository_approved(&pool, id).await.unwrap(),
+            "new repos start pending (gated)"
+        );
+
+        // register_pending is insert-only: it reports not-new for an existing repo and leaves it be.
+        assert!(!register_pending_repository(&pool, 4242, "o", "r", "")
+            .await
+            .unwrap());
+        // A brand-new repo registers as pending (reports new).
+        assert!(register_pending_repository(&pool, 5555, "o", "r2", "")
+            .await
+            .unwrap());
+
+        // Both pending repos show under the status filter; none are approved yet.
+        let pending = list_repositories(&pool, Some("pending")).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|r| r.status == "pending" && !r.active));
+        assert!(list_repositories(&pool, Some("approved"))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Approve → approved + active + records the approver; the gate opens.
+        let row = set_repository_status_by_id(&pool, id, "approved", Some("alice"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "approved");
+        assert!(row.active);
+        assert_eq!(row.approved_by.as_deref(), Some("alice"));
+        assert!(row.approved_at.is_some());
+        assert!(repository_approved(&pool, id).await.unwrap());
+
+        // Disable → not approved, approver/timestamp cleared.
+        let row = set_repository_status_by_id(&pool, id, "disabled", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "disabled");
+        assert!(!row.active);
+        assert!(row.approved_by.is_none() && row.approved_at.is_none());
+        assert!(!repository_approved(&pool, id).await.unwrap());
+
+        // Disable-by-github-id (the webhook removal path).
+        set_repository_status_by_github_id(&pool, 5555, "disabled")
+            .await
+            .unwrap();
+        // Unknown local id → None.
+        assert!(
+            set_repository_status_by_id(&pool, 999_999, "approved", Some("x"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an
