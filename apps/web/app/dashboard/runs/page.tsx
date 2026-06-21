@@ -5,7 +5,12 @@ import { listTasks } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-export default async function Runs() {
+export default async function Runs({
+  searchParams,
+}: {
+  searchParams: Promise<{ status?: string }>;
+}) {
+  const { status } = await searchParams;
   const result = await listTasks();
   const now = Date.now();
 
@@ -27,7 +32,7 @@ export default async function Runs() {
           Runs appear here when the GitHub App processes a pull request or comment command.
         </EmptyState>
       ) : (
-        <RunList tasks={result.data} now={now} />
+        <RunList tasks={result.data} now={now} initialStatus={status} />
       )}
     </div>
   );
