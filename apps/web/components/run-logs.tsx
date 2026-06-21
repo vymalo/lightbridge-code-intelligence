@@ -1,8 +1,11 @@
 "use client";
 
-import { Check, Copy, Download, Search } from "lucide-react";
+import { Check, Copy, Download } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { cn } from "@/lib/cn";
+import { Button } from "@/components/ui/button";
+import { SearchInput } from "@/components/ui/search-input";
+import { useCopyToClipboard } from "@/lib/hooks/use-copy";
+import { useLogStream } from "@/lib/hooks/use-log-stream";
 
 type Level = "all" | "info" | "warn" | "error";
 
@@ -24,54 +27,16 @@ function lineMatchesLevel(line: string, level: Level): boolean {
 }
 
 /**
- * Live agent-Job log stream for a run (Epic #75; filter bar added in ADR-0024, Lovable pattern).
- * Reads the `text/plain` streaming response from `/api/runs/{id}/logs` chunk by chunk; the level
- * filter, search, copy, and download all operate on the buffered text client-side. Read-only.
+ * Live agent-Job log stream for a run (Epic #75; filter bar in ADR-0024, daisyUI in ADR-0027).
+ * Streaming lives in `useLogStream`; the level filter, search, copy, and download all operate on the
+ * buffered text client-side. Read-only.
  */
 export function RunLogs({ taskId }: { taskId: string }) {
-  const [text, setText] = useState("");
-  const [state, setState] = useState<"streaming" | "done" | "error">("streaming");
+  const { text, state } = useLogStream(taskId);
+  const { copied, copy } = useCopyToClipboard();
   const [level, setLevel] = useState<Level>("all");
   const [query, setQuery] = useState("");
-  const [copied, setCopied] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const res = await fetch(`/api/runs/${encodeURIComponent(taskId)}/logs`, {
-          signal: controller.signal,
-        });
-        if (!res.ok || !res.body) {
-          const detail = await res.text().catch(() => "");
-          if (!cancelled) {
-            setText(detail || `Failed to load logs (HTTP ${res.status}).`);
-            setState("error");
-          }
-          return;
-        }
-        const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value && !cancelled) setText((prev) => prev + value);
-        }
-        if (!cancelled) setState("done");
-      } catch {
-        // A real fetch/stream failure (network/reset). Unmount aborts set `cancelled`, so this only
-        // marks an error for genuine failures.
-        if (!cancelled) setState("error");
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [taskId]);
 
   const allLines = useMemo(() => (text ? text.split("\n") : []), [text]);
   const filtering = level !== "all" || query.trim() !== "";
@@ -96,17 +61,7 @@ export function RunLogs({ taskId }: { taskId: string }) {
   }, [shown, filtering]);
 
   const body = text ? shown.join("\n") : "";
-
-  const copy = async () => {
-    if (!navigator?.clipboard || !body) return;
-    try {
-      await navigator.clipboard.writeText(body);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard can reject (document not focused, permissions) — ignore; the button just won't flip.
-    }
-  };
+  const placeholder = state === "streaming" ? "Connecting to the run's logs…" : "No log output.";
 
   const download = () => {
     if (!body) return;
@@ -120,8 +75,6 @@ export function RunLogs({ taskId }: { taskId: string }) {
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
-  const placeholder = state === "streaming" ? "Connecting to the run's logs…" : "No log output.";
-
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
@@ -129,7 +82,7 @@ export function RunLogs({ taskId }: { taskId: string }) {
           value={level}
           onChange={(e) => setLevel(e.target.value as Level)}
           aria-label="Filter logs by level"
-          className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-border-strong focus:ring-1 focus:ring-ring"
+          className="select select-sm w-auto"
         >
           {LEVELS.map((l) => (
             <option key={l.value} value={l.value}>
@@ -137,31 +90,28 @@ export function RunLogs({ taskId }: { taskId: string }) {
             </option>
           ))}
         </select>
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-          <input
-            type="search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search logs"
-            className="h-7 w-44 rounded-md border border-border bg-background pl-7 pr-2 text-xs outline-none placeholder:text-muted-foreground focus:border-border-strong focus:ring-1 focus:ring-ring"
-          />
-        </div>
+        <SearchInput
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search logs"
+          aria-label="Search logs"
+          className="w-44"
+        />
         <div className="ml-auto flex items-center gap-1">
-          <LogAction onClick={copy} label={copied ? "Copied" : "Copy"} disabled={!body}>
+          <Button variant="ghost" size="xs" onClick={() => copy(body)} disabled={!body}>
             {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {copied ? "Copied" : "Copy"}
-          </LogAction>
-          <LogAction onClick={download} label="Download" disabled={!body}>
+          </Button>
+          <Button variant="ghost" size="xs" onClick={download} disabled={!body}>
             <Download className="size-3.5" />
             Download
-          </LogAction>
+          </Button>
         </div>
       </div>
 
       <pre
         ref={preRef}
-        className="max-h-96 overflow-auto rounded-md bg-[var(--surface)] p-3 font-mono text-xs leading-relaxed text-muted-foreground"
+        className="max-h-96 overflow-auto rounded-md bg-base-200 p-3 font-mono text-xs leading-relaxed text-muted-foreground"
       >
         {body || (filtering ? "No lines match the current filters." : placeholder)}
       </pre>
@@ -173,32 +123,5 @@ export function RunLogs({ taskId }: { taskId: string }) {
         {text && filtering && ` · showing ${shown.length} of ${allLines.length} lines`}
       </span>
     </div>
-  );
-}
-
-function LogAction({
-  onClick,
-  label,
-  disabled,
-  children,
-}: {
-  onClick: () => void;
-  label: string;
-  disabled?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={label}
-      className={cn(
-        "inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
-        "disabled:cursor-not-allowed disabled:opacity-40",
-      )}
-    >
-      {children}
-    </button>
   );
 }

@@ -1,18 +1,10 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
-/** Flat surface card — thin border, no shadow (ADR-0015). */
+/** Flat surface card on the daisyUI `card` primitive (ADR-0027): hairline border (`card-border`),
+ * no shadow, base-200 surface. Header/body keep a dense, hairline-divided rhythm. */
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return (
-    <div
-      className={cn(
-        "rounded-card border border-border bg-surface text-surface-foreground",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
+  return <div className={cn("card card-border bg-base-200", className)}>{children}</div>;
 }
 
 export function CardHeader({ className, children }: { className?: string; children: ReactNode }) {

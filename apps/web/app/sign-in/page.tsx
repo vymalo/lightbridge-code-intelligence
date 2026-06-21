@@ -1,3 +1,4 @@
+import { buttonClass } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 
 /** Authentication is delegated to Keycloak (OIDC). This page just kicks off the redirect flow. */
@@ -16,10 +17,7 @@ export default function SignInPage() {
             Authentication is handled by Keycloak (OIDC). You'll be redirected to sign in, then
             returned here — the app manages no credentials of its own (see ADR-0014).
           </p>
-          <a
-            href="/api/auth/login"
-            className="inline-flex items-center justify-center rounded-md bg-accent px-3.5 py-2 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
-          >
+          <a href="/api/auth/login" className={buttonClass("primary", "md")}>
             Continue with Keycloak
           </a>
         </CardBody>

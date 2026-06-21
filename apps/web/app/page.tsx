@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { buttonClass } from "@/components/ui/button";
 
 export default function Home() {
   return (
@@ -14,16 +15,10 @@ export default function Home() {
         pull requests. Sign in to see task runs across your repositories.
       </p>
       <div className="flex gap-3">
-        <Link
-          href="/dashboard"
-          className="inline-flex items-center rounded-md bg-accent px-3.5 py-2 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
-        >
+        <Link href="/dashboard" className={buttonClass("primary", "md")}>
           Open console
         </Link>
-        <Link
-          href="/sign-in"
-          className="inline-flex items-center rounded-md border border-border px-3.5 py-2 text-sm transition-colors hover:bg-muted"
-        >
+        <Link href="/sign-in" className={buttonClass("neutral", "md")}>
           Sign in
         </Link>
       </div>

@@ -1,11 +1,12 @@
 "use client";
 
-import { LayoutList, Search, Table2 } from "lucide-react";
+import { LayoutList, Table2 } from "lucide-react";
 import { parseAsInteger, parseAsStringLiteral, useQueryState } from "nuqs";
 import { useMemo } from "react";
 import { RunTable } from "@/components/run-table";
 import { RunTimeline } from "@/components/run-timeline";
 import { StatusLine } from "@/components/states";
+import { SearchInput } from "@/components/ui/search-input";
 import { cn } from "@/lib/cn";
 import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/tasks";
 
@@ -21,9 +22,9 @@ const FILTERS: { value: (typeof FILTER_VALUES)[number]; label: string }[] = [
 
 const VIEW_VALUES = ["timeline", "table"] as const;
 
-/** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024).
- * All state lives in the URL via nuqs (shareable/bookmarkable); `now` is server-passed so relative
- * times don't drift on hydration. Filtering happens client-side over the fetched page. */
+/** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024,
+ * daisyUI in ADR-0027). All state lives in the URL via nuqs (shareable/bookmarkable); `now` is
+ * server-passed so relative times don't drift on hydration. Filtering is client-side over the page. */
 export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
   const [filter, setFilter] = useQueryState(
     "status",
@@ -57,9 +58,9 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
   const resetPage = () => setPage(null);
 
   return (
-    <div className="overflow-hidden rounded-card border border-border bg-surface">
+    <div className="overflow-hidden rounded-box border border-border bg-base-200">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2.5">
-        <div className="flex flex-wrap gap-1">
+        <div className="join">
           {FILTERS.map((f) => (
             <button
               type="button"
@@ -68,12 +69,7 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
                 setFilter(f.value);
                 resetPage();
               }}
-              className={cn(
-                "rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                filter === f.value
-                  ? "bg-foreground text-background"
-                  : "text-muted-foreground hover:bg-muted",
-              )}
+              className={cn("btn btn-xs join-item", filter === f.value && "btn-active btn-primary")}
             >
               {f.label}
             </button>
@@ -89,7 +85,7 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
                 resetPage();
               }}
               aria-label="Filter by repository"
-              className="h-7 max-w-[12rem] rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-border-strong focus:ring-1 focus:ring-ring"
+              className="select select-sm max-w-[12rem]"
             >
               <option value="all">All repositories</option>
               {repos.map((r) => (
@@ -100,22 +96,19 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
             </select>
           )}
 
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => {
-                setQuery(e.target.value);
-                resetPage();
-              }}
-              placeholder="Search runs"
-              className="h-7 w-44 rounded-md border border-border bg-background pl-7 pr-2 text-xs outline-none placeholder:text-muted-foreground focus:border-border-strong focus:ring-1 focus:ring-ring"
-            />
-          </div>
+          <SearchInput
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              resetPage();
+            }}
+            placeholder="Search runs"
+            aria-label="Search runs"
+            className="w-44"
+          />
 
           {/* Timeline / table view toggle. */}
-          <div className="flex items-center rounded-md border border-border p-0.5">
+          <div className="join">
             <ViewButton
               active={view === "timeline"}
               onClick={() => setView("timeline")}
@@ -159,10 +152,7 @@ function ViewButton({
       aria-pressed={active}
       aria-label={`${label} view`}
       title={`${label} view`}
-      className={cn(
-        "rounded p-1 transition-colors",
-        active ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
-      )}
+      className={cn("btn btn-xs btn-square join-item", active && "btn-active")}
     >
       {children}
     </button>
