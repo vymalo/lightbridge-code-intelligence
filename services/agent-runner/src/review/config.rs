@@ -15,12 +15,30 @@ const GRAPH_MCP_BIN: &str = "/usr/local/bin/lightbridge-graph-mcp";
 /// Secrets are passed by `{env:…}` reference for the provider (so `LLM_API_KEY` isn't written to the
 /// file); the MCP env is written literally since those values must reach the child processes and the
 /// file lives only on the ephemeral Job disk.
-pub fn opencode_config(review: &ReviewConfig, mcp_env: &[(String, String)]) -> Value {
+pub fn opencode_config(
+    review: &ReviewConfig,
+    mcp_env: &[(String, String)],
+    attribution: &[(String, String)],
+) -> Value {
     let env_obj: Value = mcp_env
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect::<serde_json::Map<_, _>>()
         .into();
+
+    // Provider options: the gateway base URL + key, plus attribution headers (epic #89) so the Envoy
+    // AI Gateway bills the review's token spend to the right project. @ai-sdk/openai-compatible
+    // forwards `options.headers` on every request.
+    let mut provider_options = serde_json::Map::new();
+    provider_options.insert("baseURL".to_string(), json!(review.base_url));
+    provider_options.insert("apiKey".to_string(), json!("{env:LLM_API_KEY}"));
+    if !attribution.is_empty() {
+        let headers: serde_json::Map<String, Value> = attribution
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        provider_options.insert("headers".to_string(), Value::Object(headers));
+    }
 
     let mcp_server = |bin: &str| {
         json!({
@@ -54,10 +72,7 @@ pub fn opencode_config(review: &ReviewConfig, mcp_env: &[(String, String)]) -> V
             super::PROVIDER_ID: {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Lightbridge Gateway (eaig)",
-                "options": {
-                    "baseURL": review.base_url,
-                    "apiKey": "{env:LLM_API_KEY}",
-                },
+                "options": Value::Object(provider_options),
                 "models": {
                     review.model.clone(): model_entry,
                 }
@@ -97,7 +112,7 @@ mod tests {
 
     #[test]
     fn model_options_carry_configured_params() {
-        let cfg = opencode_config(&review(), &[]);
+        let cfg = opencode_config(&review(), &[], &[]);
         let opts = &cfg["provider"]["eaig"]["models"]["qwen-coder"]["options"];
         assert_eq!(opts["temperature"], serde_json::json!(0.2));
         assert_eq!(opts["max_tokens"], serde_json::json!(4096));
@@ -105,9 +120,25 @@ mod tests {
     }
 
     #[test]
+    fn attribution_headers_go_to_provider_options() {
+        let attribution = vec![(
+            "x-code-intelligence-repo".to_string(),
+            "octo/hello".to_string(),
+        )];
+        let cfg = opencode_config(&review(), &[], &attribution);
+        assert_eq!(
+            cfg["provider"]["eaig"]["options"]["headers"]["x-code-intelligence-repo"],
+            "octo/hello"
+        );
+        // No attribution → no headers key.
+        let bare = opencode_config(&review(), &[], &[]);
+        assert!(bare["provider"]["eaig"]["options"].get("headers").is_none());
+    }
+
+    #[test]
     fn wires_provider_model_and_mcp_servers() {
         let env = vec![("TASK_ID".to_string(), "t1".to_string())];
-        let cfg = opencode_config(&review(), &env);
+        let cfg = opencode_config(&review(), &env, &[]);
 
         // Provider is the OpenAI-compatible gateway; the key is an env reference, not the literal.
         let provider = &cfg["provider"]["eaig"];
