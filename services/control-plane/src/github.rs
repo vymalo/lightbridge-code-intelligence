@@ -138,7 +138,11 @@ impl GithubApp {
             "event": "COMMENT",
             "comments": comments,
         });
-        let review: serde_json::Value = self
+        #[derive(Deserialize)]
+        struct ReviewResponse {
+            html_url: Option<String>,
+        }
+        let review: ReviewResponse = self
             .http
             .post(format!(
                 "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews"
@@ -156,7 +160,7 @@ impl GithubApp {
             .json()
             .await
             .context("parsing PR review response")?;
-        Ok(review["html_url"].as_str().map(str::to_string))
+        Ok(review.html_url)
     }
 
     /// Fetch a repository's default branch. Used by index-on-approve (Epic #75): a repo registered
