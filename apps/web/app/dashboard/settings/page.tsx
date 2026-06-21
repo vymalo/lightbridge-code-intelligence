@@ -1,5 +1,6 @@
 import { ExternalLink } from "lucide-react";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import Link from "next/link";
+import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
 import { githubAppInstallUrl } from "@/lib/config";
 import { currentClaims, displayName } from "@/lib/session";
 
@@ -17,43 +18,64 @@ export default async function Settings() {
           (ADR-0014).
         </p>
       </div>
-      <Card>
-        <CardHeader>
-          <CardTitle>Account</CardTitle>
-        </CardHeader>
-        <CardBody>
-          {claims ? (
-            <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-              <Field label="Name" value={displayName(claims)} />
-              <Field label="Email" value={claims.email ?? "—"} />
-              <Field label="Username" value={claims.preferred_username ?? "—"} />
-              <Field label="Subject" value={claims.sub} mono />
-            </dl>
-          ) : (
-            <p className="text-sm text-muted-foreground">Not signed in.</p>
-          )}
-        </CardBody>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>GitHub App</CardTitle>
-        </CardHeader>
-        <CardBody>
-          <p className="text-sm text-muted-foreground">
-            Lightbridge reviews via a GitHub App. Manage its installation, repository access, and
-            permissions from its public page.
-          </p>
-          <a
-            href={githubAppInstallUrl()}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
-          >
-            Open the GitHub App
-            <ExternalLink className="size-3.5" />
-          </a>
-        </CardBody>
-      </Card>
+
+      <SettingsSection title="Account">
+        {claims ? (
+          <>
+            <SettingsRow label="Name" control={<Value>{displayName(claims)}</Value>} />
+            <SettingsRow label="Email" control={<Value>{claims.email ?? "—"}</Value>} />
+            <SettingsRow
+              label="Username"
+              control={<Value>{claims.preferred_username ?? "—"}</Value>}
+            />
+            <SettingsRow label="Subject" control={<Value mono>{claims.sub}</Value>} />
+          </>
+        ) : (
+          <SettingsRow label="Not signed in" control={<Value>—</Value>} />
+        )}
+      </SettingsSection>
+
+      <SettingsSection title="GitHub App">
+        <SettingsRow
+          label="Installation"
+          description="Lightbridge reviews via a GitHub App. Manage its installation, repository access, and permissions on its public page."
+          control={
+            <a
+              href={githubAppInstallUrl()}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
+            >
+              Open
+              <ExternalLink className="size-3.5" />
+            </a>
+          }
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Access">
+        <SettingsRow
+          label="Permissions"
+          description="Access is governed by the permissions in your identity token and managed by your identity provider — there is nothing to configure here."
+          control={<Value>Managed by your IdP</Value>}
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Indexing">
+        <SettingsRow
+          label="Automatic indexing"
+          description="Repositories are indexed automatically once approved. Per-repository index health appears on the Repositories page."
+          control={
+            <Link
+              href="/dashboard/repositories"
+              className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
+            >
+              Repositories
+            </Link>
+          }
+        />
+      </SettingsSection>
+
       <div>
         <a
           href="/api/auth/logout"
@@ -66,11 +88,10 @@ export default async function Settings() {
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Value({ children, mono }: { children: React.ReactNode; mono?: boolean }) {
   return (
-    <div>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className={`mt-0.5 break-all text-sm ${mono ? "font-mono" : ""}`}>{value}</dd>
-    </div>
+    <span className={`break-all text-foreground ${mono ? "font-mono text-xs" : ""}`}>
+      {children}
+    </span>
   );
 }
