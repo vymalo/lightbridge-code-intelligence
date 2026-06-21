@@ -82,6 +82,27 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
           {finding.suggestion}
         </pre>
       )}
+      {finding.resources && finding.resources.length > 0 && (
+        <div className="mt-2">
+          <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Resources
+          </span>
+          <ul className="mt-1 flex flex-col gap-0.5">
+            {finding.resources.map((url) => (
+              <li key={url}>
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="break-all text-xs text-accent transition-colors hover:underline"
+                >
+                  {url}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </li>
   );
 }
