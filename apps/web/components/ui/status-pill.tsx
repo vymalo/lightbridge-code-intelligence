@@ -1,15 +1,21 @@
+import { cva } from "class-variance-authority";
 import { cn } from "@/lib/cn";
 import { type StatusVariant, statusVisual } from "@/lib/tasks";
 
 // Status variant → daisyUI badge color (ADR-0027). `badge-soft` keeps the calm, tinted fill from the
-// ADR-0016 status model; pending/cancelled stay neutral (ghost).
-const VARIANT_BADGE: Record<StatusVariant, string> = {
-  pending: "badge-ghost",
-  active: "badge-info badge-soft",
-  success: "badge-success badge-soft",
-  error: "badge-error badge-soft",
-  muted: "badge-ghost",
-};
+// ADR-0016 status model; pending/cancelled stay neutral (ghost). Keyed by the domain `StatusVariant`.
+const pillVariants = cva("badge badge-sm gap-1.5", {
+  variants: {
+    variant: {
+      pending: "badge-ghost",
+      active: "badge-info badge-soft",
+      success: "badge-success badge-soft",
+      error: "badge-error badge-soft",
+      muted: "badge-ghost",
+    } satisfies Record<StatusVariant, string>,
+  },
+  defaultVariants: { variant: "pending" },
+});
 
 /** A small status capsule (daisyUI `badge`) with a leading status dot — pulsing while active. Shared
  * by run statuses ([`StatusPill`]) and repo approval states (`approvalVisual`). */
@@ -25,7 +31,7 @@ export function Pill({
   className?: string;
 }) {
   return (
-    <span className={cn("badge badge-sm gap-1.5", VARIANT_BADGE[variant], className)}>
+    <span className={cn(pillVariants({ variant }), className)}>
       <span className={cn("size-1.5 rounded-full bg-current", pulse && "animate-pulse")} />
       {label}
     </span>
