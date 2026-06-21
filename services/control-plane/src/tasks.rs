@@ -47,6 +47,42 @@ pub async fn get(caller: Caller, State(state): State<AppState>, Path(id): Path<U
     }
 }
 
+/// `POST /tasks/{id}/cancel` — manually cancel an active run. Requires `task:cancel`. Sets the task
+/// `cancelled`; the runner's self-cancel poll / the reaper then stop the Job + pod. `409` when the
+/// task is already terminal (nothing to cancel), `404` when unknown.
+pub async fn cancel(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(e) = caller.require("task:cancel") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    // Distinguish "unknown id" (404) from "already finished" (409) so the UI can message correctly.
+    match crate::db::get_task_status(pool, id).await {
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "cancel: status lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+    match crate::db::cancel_task_by_id(pool, id).await {
+        Ok(true) => {
+            tracing::info!(task_id = %id, by = %caller.claims.identity(), "task cancelled (manual)");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::CONFLICT, "task is already finished").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "cancel task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "update error").into_response()
+        }
+    }
+}
+
 /// `GET /tasks/{id}/review` — the persisted review for a run (summary + body + findings), or 404 when
 /// none was recorded (older run, index task, or a review that never posted).
 pub async fn get_review(

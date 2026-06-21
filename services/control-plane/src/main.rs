@@ -204,6 +204,7 @@ fn app(state: AppState) -> Router {
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/tasks/{id}/review", get(tasks::get_review))
+        .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
         // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
         .route("/admin/repositories", get(admin::list_repositories))

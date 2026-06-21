@@ -388,6 +388,22 @@ pub async fn cancel_active_tasks_for_repo(
     .await
 }
 
+/// Cancel a single task by id, if it's still active. Returns `true` when a row moved to `cancelled`
+/// (false if the id is unknown or already terminal). Backs the manual "Cancel run" action; the
+/// runner's self-cancel poll / the reaper then stop the Job + pod.
+pub async fn cancel_task_by_id(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'cancelled', completed_at = now(), \
+             lease_owner = NULL, lease_expires_at = NULL \
+         WHERE id = $1 \
+           AND status IN ('received', 'waiting_for_index', 'queued', 'running', 'posting_result')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo
 /// is removed/denied (Epic #75, Milestone B). Returns the number of rows deleted.
 pub async fn delete_code_chunks_for_repo(
