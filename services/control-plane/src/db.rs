@@ -56,10 +56,11 @@ pub async fn reconcile_embedding_dimension(
 ) -> anyhow::Result<()> {
     use anyhow::bail;
     // pgvector stores the dimension in the column's `atttypmod` (== N for `vector(N)`, -1 if none).
+    // `to_regclass` resolves the table via the active search_path and yields NULL (→ no row) when it
+    // doesn't exist, so this is schema-safe and a no-op before the table is created.
     let current: Option<i32> = sqlx::query_scalar(
-        "SELECT a.atttypmod FROM pg_attribute a \
-         JOIN pg_class c ON c.oid = a.attrelid \
-         WHERE c.relname = 'code_chunks' AND a.attname = 'embedding' AND NOT a.attisdropped",
+        "SELECT atttypmod FROM pg_attribute \
+         WHERE attrelid = to_regclass('code_chunks') AND attname = 'embedding' AND NOT attisdropped",
     )
     .fetch_optional(pool)
     .await?;
@@ -81,16 +82,20 @@ pub async fn reconcile_embedding_dimension(
         to = dimension,
         "embedding dimension changed; TRUNCATE code_chunks + ALTER column (reindex from scratch)"
     );
+    // Atomic: TRUNCATE + ALTER in one transaction so a failed ALTER can't leave the table truncated
+    // but still at the old width (an inconsistent state the next startup wouldn't detect).
+    let mut tx = pool.begin().await?;
     sqlx::query("TRUNCATE TABLE code_chunks")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
     // safe; the vector type width can't be a bind parameter.
     sqlx::query(&format!(
         "ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector({dimension})"
     ))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 

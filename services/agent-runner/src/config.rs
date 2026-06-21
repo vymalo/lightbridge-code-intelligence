@@ -47,8 +47,11 @@ pub struct ReviewFile {
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_diff_chars: Option<usize>,
     /// Generation params for the review model, passed through to opencode.json (the OpenAI-compatible
-    /// provider). All optional — unset means the model/provider default.
+    /// provider). All optional — unset means the model/provider default. Numeric-string tolerant so
+    /// `{env:…}`-substituted values (always strings) still deserialize.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
     pub temperature: Option<f64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
     pub top_p: Option<f64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub max_tokens: Option<i64>,

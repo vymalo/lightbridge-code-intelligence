@@ -65,11 +65,13 @@ pub struct KubeLauncher {
     resources: Option<Value>,
     /// Handle to the agent ServiceAccount, used to resolve its UID for the Job `ownerReference`.
     sa: Api<ServiceAccount>,
-    /// Lazily-resolved Job `ownerReference` (to the agent SA) for k8s GC + traceability. `None` means
-    /// "not resolved yet" — `launch` retries on each call until it succeeds, so a not-yet-created SA
-    /// or a transient API error at startup doesn't permanently leave Jobs un-owned. Owner must be the
-    /// same-namespace SA (k8s forbids cross-namespace ownerRefs), not the cross-ns dispatcher.
-    owner_reference: tokio::sync::Mutex<Option<Value>>,
+    /// Lazily-resolved Job `ownerReference` (to the agent SA) for k8s GC + traceability. A
+    /// [`OnceCell`] so the SA UID is fetched on first launch and cached; until it resolves, each
+    /// launch retries (a not-yet-created SA or transient API error at startup must not permanently
+    /// leave Jobs un-owned). `get_or_try_init` only holds its internal lock during the one-time init,
+    /// not across every launch. Owner must be the same-namespace SA (k8s forbids cross-namespace
+    /// ownerRefs), not the cross-ns dispatcher.
+    owner_reference: tokio::sync::OnceCell<Value>,
 }
 
 /// The default Job runtime cap when `AGENT_JOB_DEADLINE_SECONDS` is unset or unparseable.
@@ -162,46 +164,53 @@ impl KubeLauncher {
             review_system_prompt,
             agent_config_map,
             resources,
-            owner_reference: tokio::sync::Mutex::new(None),
+            owner_reference: tokio::sync::OnceCell::new(),
         })
     }
 }
 
-/// Read the agent ServiceAccount's UID and shape it into a Job `ownerReference`. Best-effort: a
-/// failure (RBAC, missing SA) is logged and yields `None` so Job creation still works un-owned.
-async fn fetch_owner_reference(sa: &Api<ServiceAccount>, sa_name: &str) -> Option<Value> {
-    match sa.get(sa_name).await {
-        Ok(sa) => sa.metadata.uid.map(|uid| {
-            json!({
-                "apiVersion": "v1",
-                "kind": "ServiceAccount",
-                "name": sa_name,
-                "uid": uid,
-                // Not a controlling owner (the reaper/TTL manage lifecycle); just a GC + trace link
-                // that must not block the SA's own deletion.
-                "controller": false,
-                "blockOwnerDeletion": false,
-            })
-        }),
-        Err(error) => {
-            tracing::warn!(%error, sa_name, "could not read agent ServiceAccount uid; Jobs will have no ownerReference");
-            None
-        }
-    }
+/// Read the agent ServiceAccount's UID and shape it into a Job `ownerReference`. Returns `Err` (so the
+/// caching `OnceCell` retries on the next launch) when the SA can't be read or has no UID yet — a
+/// startup race we want to recover from, not cache as "un-owned forever".
+async fn fetch_owner_reference(sa: &Api<ServiceAccount>, sa_name: &str) -> anyhow::Result<Value> {
+    use anyhow::Context;
+    let account = sa
+        .get(sa_name)
+        .await
+        .with_context(|| format!("reading agent ServiceAccount {sa_name}"))?;
+    let uid = account
+        .metadata
+        .uid
+        .with_context(|| format!("agent ServiceAccount {sa_name} has no uid yet"))?;
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "name": sa_name,
+        "uid": uid,
+        // Not a controlling owner (the reaper/TTL manage lifecycle); just a GC + trace link that must
+        // not block the SA's own deletion.
+        "controller": false,
+        "blockOwnerDeletion": false,
+    }))
 }
 
 impl TaskLauncher for KubeLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String> {
         let name = job_name(task);
-        // Resolve the SA ownerReference lazily + cached: fetch on first launch (when the SA exists),
-        // retry on each launch until it succeeds, then reuse. So a startup race or transient API
-        // error doesn't permanently leave Jobs un-owned.
-        let owner_reference = {
-            let mut cache = self.owner_reference.lock().await;
-            if cache.is_none() {
-                *cache = fetch_owner_reference(&self.sa, &self.service_account).await;
+        // Resolve the SA ownerReference lazily + cached via `OnceCell`: fetched on first launch (when
+        // the SA exists), retried each launch until it succeeds, then reused — so a startup race or
+        // transient API error doesn't permanently leave Jobs un-owned. The internal lock is held only
+        // during the one-time init, never across every launch's `.await`.
+        let owner_reference = match self
+            .owner_reference
+            .get_or_try_init(|| fetch_owner_reference(&self.sa, &self.service_account))
+            .await
+        {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                tracing::warn!(%error, "could not resolve agent SA ownerReference; Job created un-owned");
+                None
             }
-            cache.clone()
         };
         let manifest = job_manifest(
             &name,
@@ -215,7 +224,7 @@ impl TaskLauncher for KubeLauncher {
                 review_system_prompt: self.review_system_prompt.as_deref(),
                 agent_config_map: self.agent_config_map.as_deref(),
                 resources: self.resources.as_ref(),
-                owner_reference: owner_reference.as_ref(),
+                owner_reference,
             },
             task,
         );
