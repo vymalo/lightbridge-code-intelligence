@@ -93,6 +93,9 @@ pub struct TaskContextResponse {
     pub command: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    /// Whether the repo already has a semantic index. The runner skips the full re-index on a review
+    /// when this is true (reuses the base index + the PR diff) — ADR-0025.
+    pub repo_indexed: bool,
 }
 
 /// `GET /internal/tasks/{id}` — task context + a freshly-minted installation token for the runner.
@@ -126,6 +129,12 @@ pub async fn get_context(
         }
     };
 
+    // A missing/failed index check is treated as "not indexed" (fail safe → the runner indexes),
+    // so a transient DB hiccup degrades to the old always-index behavior rather than skipping.
+    let repo_indexed = crate::db::repo_has_index(pool, context.repository_id)
+        .await
+        .unwrap_or(false);
+
     Json(TaskContextResponse {
         task_id: context.id,
         repository_id: context.repository_id,
@@ -139,6 +148,7 @@ pub async fn get_context(
         command: context.command_text,
         base_sha: context.base_sha,
         head_sha: context.head_sha,
+        repo_indexed,
     })
     .into_response()
 }

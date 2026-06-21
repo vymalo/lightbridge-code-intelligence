@@ -27,7 +27,8 @@ async fn get_context_sends_bearer_and_parses_the_response() {
             "target_id": 7,
             "command": "review",
             "base_sha": "base123",
-            "head_sha": "head456"
+            "head_sha": "head456",
+            "repo_indexed": true
         })))
         .mount(&server)
         .await;
@@ -39,6 +40,7 @@ async fn get_context_sends_bearer_and_parses_the_response() {
     assert_eq!(context.name, "repo");
     assert_eq!(context.command, "review");
     assert_eq!(context.head_sha.as_deref(), Some("head456"));
+    assert!(context.repo_indexed, "repo_indexed parses from the context");
     assert_eq!(
         context.authenticated_clone_url(),
         "https://x-access-token:test-install-tok@github.com/octo/repo.git"

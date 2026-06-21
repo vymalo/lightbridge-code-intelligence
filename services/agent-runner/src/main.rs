@@ -188,18 +188,28 @@ async fn run(
 
     let checkout = clone::checkout(&context, &config.workdir).await?;
 
-    // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────────
-    let chunk_count = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
-
-    // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────────
-    // Best-effort: the semantic index already landed, and the graph store may be unconfigured
-    // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-    let graph_summary = match indexer::graph::index_graph(&context, &checkout, client).await {
-        Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
-        Err(error) => {
-            tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
-            "graph skipped".to_string()
-        }
+    // Index when this is an `index` task, or a cold repo with no base index yet. A review on an
+    // already-indexed repo REUSES the base index (it searches related code via the MCP tools and has
+    // the PR diff in its prompt), so we skip the costly full re-index — that re-index was why a review
+    // took roughly as long as an index every time (ADR-0025).
+    let needs_index = context.command == "index" || !context.repo_indexed;
+    let (chunk_count, graph_summary) = if needs_index {
+        // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
+        let chunks = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
+        // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────
+        // Best-effort: the semantic index already landed, and the graph store may be unconfigured
+        // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
+        let graph = match indexer::graph::index_graph(&context, &checkout, client).await {
+            Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
+            Err(error) => {
+                tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
+                "graph skipped".to_string()
+            }
+        };
+        (chunks, graph)
+    } else {
+        tracing::info!("repo already indexed — reusing the base index (skipping re-index for review)");
+        (0, "reused base index".to_string())
     };
 
     // ── Review: OpenCode over the MCP tools → validated GitHub write-back ────────────────────

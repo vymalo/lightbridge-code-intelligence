@@ -404,6 +404,15 @@ pub async fn cancel_task_by_id(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Er
     Ok(result.rows_affected() > 0)
 }
 
+/// Whether a repository already has a semantic index (any `code_chunks` rows). The runner uses this
+/// to skip the full re-index on a review when a base index already exists (ADR-0025).
+pub async fn repo_has_index(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM code_chunks WHERE repository_id = $1)")
+        .bind(repository_id)
+        .fetch_one(pool)
+        .await
+}
+
 /// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo
 /// is removed/denied (Epic #75, Milestone B). Returns the number of rows deleted.
 pub async fn delete_code_chunks_for_repo(
