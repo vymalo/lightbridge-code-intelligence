@@ -70,12 +70,108 @@ async fn set_status(admin: Admin, state: AppState, id: i64, status: &str) -> Res
             if status == "disabled" {
                 crate::lifecycle::spawn_purge(&state, id);
             }
+            // Approval opts the repo in → index its default branch (Epic #75, Milestone B). Spawned:
+            // it makes GitHub calls (token mint, default-branch resolve) that must not block the
+            // admin response.
+            if status == "approved" {
+                let (state, repo_id, owner, name, default_branch) = (
+                    state.clone(),
+                    repo.id,
+                    repo.owner.clone(),
+                    repo.name.clone(),
+                    repo.default_branch.clone(),
+                );
+                tokio::spawn(async move {
+                    enqueue_index_on_approve(state, repo_id, owner, name, default_branch).await;
+                });
+            }
             Json(repo).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(error) => {
             tracing::error!(%error, repo_id = id, status, "admin set repository status failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
+/// Enqueue the base index for a just-approved repo (best-effort — never fails the approval response).
+/// Needs the repo's `installation_id` (to mint a clone token); logs + skips if it's unknown (e.g. a
+/// repo approved before any installation/PR webhook recorded it). When the `default_branch` is blank
+/// (a repo first seen via an installation webhook, which omits it) it's resolved via the API and
+/// persisted, so the runner clones the right ref.
+async fn enqueue_index_on_approve(
+    state: AppState,
+    repo_id: i64,
+    owner: String,
+    name: String,
+    default_branch: String,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let installation_id = match crate::db::repository_installation_id(pool, repo_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::warn!(
+                repository_id = repo_id,
+                "approved but no installation_id recorded; base index skipped (will index on the next PR)"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, repository_id = repo_id, "approved: installation_id lookup failed");
+            return;
+        }
+    };
+
+    // Resolve the default branch if it's a placeholder (installation webhooks don't carry it).
+    if default_branch.trim().is_empty() {
+        match state.github.as_ref() {
+            Some(app) => match app.installation_token(installation_id).await {
+                Ok(token) => match app.repository_default_branch(&token, &owner, &name).await {
+                    Ok(branch) => {
+                        if let Err(error) =
+                            crate::db::update_repository_default_branch(pool, repo_id, &branch)
+                                .await
+                        {
+                            tracing::error!(%error, repository_id = repo_id, "approved: persist default_branch failed");
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, repository_id = repo_id, "approved: resolve default_branch failed; index skipped");
+                        return;
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(%error, repository_id = repo_id, "approved: token mint failed; index skipped");
+                    return;
+                }
+            },
+            None => {
+                tracing::warn!(
+                    repository_id = repo_id,
+                    "approved but GitHub App unconfigured + no default_branch; index skipped"
+                );
+                return;
+            }
+        }
+    }
+
+    match crate::db::create_index_task(pool, repo_id, installation_id).await {
+        Ok(Some(task_id)) => {
+            crate::metrics::task_created();
+            tracing::info!(repository_id = repo_id, %task_id, "approved: enqueued base index task")
+        }
+        Ok(None) => {
+            tracing::info!(
+                repository_id = repo_id,
+                "approved: an index task is already active; skipping"
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, repository_id = repo_id, "approved: enqueue index failed")
         }
     }
 }

@@ -134,19 +134,28 @@ async fn handle_pull_request(
         );
         return;
     };
-    let repository_id =
-        match crate::db::upsert_repository(pool, github_repo_id, owner, name, default_branch).await
-        {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::error!(%error, delivery_id, "failed to upsert repository");
-                return;
-            }
-        };
+    // installation.id is present on PR events; record it so index-on-approve can mint a clone token.
+    let installation_id_opt = payload["installation"]["id"].as_i64();
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        github_repo_id,
+        owner,
+        name,
+        default_branch,
+        installation_id_opt,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "failed to upsert repository");
+            return;
+        }
+    };
 
     match action {
         "opened" => {
-            let Some(installation_id) = payload["installation"]["id"].as_i64() else {
+            let Some(installation_id) = installation_id_opt else {
                 return;
             };
             // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
@@ -253,15 +262,22 @@ async fn handle_issue_comment(
             return;
         }
     };
-    let repository_id =
-        match crate::db::upsert_repository(pool, github_repo_id, owner, name, default_branch).await
-        {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::error!(%error, delivery_id, "failed to upsert repository");
-                return;
-            }
-        };
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        github_repo_id,
+        owner,
+        name,
+        default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "failed to upsert repository");
+            return;
+        }
+    };
     // Approval gate (Epic #75): even an explicit @mention can't run on an unapproved repo.
     if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
         return;
@@ -363,8 +379,9 @@ async fn handle_installation(
     };
     let action = payload["action"].as_str().unwrap_or_default();
     let repos = payload["repositories"].as_array();
+    let installation_id = payload["installation"]["id"].as_i64();
     match action {
-        "created" => register_pending(pool, repos, delivery_id).await,
+        "created" => register_pending(pool, repos, installation_id, delivery_id).await,
         "deleted" => disable_repos(state, repos, delivery_id).await,
         _ => {} // suspend/unsuspend/new_permissions_accepted → persisted only
     }
@@ -380,7 +397,14 @@ async fn handle_installation_repositories(
     let Some(pool) = state.db.as_ref() else {
         return;
     };
-    register_pending(pool, payload["repositories_added"].as_array(), delivery_id).await;
+    let installation_id = payload["installation"]["id"].as_i64();
+    register_pending(
+        pool,
+        payload["repositories_added"].as_array(),
+        installation_id,
+        delivery_id,
+    )
+    .await;
     disable_repos(
         state,
         payload["repositories_removed"].as_array(),
@@ -390,17 +414,27 @@ async fn handle_installation_repositories(
 }
 
 /// Register each repo (a webhook repo object: `id`, `full_name`) as pending approval, insert-only so
-/// an already-approved repo is untouched.
+/// an already-approved repo is untouched. Records `installation_id` (for later index-on-approve).
 async fn register_pending(
     pool: &sqlx::PgPool,
     repos: Option<&Vec<serde_json::Value>>,
+    installation_id: Option<i64>,
     delivery_id: &str,
 ) {
     for repo in repos.into_iter().flatten() {
         let Some((github_repo_id, owner, name)) = repo_identity(repo) else {
             continue;
         };
-        match crate::db::register_pending_repository(pool, github_repo_id, owner, name, "").await {
+        match crate::db::register_pending_repository(
+            pool,
+            github_repo_id,
+            owner,
+            name,
+            "",
+            installation_id,
+        )
+        .await
+        {
             Ok(true) => {
                 tracing::info!(delivery_id, repo = %format!("{owner}/{name}"), "registered pending repository (awaiting approval)")
             }

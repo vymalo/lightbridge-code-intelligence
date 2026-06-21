@@ -153,6 +153,37 @@ impl GithubApp {
         Ok(())
     }
 
+    /// Fetch a repository's default branch. Used by index-on-approve (Epic #75): a repo registered
+    /// via an installation webhook has no `default_branch` (that payload omits it), so we resolve it
+    /// before indexing.
+    pub async fn repository_default_branch(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let value: serde_json::Value = self
+            .http
+            .get(format!("https://api.github.com/repos/{owner}/{repo}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("fetching repository")?
+            .error_for_status()
+            .context("github rejected the repository fetch")?
+            .json()
+            .await
+            .context("parsing repository")?;
+        value["default_branch"]
+            .as_str()
+            .map(str::to_string)
+            .context("repository response missing default_branch")
+    }
+
     /// Fetch a PR's base + head SHAs. Used by the `@mention` re-review path, where the
     /// `issue_comment` payload has no SHAs (unlike the `pull_request` event).
     pub async fn pull_request_shas(

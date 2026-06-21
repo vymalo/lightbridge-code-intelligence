@@ -133,7 +133,9 @@ pub struct TaskRow {
     pub id: Uuid,
     pub repository_id: i64,
     pub installation_id: i64,
-    pub github_delivery_id: String,
+    /// `None` for admin-initiated tasks (e.g. index-on-approve) that have no originating webhook
+    /// delivery; `Some` for webhook-created tasks. (Column is nullable since migration 0008.)
+    pub github_delivery_id: Option<String>,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
@@ -189,24 +191,31 @@ pub struct ClaimedTask {
 }
 
 /// Insert or update a repository by its GitHub id; returns the local `repositories.id`.
+/// `installation_id` is recorded when known (`Some`) and preserved otherwise (`COALESCE`), so the
+/// index-on-approve path can mint a token for it. Status is never touched here (the approval gate
+/// owns it).
 pub async fn upsert_repository(
     pool: &PgPool,
     github_repo_id: i64,
     owner: &str,
     name: &str,
     default_branch: &str,
+    installation_id: Option<i64>,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
-        "INSERT INTO repositories (github_repo_id, owner, name, default_branch) \
-         VALUES ($1, $2, $3, $4) \
+        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, installation_id) \
+         VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (github_repo_id) DO UPDATE \
-           SET owner = EXCLUDED.owner, name = EXCLUDED.name, default_branch = EXCLUDED.default_branch \
+           SET owner = EXCLUDED.owner, name = EXCLUDED.name, \
+               default_branch = EXCLUDED.default_branch, \
+               installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id) \
          RETURNING id",
     )
     .bind(github_repo_id)
     .bind(owner)
     .bind(name)
     .bind(default_branch)
+    .bind(installation_id)
     .fetch_one(pool)
     .await
 }
@@ -533,18 +542,21 @@ pub async fn register_pending_repository(
     owner: &str,
     name: &str,
     default_branch: &str,
+    installation_id: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let affected = sqlx::query(
-        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, status) \
-         VALUES ($1, $2, $3, $4, 'pending') \
+        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, installation_id, status) \
+         VALUES ($1, $2, $3, $4, $5, 'pending') \
          ON CONFLICT (github_repo_id) DO UPDATE \
-           SET status = 'pending', owner = EXCLUDED.owner, name = EXCLUDED.name \
+           SET status = 'pending', owner = EXCLUDED.owner, name = EXCLUDED.name, \
+               installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id) \
            WHERE repositories.status = 'disabled'",
     )
     .bind(github_repo_id)
     .bind(owner)
     .bind(name)
     .bind(default_branch)
+    .bind(installation_id)
     .execute(pool)
     .await?;
     Ok(affected.rows_affected() > 0)
@@ -565,6 +577,71 @@ pub async fn repository_status(
 /// review/index task. A missing repo (shouldn't happen — callers upsert first) reads as not approved.
 pub async fn repository_approved(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
     Ok(repository_status(pool, repository_id).await?.as_deref() == Some("approved"))
+}
+
+/// Persist a repository's resolved default branch (e.g. fetched at approval time for a repo first
+/// seen via an installation webhook, which doesn't carry it).
+pub async fn update_repository_default_branch(
+    pool: &PgPool,
+    repository_id: i64,
+    default_branch: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE repositories SET default_branch = $2 WHERE id = $1")
+        .bind(repository_id)
+        .bind(default_branch)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// The repository's GitHub `installation_id` (for minting a clone token), or `None` if not recorded.
+pub async fn repository_installation_id(
+    pool: &PgPool,
+    repository_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let id: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT installation_id FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(id.flatten())
+}
+
+/// Enqueue a standalone **index** task for a repository's default branch (Epic #75, Milestone B —
+/// runs on admin approval). Skips if an index task is already active for the repo (so re-approving
+/// doesn't pile up duplicates). Returns the new task id, or `None` if one was already pending/running.
+/// Unlike review tasks it has no originating delivery (`github_delivery_id` NULL) and no SHA (the
+/// runner indexes the default-branch HEAD).
+pub async fn create_index_task(
+    pool: &PgPool,
+    repository_id: i64,
+    installation_id: i64,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id = Uuid::new_v4();
+    let inserted: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO tasks (id, repository_id, installation_id, target_type, target_id, \
+         command_text, run_epoch, status) \
+         SELECT $1, $2, $3, 'repository', $2, 'index', 0, 'queued' \
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM tasks WHERE repository_id = $2 AND command_text = 'index' \
+             AND status IN ('queued', 'running', 'posting_result') \
+         ) \
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(repository_id)
+    .bind(installation_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(new_id) = inserted {
+        let _ = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(TASK_QUEUED_CHANNEL)
+            .bind(new_id.to_string())
+            .execute(pool)
+            .await;
+    }
+    Ok(inserted)
 }
 
 /// Set a repository's approval status by its **GitHub** id (webhook path — e.g. mark `disabled` when
@@ -853,7 +930,7 @@ mod tests {
 
     /// Seed the FK rows a task needs (one repository + one delivery); returns the repository id.
     async fn seed(pool: &PgPool) -> i64 {
-        let repo_id = upsert_repository(pool, 1, "octo", "repo", "main")
+        let repo_id = upsert_repository(pool, 1, "octo", "repo", "main", None)
             .await
             .unwrap();
         record_delivery(pool, "d1", "pull_request", &json!({}))
@@ -1040,10 +1117,10 @@ mod tests {
     /// reports `0` with a null `last_task_at`, and the active repo sorts first.
     #[sqlx::test]
     async fn list_repositories_summarises_activity(pool: PgPool) {
-        let active = upsert_repository(&pool, 1, "vymalo", "shop", "main")
+        let active = upsert_repository(&pool, 1, "vymalo", "shop", "main", None)
             .await
             .unwrap();
-        let idle = upsert_repository(&pool, 2, "vymalo", "idle", "trunk")
+        let idle = upsert_repository(&pool, 2, "vymalo", "idle", "trunk", None)
             .await
             .unwrap();
 
@@ -1090,7 +1167,7 @@ mod tests {
     #[sqlx::test]
     async fn repo_approval_status_transitions(pool: PgPool) {
         // A repo seen via the normal upsert path defaults to pending → gated.
-        let id = upsert_repository(&pool, 4242, "o", "r", "main")
+        let id = upsert_repository(&pool, 4242, "o", "r", "main", None)
             .await
             .unwrap();
         assert!(
@@ -1099,13 +1176,17 @@ mod tests {
         );
 
         // register_pending is insert-only: it reports not-new for an existing repo and leaves it be.
-        assert!(!register_pending_repository(&pool, 4242, "o", "r", "")
-            .await
-            .unwrap());
+        assert!(
+            !register_pending_repository(&pool, 4242, "o", "r", "", None)
+                .await
+                .unwrap()
+        );
         // A brand-new repo registers as pending (reports new).
-        assert!(register_pending_repository(&pool, 5555, "o", "r2", "")
-            .await
-            .unwrap());
+        assert!(
+            register_pending_repository(&pool, 5555, "o", "r2", "", None)
+                .await
+                .unwrap()
+        );
 
         // Both pending repos show under the status filter; none are approved yet.
         let pending = list_repositories(&pool, Some("pending")).await.unwrap();
@@ -1143,7 +1224,7 @@ mod tests {
             .unwrap();
         // Re-install of a DISABLED repo re-opens it to pending (so the admin can re-approve).
         assert!(
-            register_pending_repository(&pool, 5555, "o", "r2", "")
+            register_pending_repository(&pool, 5555, "o", "r2", "", None)
                 .await
                 .unwrap(),
             "re-registering a disabled repo re-pends it"
@@ -1158,7 +1239,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !register_pending_repository(&pool, 4242, "o", "r", "")
+            !register_pending_repository(&pool, 4242, "o", "r", "", None)
                 .await
                 .unwrap(),
             "an approved repo is not re-pended"
@@ -1179,7 +1260,7 @@ mod tests {
     #[sqlx::test]
     async fn purge_cancels_only_target_repo_tasks(pool: PgPool) {
         let repo_a = seed(&pool).await;
-        let repo_b = upsert_repository(&pool, 9001, "octo", "other", "main")
+        let repo_b = upsert_repository(&pool, 9001, "octo", "other", "main", None)
             .await
             .unwrap();
         create_task(&pool, &pr_task(repo_a, "h1"))
@@ -1217,6 +1298,29 @@ mod tests {
         // Delete helpers are safe no-ops with nothing indexed.
         assert_eq!(delete_code_chunks_for_repo(&pool, repo_a).await.unwrap(), 0);
         assert_eq!(delete_repo_index_rows(&pool, repo_a).await.unwrap(), 0);
+    }
+
+    /// Index-on-approve (Epic #75, Milestone B): the repo's installation_id round-trips, and the index
+    /// task is created once but not duplicated while one is already active.
+    #[sqlx::test]
+    async fn index_task_creation_is_deduped(pool: PgPool) {
+        let id = upsert_repository(&pool, 1212, "o", "r", "main", Some(555))
+            .await
+            .unwrap();
+        assert_eq!(
+            repository_installation_id(&pool, id).await.unwrap(),
+            Some(555),
+            "installation_id recorded for the clone token"
+        );
+
+        assert!(
+            create_index_task(&pool, id, 555).await.unwrap().is_some(),
+            "first approve enqueues an index task"
+        );
+        assert!(
+            create_index_task(&pool, id, 555).await.unwrap().is_none(),
+            "no duplicate while one index task is active"
+        );
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an
