@@ -71,11 +71,12 @@ pub async fn run_review(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
+    attribution: &[(String, String)],
 ) -> anyhow::Result<ReviewResult> {
     // Generate the project config the agent runs under. Built from the runner's own env so the MCP
     // subprocesses inherit TASK_ID / CONTROL_PLANE_URL / AGENT_RUNNER_TOKEN / EMBEDDINGS_* explicitly
-    // rather than relying on env inheritance.
-    let cfg = opencode_config(review, &mcp_env());
+    // rather than relying on env inheritance. `attribution` adds the gateway billing headers (#89).
+    let cfg = opencode_config(review, &mcp_env(), attribution);
     let cfg_path = checkout.join("opencode.json");
     tokio::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?)
         .await

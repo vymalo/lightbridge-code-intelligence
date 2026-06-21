@@ -25,6 +25,9 @@ pub struct EmbeddingsClient {
     api_key: String,
     model: String,
     http: reqwest::Client,
+    /// Attribution headers (epic #89) added to every request so the gateway can bill the right
+    /// project. Empty by default; set via [`EmbeddingsClient::with_attribution`].
+    attribution: reqwest::header::HeaderMap,
 }
 
 /// Build the HTTP client, additionally trusting the CA PEM at `EMBEDDINGS_CA_CERT` if set. The eaig
@@ -62,7 +65,23 @@ impl EmbeddingsClient {
             api_key: api_key.into(),
             model: model.into(),
             http: build_http_client(),
+            attribution: reqwest::header::HeaderMap::new(),
         }
+    }
+
+    /// Attach gateway attribution headers (epic #89). Invalid header names/values are skipped (these
+    /// are our own controlled keys, so that shouldn't happen).
+    pub fn with_attribution(mut self, headers: &[(String, String)]) -> Self {
+        use reqwest::header::{HeaderName, HeaderValue};
+        for (name, value) in headers {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                self.attribution.insert(n, v);
+            }
+        }
+        self
     }
 
     /// Embed a batch of texts. Returns one vector per input, in the same order.
@@ -78,6 +97,7 @@ impl EmbeddingsClient {
             .http
             .post(&self.url)
             .bearer_auth(&self.api_key)
+            .headers(self.attribution.clone())
             .json(&EmbedRequest {
                 model: &self.model,
                 input: texts,

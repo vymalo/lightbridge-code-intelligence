@@ -25,6 +25,34 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
+    /// Attribution headers (epic #89) for the OpenAI-compatible gateway: they let the Envoy AI Gateway
+    /// map this call's token spend to the customer's project (budgeting). Sent on the embeddings + the
+    /// review LLM calls. Header names are lowercase per HTTP/2.
+    pub fn attribution_headers(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "x-code-intelligence-repo".to_string(),
+                format!("{}/{}", self.owner, self.name),
+            ),
+            (
+                "x-code-intelligence-repo-id".to_string(),
+                self.repository_id.to_string(),
+            ),
+            (
+                "x-code-intelligence-task-id".to_string(),
+                self.task_id.to_string(),
+            ),
+            (
+                "x-code-intelligence-target".to_string(),
+                format!("{}#{}", self.target_type, self.target_id),
+            ),
+            (
+                "x-code-intelligence-command".to_string(),
+                self.command.clone(),
+            ),
+        ]
+    }
+
     /// The HTTPS remote with the installation token embedded — what `git` is invoked against.
     /// GitHub accepts `x-access-token:<token>` basic auth for App installation tokens.
     pub fn authenticated_clone_url(&self) -> String {
