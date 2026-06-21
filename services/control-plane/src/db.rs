@@ -814,6 +814,16 @@ pub fn is_runner_reportable_status(status: &str) -> bool {
     )
 }
 
+/// The task's current status string, or `None` if the row is gone. Lightweight (no token mint) —
+/// the runner polls this to self-cancel promptly when its task is cancelled, independent of the
+/// reaper (which may be down mid-deploy).
+pub async fn get_task_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Apply a runner-reported status transition. Terminal states (`succeeded`/`failed`/`timed_out`/
 /// `cancelled`) stamp `completed_at` and clear the dispatcher lease so the reaper (Phase 2) won't
 /// reclaim a finished task; `running` stamps `started_at` if unset. Returns `false` if no task

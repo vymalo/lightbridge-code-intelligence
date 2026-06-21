@@ -705,6 +705,33 @@ pub async fn set_status(
     }
 }
 
+/// The current task status, for the runner's self-cancel poll.
+#[derive(Debug, Serialize)]
+pub struct TaskStatusResponse {
+    pub status: String,
+}
+
+/// `GET /internal/tasks/{id}/status` — the task's current status, so the runner can stop promptly
+/// when its task is cancelled (e.g. its PR closed) even if the reaper that would delete the Job is
+/// down. Lightweight: no token mint. A missing task is `404` — the runner treats that as "stop" too.
+pub async fn get_status(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::get_task_status(pool, id).await {
+        Ok(Some(status)) => Json(TaskStatusResponse { status }).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "get task status failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// Best-effort 😕 on the PR when a review task fails. Loads the task's PR context + mints a token;
 /// any error (no App, non-PR task, GitHub hiccup) is logged and ignored.
 async fn react_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {

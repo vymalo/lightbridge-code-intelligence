@@ -75,16 +75,22 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // Race the work against SIGTERM. When a task is cancelled, the control plane deletes the Job;
-    // Kubernetes then SIGTERMs the pod. Without this the process ignores it and runs until SIGKILL
-    // (~30s of wasted work); here we exit promptly so cancellation is "real". We don't report a
-    // status on SIGTERM — the control plane already owns it (cancelled / will be reaped) and we must
-    // not clobber a `cancelled` row with `failed`.
+    // Race the work against two stop signals; on either we exit promptly WITHOUT reporting a status
+    // (the control plane already owns a cancelled row and we must not clobber it with `failed`):
+    //  1. SIGTERM — Kubernetes sends it when the reaper deletes the Job. Without this the process
+    //     runs until SIGKILL (~30s of wasted work).
+    //  2. Upstream cancellation poll — the reaper only SIGTERMs us when it's running; if it's down
+    //     (e.g. mid-deploy) a cancelled task's pod would otherwise run to completion. Polling our own
+    //     status lets us self-cancel within ~10s regardless of the reaper.
     let outcome = tokio::select! {
         result = run(&config, &client, &embeddings_config, review_config.as_ref()) => result,
         _ = terminated() => {
             tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
             return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
+        }
+        _ = cancelled_upstream(&client, config.task_id) => {
+            tracing::warn!(task_id = %config.task_id, "task no longer active upstream (cancelled); aborting promptly");
+            return std::process::ExitCode::from(143);
         }
     };
     match outcome {
@@ -125,6 +131,29 @@ async fn terminated() {
         tracing::warn!(%error, "could not install Ctrl-C handler; running uninterruptible");
         std::future::pending::<()>().await;
     }
+}
+
+/// Resolves once this task is no longer active upstream — e.g. it was cancelled because its PR
+/// closed or the repo was removed. The runner polls its own status every 10s so it can stop promptly
+/// even when the reaper (which would delete the Job and SIGTERM us) is down. Transient poll errors
+/// are ignored — a control-plane blip must not abort a healthy run.
+async fn cancelled_upstream(client: &ControlPlaneClient, task_id: uuid::Uuid) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    tick.tick().await; // the first tick is immediate; skip it so we poll after one interval
+    loop {
+        tick.tick().await;
+        match client.task_status(task_id).await {
+            Ok(status) if is_terminal_status(&status) => return,
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, "cancellation poll failed (transient); continuing"),
+        }
+    }
+}
+
+/// A status the runner should stop on. While `run()` is in flight the only terminal state we can
+/// observe is `cancelled` (we set the others ourselves, at the very end) — so this means "stop now".
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "cancelled" | "failed" | "timed_out" | "succeeded")
 }
 
 /// The task lifecycle. Returns a human summary on success; any error is reported as `failed`.
