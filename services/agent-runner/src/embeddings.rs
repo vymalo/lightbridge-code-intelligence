@@ -74,11 +74,14 @@ impl EmbeddingsClient {
     pub fn with_attribution(mut self, headers: &[(String, String)]) -> Self {
         use reqwest::header::{HeaderName, HeaderValue};
         for (name, value) in headers {
-            if let (Ok(n), Ok(v)) = (
+            match (
                 HeaderName::from_bytes(name.as_bytes()),
                 HeaderValue::from_str(value),
             ) {
-                self.attribution.insert(n, v);
+                (Ok(n), Ok(v)) => {
+                    self.attribution.insert(n, v);
+                }
+                _ => tracing::warn!(header = %name, "skipping unparseable attribution header"),
             }
         }
         self

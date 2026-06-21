@@ -29,10 +29,26 @@ impl TaskContext {
     /// map this call's token spend to the customer's project (budgeting). Sent on the embeddings + the
     /// review LLM calls. Header names are lowercase per HTTP/2.
     pub fn attribution_headers(&self) -> Vec<(String, String)> {
+        // Header values must be visible ASCII; a control char / non-ASCII byte makes Rust's
+        // HeaderValue (embeddings) and OpenCode's Node HTTP client (review) reject it — the latter
+        // would crash the review. Sanitize + bound the length defensively (the values are mostly
+        // controlled, but repo names + command are not fully ours).
+        let clean = |val: &str, max: usize| -> String {
+            val.chars()
+                .map(|c| {
+                    if c.is_ascii() && !c.is_ascii_control() {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
+                .take(max)
+                .collect()
+        };
         vec![
             (
                 "x-code-intelligence-repo".to_string(),
-                format!("{}/{}", self.owner, self.name),
+                clean(&format!("{}/{}", self.owner, self.name), 200),
             ),
             (
                 "x-code-intelligence-repo-id".to_string(),
@@ -44,11 +60,11 @@ impl TaskContext {
             ),
             (
                 "x-code-intelligence-target".to_string(),
-                format!("{}#{}", self.target_type, self.target_id),
+                clean(&format!("{}#{}", self.target_type, self.target_id), 100),
             ),
             (
                 "x-code-intelligence-command".to_string(),
-                self.command.clone(),
+                clean(&self.command, 200),
             ),
         ]
     }
