@@ -1,9 +1,8 @@
 import { Check, X } from "lucide-react";
 import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
-import { hasPermission, listPendingRepos } from "@/lib/admin";
-import type { Repository } from "@/lib/repos";
-import { repoSlug } from "@/lib/repos";
+import { hasPermission, listAdminRepos } from "@/lib/admin";
+import { approvalVisual, type Repository, repoSlug } from "@/lib/repos";
 import { currentClaims } from "@/lib/session";
 import { approveRepoAction, denyRepoAction } from "./actions";
 
@@ -11,21 +10,24 @@ export const dynamic = "force-dynamic";
 
 export default async function AdminPage() {
   const claims = await currentClaims();
-  if (!hasPermission(claims, "repo:approve")) {
+  const canApprove = hasPermission(claims, "repo:approve");
+  const canDeny = hasPermission(claims, "repo:deny");
+
+  if (!canApprove && !canDeny) {
     return (
       <div className="flex flex-col gap-5">
         <h1 className="text-lg font-medium tracking-tight">Repository approvals</h1>
         <Card>
           <StatusLine>
-            You need the <code>repo:approve</code> permission to manage repository approvals. Ask an
-            administrator to grant it.
+            You need the <code>repo:approve</code> or <code>repo:deny</code> permission to manage
+            repository approvals. Ask an administrator to grant it.
           </StatusLine>
         </Card>
       </div>
     );
   }
 
-  const result = await listPendingRepos();
+  const result = await listAdminRepos();
 
   return (
     <div className="flex flex-col gap-5">
@@ -33,33 +35,97 @@ export default async function AdminPage() {
         <h1 className="text-lg font-medium tracking-tight">Repository approvals</h1>
         <p className="mt-1 text-sm text-muted-foreground">
           Newly added repositories stay pending until approved — only then are they indexed or
-          reviewed. Approving triggers an initial index; denying keeps the repo out of scope.
+          reviewed. Decisions are reversible: deny an approved repo to take it back out of scope, or
+          approve a denied one to bring it in (re-approving re-indexes it).
         </p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Pending</CardTitle>
-        </CardHeader>
-        {!result.ok ? (
+      {!result.ok ? (
+        <Card>
           <CardBody>
             <ApiErrorLine result={result} />
           </CardBody>
-        ) : result.data.length === 0 ? (
-          <StatusLine>No repositories are awaiting approval.</StatusLine>
-        ) : (
-          <ul className="divide-y divide-border">
-            {result.data.map((repo) => (
-              <PendingRow key={repo.id} repo={repo} />
-            ))}
-          </ul>
-        )}
-      </Card>
+        </Card>
+      ) : (
+        <RepoSections repos={result.data} canApprove={canApprove} canDeny={canDeny} />
+      )}
     </div>
   );
 }
 
-function PendingRow({ repo }: { repo: Repository }) {
+function RepoSections({
+  repos,
+  canApprove,
+  canDeny,
+}: {
+  repos: Repository[];
+  canApprove: boolean;
+  canDeny: boolean;
+}) {
+  const pending = repos.filter((r) => r.status === "pending");
+  const approved = repos.filter((r) => r.status === "approved");
+  const disabled = repos.filter((r) => r.status === "disabled");
+
+  return (
+    <>
+      <Section
+        title="Pending"
+        repos={pending}
+        empty="No repositories are awaiting approval."
+        canApprove={canApprove}
+        canDeny={canDeny}
+      />
+      {approved.length > 0 && (
+        <Section title="Approved" repos={approved} canApprove={canApprove} canDeny={canDeny} />
+      )}
+      {disabled.length > 0 && (
+        <Section title="Denied" repos={disabled} canApprove={canApprove} canDeny={canDeny} />
+      )}
+    </>
+  );
+}
+
+function Section({
+  title,
+  repos,
+  empty,
+  canApprove,
+  canDeny,
+}: {
+  title: string;
+  repos: Repository[];
+  empty?: string;
+  canApprove: boolean;
+  canDeny: boolean;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+      </CardHeader>
+      {repos.length === 0 ? (
+        <StatusLine>{empty}</StatusLine>
+      ) : (
+        <ul className="divide-y divide-border">
+          {repos.map((repo) => (
+            <RepoRow key={repo.id} repo={repo} canApprove={canApprove} canDeny={canDeny} />
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function RepoRow({
+  repo,
+  canApprove,
+  canDeny,
+}: {
+  repo: Repository;
+  canApprove: boolean;
+  canDeny: boolean;
+}) {
+  const status = approvalVisual(repo);
   return (
     <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
       <div className="min-w-0">
@@ -69,26 +135,33 @@ function PendingRow({ repo }: { repo: Repository }) {
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <form action={approveRepoAction}>
-          <input type="hidden" name="id" value={repo.id} />
-          <button
-            type="submit"
-            className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-accent-foreground transition-opacity hover:opacity-90"
-          >
-            <Check className="size-3.5" />
-            Approve
-          </button>
-        </form>
-        <form action={denyRepoAction}>
-          <input type="hidden" name="id" value={repo.id} />
-          <button
-            type="submit"
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
-          >
-            <X className="size-3.5" />
-            Deny
-          </button>
-        </form>
+        <span className={`status-pill status-${status.variant}`}>{status.label}</span>
+        {/* Approve is available unless already approved; Deny unless already disabled — so any state
+            is reachable from any other (the control plane enforces the permission per action). */}
+        {canApprove && repo.status !== "approved" && (
+          <form action={approveRepoAction}>
+            <input type="hidden" name="id" value={repo.id} />
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-accent-foreground transition-opacity hover:opacity-90"
+            >
+              <Check className="size-3.5" />
+              Approve
+            </button>
+          </form>
+        )}
+        {canDeny && repo.status !== "disabled" && (
+          <form action={denyRepoAction}>
+            <input type="hidden" name="id" value={repo.id} />
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
+            >
+              <X className="size-3.5" />
+              Deny
+            </button>
+          </form>
+        )}
       </div>
     </li>
   );

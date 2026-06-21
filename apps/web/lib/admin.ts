@@ -54,12 +54,14 @@ async function token(): Promise<string | null> {
   return (await cookies()).get(SESSION_COOKIE)?.value ?? null;
 }
 
-/** `GET /admin/repositories?status=pending` — the approval queue. */
-export async function listPendingRepos(): Promise<ApiResult<Repository[]>> {
+/** `GET /admin/repositories[?status=…]` — repositories for the admin console. Omit `status` to get
+ * every repository (pending, approved, and disabled) so approvals are reversible from the UI. */
+export async function listAdminRepos(status?: string): Promise<ApiResult<Repository[]>> {
   try {
     const t = await token();
     if (!t) return { ok: false, reason: "unauthenticated" };
-    const res = await fetch(`${controlPlaneUrl()}/admin/repositories?status=pending`, {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories${qs}`, {
       headers: { authorization: `Bearer ${t}`, accept: "application/json" },
       cache: "no-store",
     });
