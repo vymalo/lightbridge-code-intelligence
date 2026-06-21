@@ -45,20 +45,22 @@ function compare(key: SortKey, a: Task, b: Task, now: number): number {
   }
 }
 
-/** Dense, sortable, paginated table of runs (ADR-0024, Appwrite table pattern). Sort + page state is
- * local; `now` comes from the server so relative times don't drift on hydration. */
-export function RunTable({ tasks, now }: { tasks: Task[]; now: number }) {
+/** Dense, sortable, paginated table of runs (ADR-0024, Appwrite table pattern). Sort is local; the
+ * page is owned by the parent (URL state via nuqs) and reset by the parent on filter changes. `now`
+ * comes from the server so relative times don't drift on hydration. */
+export function RunTable({
+  tasks,
+  now,
+  page,
+  onPageChange,
+}: {
+  tasks: Task[];
+  now: number;
+  page: number;
+  onPageChange: (page: number | null) => void;
+}) {
   const router = useRouter();
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "created", dir: "desc" });
-  const [page, setPage] = useState(0);
-
-  // Reset to the first page when the filtered set changes (parent passes a new array). Derived-state
-  // pattern (set during render) rather than an effect, so there's no extra paint at the old page.
-  const [prevTasks, setPrevTasks] = useState(tasks);
-  if (tasks !== prevTasks) {
-    setPrevTasks(tasks);
-    setPage(0);
-  }
 
   const sorted = useMemo(() => {
     const out = [...tasks].sort((a, b) => compare(sort.key, a, b, now));
@@ -149,13 +151,14 @@ export function RunTable({ tasks, now }: { tasks: Task[]; now: number }) {
             : `${start + 1}–${Math.min(start + PAGE_SIZE, sorted.length)} of ${sorted.length}`}
         </span>
         <div className="flex items-center gap-1">
-          <PageButton disabled={current <= 0} onClick={() => setPage(current - 1)}>
+          {/* page 0 → null so nuqs drops the param (clean URL on the first page). */}
+          <PageButton disabled={current <= 0} onClick={() => onPageChange(current - 1 || null)}>
             Prev
           </PageButton>
           <span className="px-1 tabular-nums">
             {current + 1} / {pageCount}
           </span>
-          <PageButton disabled={current >= pageCount - 1} onClick={() => setPage(current + 1)}>
+          <PageButton disabled={current >= pageCount - 1} onClick={() => onPageChange(current + 1)}>
             Next
           </PageButton>
         </div>

@@ -1,14 +1,16 @@
 "use client";
 
 import { LayoutList, Search, Table2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { parseAsInteger, parseAsStringLiteral, useQueryState } from "nuqs";
+import { useMemo } from "react";
 import { RunTable } from "@/components/run-table";
 import { RunTimeline } from "@/components/run-timeline";
 import { StatusLine } from "@/components/states";
 import { cn } from "@/lib/cn";
-import { repoLabel, type StatusVariant, statusVisual, type Task, triggerLabel } from "@/lib/tasks";
+import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/tasks";
 
-const FILTERS: { value: StatusVariant | "all"; label: string }[] = [
+const FILTER_VALUES = ["all", "active", "pending", "success", "error", "muted"] as const;
+const FILTERS: { value: (typeof FILTER_VALUES)[number]; label: string }[] = [
   { value: "all", label: "All" },
   { value: "active", label: "Running" },
   { value: "pending", label: "Pending" },
@@ -17,31 +19,23 @@ const FILTERS: { value: StatusVariant | "all"; label: string }[] = [
   { value: "muted", label: "Cancelled" },
 ];
 
-type View = "timeline" | "table";
-type Filter = StatusVariant | "all";
+const VIEW_VALUES = ["timeline", "table"] as const;
 
-// Seed the status filter from a drill-through param (e.g. an Overview KPI links to ?status=success);
-// fall back to "all" for any unknown value.
-function normalizeStatus(value: string | undefined): Filter {
-  return FILTERS.some((f) => f.value === value) ? (value as Filter) : "all";
-}
-
-/** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024) —
- * all client-side over the fetched page. `now` is passed from the server so relative times don't
- * cause hydration drift. `initialStatus` seeds the filter from the URL (KPI drill-through). */
-export function RunList({
-  tasks,
-  now,
-  initialStatus,
-}: {
-  tasks: Task[];
-  now: number;
-  initialStatus?: string;
-}) {
-  const [filter, setFilter] = useState<Filter>(() => normalizeStatus(initialStatus));
-  const [repo, setRepo] = useState<string>("all");
-  const [query, setQuery] = useState("");
-  const [view, setView] = useState<View>("timeline");
+/** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024).
+ * All state lives in the URL via nuqs (shareable/bookmarkable); `now` is server-passed so relative
+ * times don't drift on hydration. Filtering happens client-side over the fetched page. */
+export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
+  const [filter, setFilter] = useQueryState(
+    "status",
+    parseAsStringLiteral(FILTER_VALUES).withDefault("all"),
+  );
+  const [repo, setRepo] = useQueryState("repo", { defaultValue: "all", clearOnDefault: true });
+  const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
+  const [view, setView] = useQueryState(
+    "view",
+    parseAsStringLiteral(VIEW_VALUES).withDefault("timeline"),
+  );
+  const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
 
   // Repos present in this page, for the repo filter dropdown.
   const repos = useMemo(
@@ -59,6 +53,9 @@ export function RunList({
     });
   }, [tasks, filter, repo, query]);
 
+  // Any filter change invalidates the current page offset, so reset to the first page.
+  const resetPage = () => setPage(null);
+
   return (
     <div className="overflow-hidden rounded-card border border-border bg-surface">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2.5">
@@ -67,7 +64,10 @@ export function RunList({
             <button
               type="button"
               key={f.value}
-              onClick={() => setFilter(f.value)}
+              onClick={() => {
+                setFilter(f.value);
+                resetPage();
+              }}
               className={cn(
                 "rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
                 filter === f.value
@@ -84,7 +84,10 @@ export function RunList({
           {repos.length > 1 && (
             <select
               value={repo}
-              onChange={(e) => setRepo(e.target.value)}
+              onChange={(e) => {
+                setRepo(e.target.value);
+                resetPage();
+              }}
               aria-label="Filter by repository"
               className="h-7 max-w-[12rem] rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-border-strong focus:ring-1 focus:ring-ring"
             >
@@ -102,7 +105,10 @@ export function RunList({
             <input
               type="search"
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                resetPage();
+              }}
               placeholder="Search runs"
               className="h-7 w-44 rounded-md border border-border bg-background pl-7 pr-2 text-xs outline-none placeholder:text-muted-foreground focus:border-border-strong focus:ring-1 focus:ring-ring"
             />
@@ -129,7 +135,7 @@ export function RunList({
       ) : view === "timeline" ? (
         <RunTimeline tasks={filtered} now={now} />
       ) : (
-        <RunTable tasks={filtered} now={now} />
+        <RunTable tasks={filtered} now={now} page={page} onPageChange={setPage} />
       )}
     </div>
   );
