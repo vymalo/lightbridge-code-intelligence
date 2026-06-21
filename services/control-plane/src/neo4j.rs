@@ -98,6 +98,33 @@ pub async fn upsert_graph(
     Ok((nodes.len(), edges.len()))
 }
 
+/// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
+/// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
+/// `DETACH DELETE` removes the nodes' relationships too. Idempotent (deletes nothing for an
+/// already-clean repo).
+pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    // Count BEFORE deleting: a `RETURN count(s)` after `DETACH DELETE s` is unreliable (the nodes are
+    // gone from the query context). Collect + count first, then delete via FOREACH.
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo}) \
+                 WITH collect(s) AS nodes, count(s) AS deleted \
+                 FOREACH (n IN nodes | DETACH DELETE n) \
+                 RETURN deleted",
+            )
+            .param("repo", repository_id),
+        )
+        .await
+        .context("delete repo graph")?;
+    let deleted = match rows.next().await.context("read delete count")? {
+        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
+        None => 0,
+    };
+    Ok(deleted)
+}
+
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
