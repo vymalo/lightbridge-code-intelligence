@@ -4,5 +4,5 @@
  * Server Components only.
  */
 export function githubAppInstallUrl(): string {
-  return process.env.GITHUB_APP_INSTALL_URL ?? "https://github.com/apps/lucky-rabbit-ai";
+  return process.env.GITHUB_APP_INSTALL_URL ?? "https://github.com/apps/lightbridge-assistant";
 }
