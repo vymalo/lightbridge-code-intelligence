@@ -78,6 +78,23 @@ export async function getReview(id: string): Promise<ApiResult<Review | null>> {
   }
 }
 
+/** `POST /tasks/{id}/cancel` — manually cancel an active run. `data` is null on success. */
+export async function cancelTask(id: string): Promise<ApiResult<null>> {
+  try {
+    const token = (await cookies()).get(SESSION_COOKIE)?.value;
+    if (!token) return { ok: false, reason: "unauthenticated" };
+    const res = await fetch(`${controlPlaneUrl()}/tasks/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: null };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
 /** `GET /repositories` — connected repositories + run activity. */
 export async function listRepositories(): Promise<ApiResult<Repository[]>> {
   try {

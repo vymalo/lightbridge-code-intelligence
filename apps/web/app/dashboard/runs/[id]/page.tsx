@@ -1,4 +1,4 @@
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, Ban, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CommandSnippet } from "@/components/command-snippet";
@@ -7,7 +7,9 @@ import { RunLogs } from "@/components/run-logs";
 import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusPill } from "@/components/ui/status-pill";
+import { hasPermission } from "@/lib/admin";
 import { getReview, getTask } from "@/lib/api";
+import { currentClaims } from "@/lib/session";
 import {
   absoluteTime,
   duration,
@@ -18,6 +20,7 @@ import {
   targetUrl,
   triggerLabel,
 } from "@/lib/tasks";
+import { cancelRunAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -54,7 +57,11 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
 
   const task = result.data;
   const now = Date.now();
-  const isError = statusVisual(task.status).variant === "error";
+  const variant = statusVisual(task.status).variant;
+  const isError = variant === "error";
+  // A run is cancellable while it's still pending or active; the button also needs `task:cancel`.
+  const cancellable = variant === "pending" || variant === "active";
+  const canCancel = cancellable && hasPermission(await currentClaims(), "task:cancel");
   // The persisted review (if any). 404 → null (older run / index task / never posted).
   const reviewResult = await getReview(id);
   const review = reviewResult.ok ? reviewResult.data : null;
@@ -64,6 +71,18 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
       <div className="flex flex-wrap items-center gap-3">
         <StatusPill status={task.status} />
         <h1 className="text-lg font-medium tracking-tight">{triggerLabel(task)}</h1>
+        {canCancel && (
+          <form action={cancelRunAction} className="ml-auto">
+            <input type="hidden" name="id" value={task.id} />
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted"
+            >
+              <Ban className="size-3.5" />
+              Cancel run
+            </button>
+          </form>
+        )}
       </div>
 
       {isError && (

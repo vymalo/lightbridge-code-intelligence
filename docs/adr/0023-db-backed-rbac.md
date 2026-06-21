@@ -48,6 +48,7 @@ straight from the token).
 | `repo:approve` | `POST /admin/repositories/{id}/approve` |
 | `repo:deny` | `POST /admin/repositories/{id}/deny` |
 | `task:read` | `GET /tasks`, `GET /tasks/{id}` |
+| `task:cancel` | `POST /tasks/{id}/cancel` (manual cancel of an active run) |
 | `task:logs` | `GET /tasks/{id}/logs` (web SA route) |
 | `review:read` | `GET /tasks/{id}/review` |
 | `rbac:manage` | reserved (future policy/admin surface) |
