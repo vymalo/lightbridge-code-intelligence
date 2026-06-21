@@ -54,9 +54,18 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
+          # Load into the local daemon so we can measure the built image (size report below).
+          load: true
           tags: ${{ matrix.image }}:pr
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Surface the image size in the PR run summary so size regressions are visible at review time
+      # (optimization tracking, epic #89). Uncompressed (on-disk) size.
+      - name: Report image size
+        run: |
+          bytes=$(docker image inspect "${{ matrix.image }}:pr" --format '{{.Size}}')
+          printf '### 📦 %s\n\n**%s** uncompressed\n' \
+            "${{ matrix.image }}" "$(numfmt --to=iec --suffix=B "$bytes")" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     # main / version tags: build + push to GHCR, then cosign-sign each pushed
@@ -111,6 +120,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Compressed (registry pull) size of the pushed image, summed from the manifest — what clusters
+      # actually pull. Surfaced in the run summary for optimization tracking (epic #89).
+      - name: Report image size
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          bytes=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw \
+            | jq '([.layers[].size] + [.config.size]) | add')
+          printf '### 📦 %s\n\n**%s** compressed (`%s`)\n' \
+            "${{ matrix.image }}" "$(numfmt --to=iec --suffix=B "$bytes")" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
       # Keyless cosign signature over the immutable digest (covers every tag that
       # points at it). argocd-image-updater refuses any digest whose signature
       # doesn't trace back to this workflow's identity (Fulcio + Rekor).

@@ -21,6 +21,10 @@ pub struct ReviewFinding {
     /// ```suggestion block. Omitted by the model when it has no precise fix to offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
+    /// Optional links to supporting resources (docs, CWE, RFCs) the control plane renders as a
+    /// "Resources" list under the finding (epic #89 finding format). Empty when the model offers none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
 }
 
 /// The structured review the agent produces.

@@ -26,6 +26,10 @@ pub struct Finding {
     /// when the finding anchors inline.
     #[serde(default)]
     pub suggestion: Option<String>,
+    /// Optional links to supporting resources (docs, CWE, RFCs) rendered as a "Resources" list
+    /// (epic #89 finding format). Defaults to empty.
+    #[serde(default)]
+    pub resources: Vec<String>,
 }
 
 /// Body for `POST /internal/tasks/{id}/review`.
@@ -148,14 +152,37 @@ pub fn validate(
 /// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
 /// (Some vs None), not on emptiness.
 fn inline_body(finding: &Finding) -> String {
+    // Standardized finding format (epic #89): `<LEVEL>: <title>` → explanation → committable
+    // suggestion → resources.
     let mut body = format!(
-        "**{}** ({})\n\n{}",
-        finding.title, finding.severity, finding.body
+        "**{}: {}**\n\n{}",
+        finding.severity.to_uppercase(),
+        finding.title,
+        finding.body
     );
     if let Some(suggestion) = finding.suggestion.as_deref().map(str::trim_end) {
         body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
     }
+    body.push_str(&resources_block(finding));
     body
+}
+
+/// A "Resources" markdown list for a finding's links, or empty when it has none. Shared by the inline
+/// and deferred renderings so every finding looks the same (epic #89).
+fn resources_block(finding: &Finding) -> String {
+    let links: Vec<&String> = finding
+        .resources
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    if links.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n**Resources**\n");
+    for link in links {
+        out.push_str(&format!("- {link}\n"));
+    }
+    out
 }
 
 /// Normalize a model-supplied path toward the repo-root-relative, forward-slash form GitHub uses:
@@ -178,10 +205,19 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: usize) -> 
         body.push_str("\n\n### Notes on changed files\n");
         body.push_str("_Findings on this PR's changes that couldn't be pinned to a diff line._\n");
         for f in deferred {
+            // Same `<LEVEL>: <title>` format as inline comments (epic #89), plus the location and
+            // any resource links (no committable suggestion — these aren't anchored to a diff line).
             body.push_str(&format!(
-                "\n- **{}** ({}) — `{}:{}`\n  {}",
-                f.title, f.severity, f.file, f.line, f.body
+                "\n- **{}: {}** — `{}:{}`\n  {}",
+                f.severity.to_uppercase(),
+                f.title,
+                f.file,
+                f.line,
+                f.body
             ));
+            for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
+                body.push_str(&format!("\n  - {link}"));
+            }
         }
     }
 
@@ -221,7 +257,26 @@ mod tests {
             title: title.into(),
             body: "b".into(),
             suggestion: None,
+            resources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inline_body_uses_standard_format_with_resources() {
+        let mut f = finding("a.rs", 1, "Null deref");
+        f.severity = "error".into();
+        f.body = "explanation".into();
+        f.suggestion = Some("let x = y;".into());
+        f.resources = vec![
+            "https://cwe.mitre.org/data/definitions/476.html".into(),
+            "  ".into(), // blank → skipped
+        ];
+        let body = inline_body(&f);
+        assert!(body.starts_with("**ERROR: Null deref**"), "level: title header");
+        assert!(body.contains("\n\nexplanation"));
+        assert!(body.contains("```suggestion\nlet x = y;\n```"));
+        assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));
+        assert_eq!(body.matches("- ").count(), 1, "blank resource skipped");
     }
 
     #[test]

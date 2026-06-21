@@ -25,6 +25,50 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
+    /// Attribution headers (epic #89) for the OpenAI-compatible gateway: they let the Envoy AI Gateway
+    /// map this call's token spend to the customer's project (budgeting). Sent on the embeddings + the
+    /// review LLM calls. Header names are lowercase per HTTP/2.
+    pub fn attribution_headers(&self) -> Vec<(String, String)> {
+        // Header values must be visible ASCII; a control char / non-ASCII byte makes Rust's
+        // HeaderValue (embeddings) and OpenCode's Node HTTP client (review) reject it — the latter
+        // would crash the review. Sanitize + bound the length defensively (the values are mostly
+        // controlled, but repo names + command are not fully ours).
+        let clean = |val: &str, max: usize| -> String {
+            val.chars()
+                .map(|c| {
+                    if c.is_ascii() && !c.is_ascii_control() {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
+                .take(max)
+                .collect()
+        };
+        vec![
+            (
+                "x-code-intelligence-repo".to_string(),
+                clean(&format!("{}/{}", self.owner, self.name), 200),
+            ),
+            (
+                "x-code-intelligence-repo-id".to_string(),
+                self.repository_id.to_string(),
+            ),
+            (
+                "x-code-intelligence-task-id".to_string(),
+                self.task_id.to_string(),
+            ),
+            (
+                "x-code-intelligence-target".to_string(),
+                clean(&format!("{}#{}", self.target_type, self.target_id), 100),
+            ),
+            (
+                "x-code-intelligence-command".to_string(),
+                clean(&self.command, 200),
+            ),
+        ]
+    }
+
     /// The HTTPS remote with the installation token embedded — what `git` is invoked against.
     /// GitHub accepts `x-access-token:<token>` basic auth for App installation tokens.
     pub fn authenticated_clone_url(&self) -> String {

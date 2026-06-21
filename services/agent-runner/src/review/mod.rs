@@ -57,10 +57,12 @@ Keep `summary` to 1–3 sentences: does the change do what it intends, and is it
 pub const OUTPUT_CONTRACT: &str = "\
 Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; never \
 comment on untouched code. Set `severity` to `error` (must fix), `warning` (should fix), or `info` \
-(minor/FYI). When you propose a fix, put the EXACT replacement source for that one line in \
-`suggestion` (no diff markers, no fences) so it applies as a GitHub suggestion.\n\n\
+(minor/FYI). Each finding has a standard shape: a short `title`, a `body` that is the detailed \
+explanation, an optional `suggestion`, and optional `resources`. When you propose a fix, put the \
+EXACT replacement source for that one line in `suggestion` (no diff markers, no fences) so it applies \
+as a GitHub suggestion. Put any supporting links (docs, CWE, RFCs) in `resources` as full URLs.\n\n\
 Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
-{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"why it matters\", \"suggestion\": \"optional exact replacement for line 42\"}\n  ]\n}";
+{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
 
 /// Run the OpenCode review over `checkout` and return the parsed structured result.
 ///
@@ -71,11 +73,12 @@ pub async fn run_review(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
+    attribution: &[(String, String)],
 ) -> anyhow::Result<ReviewResult> {
     // Generate the project config the agent runs under. Built from the runner's own env so the MCP
     // subprocesses inherit TASK_ID / CONTROL_PLANE_URL / AGENT_RUNNER_TOKEN / EMBEDDINGS_* explicitly
-    // rather than relying on env inheritance.
-    let cfg = opencode_config(review, &mcp_env());
+    // rather than relying on env inheritance. `attribution` adds the gateway billing headers (#89).
+    let cfg = opencode_config(review, &mcp_env(), attribution);
     let cfg_path = checkout.join("opencode.json");
     tokio::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?)
         .await

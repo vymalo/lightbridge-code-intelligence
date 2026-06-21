@@ -61,11 +61,8 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let embedder = EmbeddingsClient::new(
-        &embeddings_config.base_url,
-        &embeddings_config.api_key,
-        &embeddings_config.model,
-    );
+    // The embeddings client is built inside `run()` once the task context is known, so it can carry
+    // the per-project attribution headers (epic #89).
 
     // Review is optional (no model → indexing-only). But if it's half-configured, surface it.
     let review_config = match ReviewConfig::resolve(file_config.as_ref()) {
@@ -84,7 +81,7 @@ async fn main() -> std::process::ExitCode {
     // status on SIGTERM — the control plane already owns it (cancelled / will be reaped) and we must
     // not clobber a `cancelled` row with `failed`.
     let outcome = tokio::select! {
-        result = run(&config, &client, &embedder, review_config.as_ref()) => result,
+        result = run(&config, &client, &embeddings_config, review_config.as_ref()) => result,
         _ = terminated() => {
             tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
             return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
@@ -134,7 +131,7 @@ async fn terminated() {
 async fn run(
     config: &RunnerConfig,
     client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
+    embeddings_config: &EmbeddingsConfig,
     review_config: Option<&ReviewConfig>,
 ) -> anyhow::Result<String> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
@@ -150,10 +147,20 @@ async fn run(
         "fetched task context"
     );
 
+    // Gateway attribution headers (epic #89) for per-project token billing — added to the embeddings
+    // + review LLM calls. Built here since they come from the fetched task context.
+    let attribution = context.attribution_headers();
+    let embedder = EmbeddingsClient::new(
+        &embeddings_config.base_url,
+        &embeddings_config.api_key,
+        &embeddings_config.model,
+    )
+    .with_attribution(&attribution);
+
     let checkout = clone::checkout(&context, &config.workdir).await?;
 
     // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────────
-    let chunk_count = indexer::index_checkout(&context, &checkout, client, embedder).await?;
+    let chunk_count = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
 
     // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────────
     // Best-effort: the semantic index already landed, and the graph store may be unconfigured
@@ -176,7 +183,15 @@ async fn run(
             // Scope the review to the PR's change set when we can compute it (best-effort; an
             // unavailable base commit just yields an unscoped review).
             let diff = clone::pr_diff(&checkout, &context).await;
-            match review::run_review(&checkout, review, &context.command, diff.as_ref()).await {
+            match review::run_review(
+                &checkout,
+                review,
+                &context.command,
+                diff.as_ref(),
+                &attribution,
+            )
+            .await
+            {
                 Ok(result) => {
                     tracing::info!(
                         findings = result.findings.len(),

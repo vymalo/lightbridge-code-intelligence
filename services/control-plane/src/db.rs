@@ -110,6 +110,8 @@ pub struct ReviewRow {
     pub deferred_count: i32,
     pub out_of_scope_count: i32,
     pub findings: Value,
+    /// Permalink to the posted review on the PR (epic #89); `None` for older rows / if GitHub omitted it.
+    pub review_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -126,16 +128,17 @@ pub async fn upsert_review(
     deferred_count: i32,
     out_of_scope_count: i32,
     findings: &Value,
+    review_url: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO reviews \
-         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings, review_url) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (task_id) DO UPDATE SET \
            summary = EXCLUDED.summary, body = EXCLUDED.body, \
            inline_count = EXCLUDED.inline_count, deferred_count = EXCLUDED.deferred_count, \
            out_of_scope_count = EXCLUDED.out_of_scope_count, findings = EXCLUDED.findings, \
-           created_at = now()",
+           review_url = EXCLUDED.review_url, created_at = now()",
     )
     .bind(task_id)
     .bind(summary)
@@ -144,6 +147,7 @@ pub async fn upsert_review(
     .bind(deferred_count)
     .bind(out_of_scope_count)
     .bind(findings)
+    .bind(review_url)
     .execute(pool)
     .await
     .map(|_| ())
@@ -1398,17 +1402,31 @@ mod tests {
 
         let findings = serde_json::json!([{ "file": "a.rs", "line": 3, "severity": "error",
             "title": "t", "body": "b" }]);
-        upsert_review(&pool, task_id, "sum", "body", 1, 2, 0, &findings)
-            .await
-            .unwrap();
+        upsert_review(
+            &pool,
+            task_id,
+            "sum",
+            "body",
+            1,
+            2,
+            0,
+            &findings,
+            Some("https://github.com/o/r/pull/7#pullrequestreview-1"),
+        )
+        .await
+        .unwrap();
         let row = get_review(&pool, task_id).await.unwrap().unwrap();
         assert_eq!(row.summary, "sum");
         assert_eq!(row.inline_count, 1);
         assert_eq!(row.deferred_count, 2);
         assert_eq!(row.findings[0]["file"], "a.rs");
+        assert_eq!(
+            row.review_url.as_deref(),
+            Some("https://github.com/o/r/pull/7#pullrequestreview-1")
+        );
 
         // Re-post upserts in place (still one row).
-        upsert_review(&pool, task_id, "sum2", "body2", 0, 0, 0, &findings)
+        upsert_review(&pool, task_id, "sum2", "body2", 0, 0, 0, &findings, None)
             .await
             .unwrap();
         assert_eq!(

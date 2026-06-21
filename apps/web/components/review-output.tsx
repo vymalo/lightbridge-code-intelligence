@@ -1,3 +1,4 @@
+import { ExternalLink } from "lucide-react";
 import type { Review, ReviewFinding } from "@/lib/tasks";
 
 /** Severity → chip tone. Unknown severities fall back to a neutral chip. */
@@ -31,7 +32,20 @@ export function ReviewOutput({ review }: { review: Review }) {
   return (
     <div className="flex flex-col gap-4">
       {review.summary && <p className="text-sm leading-relaxed">{review.summary}</p>}
-      <p className="text-xs text-muted-foreground">{counts.join(" · ")}</p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">{counts.join(" · ")}</p>
+        {review.review_url && (
+          <a
+            href={review.review_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs text-accent transition-colors hover:underline"
+          >
+            View on GitHub
+            <ExternalLink className="size-3 shrink-0" />
+          </a>
+        )}
+      </div>
       {review.findings.length > 0 && (
         <ul className="flex flex-col gap-3">
           {review.findings.map((f, index) => (
@@ -67,6 +81,27 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
         <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-xs">
           {finding.suggestion}
         </pre>
+      )}
+      {finding.resources && finding.resources.length > 0 && (
+        <div className="mt-2">
+          <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Resources
+          </span>
+          <ul className="mt-1 flex flex-col gap-0.5">
+            {finding.resources.map((url) => (
+              <li key={url}>
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="break-all text-xs text-accent transition-colors hover:underline"
+                >
+                  {url}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </li>
   );

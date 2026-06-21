@@ -1,4 +1,6 @@
+import { ExternalLink } from "lucide-react";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { githubAppInstallUrl } from "@/lib/config";
 import { currentClaims, displayName } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
@@ -30,6 +32,26 @@ export default async function Settings() {
           ) : (
             <p className="text-sm text-muted-foreground">Not signed in.</p>
           )}
+        </CardBody>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>GitHub App</CardTitle>
+        </CardHeader>
+        <CardBody>
+          <p className="text-sm text-muted-foreground">
+            Lightbridge reviews via a GitHub App. Manage its installation, repository access, and
+            permissions from its public page.
+          </p>
+          <a
+            href={githubAppInstallUrl()}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted"
+          >
+            Open the GitHub App
+            <ExternalLink className="size-3.5" />
+          </a>
         </CardBody>
       </Card>
       <div>
