@@ -62,6 +62,7 @@ jobs:
       # Surface the image size in the PR run summary so size regressions are visible at review time
       # (optimization tracking, epic #89). Uncompressed (on-disk) size.
       - name: Report image size
+        continue-on-error: true
         run: |
           bytes=$(docker image inspect "${{ matrix.image }}:pr" --format '{{.Size}}')
           printf '### 📦 %s\n\n**%s** uncompressed\n' \
@@ -120,15 +121,19 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # Compressed (registry pull) size of the pushed image, summed from the manifest — what clusters
-      # actually pull. Surfaced in the run summary for optimization tracking (epic #89).
+      # Compressed (registry pull) size of the pushed image — what clusters actually pull. Surfaced in
+      # the run summary for optimization tracking (epic #89). NEVER fail the job over a size report:
+      # it runs before the signing step, and a broken report must not leave an unsigned (un-promotable)
+      # image. `imagetools inspect --raw` returns a manifest *or* a multi-arch index, so we sum every
+      # `.size` field recursively (config + layers, or the index's per-platform manifest sizes).
       - name: Report image size
+        continue-on-error: true
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           bytes=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw \
-            | jq '([.layers[].size] + [.config.size]) | add')
+            | jq '[.. | .size? // empty] | add // 0')
           printf '### 📦 %s\n\n**%s** compressed (`%s`)\n' \
             "${{ matrix.image }}" "$(numfmt --to=iec --suffix=B "$bytes")" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
       # Keyless cosign signature over the immutable digest (covers every tag that
