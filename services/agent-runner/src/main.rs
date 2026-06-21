@@ -78,7 +78,19 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    match run(&config, &client, &embedder, review_config.as_ref()).await {
+    // Race the work against SIGTERM. When a task is cancelled, the control plane deletes the Job;
+    // Kubernetes then SIGTERMs the pod. Without this the process ignores it and runs until SIGKILL
+    // (~30s of wasted work); here we exit promptly so cancellation is "real". We don't report a
+    // status on SIGTERM — the control plane already owns it (cancelled / will be reaped) and we must
+    // not clobber a `cancelled` row with `failed`.
+    let outcome = tokio::select! {
+        result = run(&config, &client, &embedder, review_config.as_ref()) => result,
+        _ = terminated() => {
+            tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
+            return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
+        }
+    };
+    match outcome {
         Ok(summary) => {
             tracing::info!(task_id = %config.task_id, summary, "task succeeded");
             report(&client, &config, "succeeded", None).await;
@@ -89,6 +101,21 @@ async fn main() -> std::process::ExitCode {
             tracing::error!(task_id = %config.task_id, error = %detail, "task failed");
             report(&client, &config, "failed", Some(&detail)).await;
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolves when the process receives SIGTERM (Kubernetes' pod-termination signal). If the signal
+/// can't be registered, it never resolves — the task then simply runs to completion.
+async fn terminated() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not install SIGTERM handler; running uninterruptible");
+            std::future::pending::<()>().await;
         }
     }
 }
