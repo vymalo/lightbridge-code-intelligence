@@ -47,6 +47,8 @@ export interface Review {
   deferred_count: number;
   out_of_scope_count: number;
   findings: ReviewFinding[];
+  /** Permalink to the posted review on the PR; null for older runs / if GitHub omitted it. */
+  review_url: string | null;
   created_at: string;
 }
 
