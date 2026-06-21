@@ -22,6 +22,10 @@ pub struct TaskContext {
     pub command: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    /// Whether the repo already has a semantic index — review reuses it instead of re-indexing
+    /// (ADR-0025). Defaults to `false` (index) if an older control plane omits the field.
+    #[serde(default)]
+    pub repo_indexed: bool,
 }
 
 impl TaskContext {
@@ -384,6 +388,7 @@ mod tests {
             command: "review".into(),
             base_sha: None,
             head_sha: Some("deadbeef".into()),
+            repo_indexed: false,
         }
     }
 

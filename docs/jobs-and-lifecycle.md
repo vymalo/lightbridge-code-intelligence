@@ -151,14 +151,16 @@ and guarded against a re-approve racing ahead of it.
 > Today purge runs as a best-effort async task in the control plane (`spawn_purge`); hardening it into
 > a durable, observable Job/reconciler (survives a control-plane restart) is planned.
 
-## Known inefficiency: review re-indexes every time
+## Indexing strategy: review reuses the base index (ADR-0025)
 
-As noted above, a **review job re-runs the full semantic + structural index** before it reviews,
-because the runner's pipeline indexes unconditionally. Consequences:
-- A PR review costs ≈ a full repo index every time (embeddings + graph rebuild), which is why the two
-  take similar wall-clock.
-- It re-embeds unchanged files and rebuilds the whole graph even when only a few files changed.
+Originally a review job re-ran the full semantic + structural index before reviewing (the pipeline
+indexed unconditionally) — so a PR review cost ≈ a full repo index every time, re-embedding unchanged
+files. **Fixed in [ADR-0025](adr/0025-review-reuses-base-index.md):** the control plane reports
+`repo_indexed` in the task context, and the runner indexes only for an **`index`** task or a **cold
+repo**. A review on an already-indexed repo **skips the re-index** and reviews against the base index
+(searched via the MCP tools) + the PR diff. So in the flow diagram, the `semantic/graph index` steps
+run for index jobs and cold-start reviews; warm reviews go straight to the review step.
 
-Planned fix: skip the re-index when the repo's `repo_index` is already fresh for the head SHA (or
-index only the PR's changed files), so review work is proportional to the diff. Tracked as a follow-up
-(ADR + PR).
+Trade-off: the base index tracks the **default branch**, so it can go stale as that branch moves.
+Follow-up (not yet built): a periodic/push-driven re-index of the default branch, or incremental
+diff-only indexing for reviews, so search also covers brand-new PR symbols.
