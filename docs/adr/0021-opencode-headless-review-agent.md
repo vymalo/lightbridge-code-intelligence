@@ -2,7 +2,7 @@
 
 | Field      | Value |
 |------------|-------|
-| Status     | Accepted |
+| Status     | Superseded by [ADR-0026](0026-native-review-agent.md) |
 | Date       | 2026-06-19 |
 | Deciders   | @ssegning |
 | Epic       | #5 (indexer + agent, slice 5) |
