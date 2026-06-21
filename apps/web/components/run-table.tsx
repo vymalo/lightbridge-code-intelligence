@@ -1,6 +1,7 @@
 "use client";
 
 import { ChevronDown, ChevronUp } from "lucide-react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { StatusPill } from "@/components/ui/status-pill";
@@ -26,10 +27,15 @@ const PAGE_SIZE = 25;
 function compare(key: SortKey, a: Task, b: Task, now: number): number {
   switch (key) {
     case "created":
-      return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      // created_at is ISO-8601 (UTC) — lexicographic order == chronological, no Date parsing.
+      return a.created_at.localeCompare(b.created_at);
     case "duration":
-      // Unstarted runs (null) sort below started ones in ascending order.
-      return (durationSeconds(a, now) ?? -1) - (durationSeconds(b, now) ?? -1);
+      // Unstarted runs (null) sort below started ones in ascending order. MAX_SAFE_INTEGER (not
+      // Infinity) so two nulls subtract to 0, not NaN.
+      return (
+        (durationSeconds(a, now) ?? Number.MAX_SAFE_INTEGER) -
+        (durationSeconds(b, now) ?? Number.MAX_SAFE_INTEGER)
+      );
     case "status":
       return statusVisual(a.status).label.localeCompare(statusVisual(b.status).label);
     case "repo":
@@ -45,6 +51,14 @@ export function RunTable({ tasks, now }: { tasks: Task[]; now: number }) {
   const router = useRouter();
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "created", dir: "desc" });
   const [page, setPage] = useState(0);
+
+  // Reset to the first page when the filtered set changes (parent passes a new array). Derived-state
+  // pattern (set during render) rather than an effect, so there's no extra paint at the old page.
+  const [prevTasks, setPrevTasks] = useState(tasks);
+  if (tasks !== prevTasks) {
+    setPrevTasks(tasks);
+    setPage(0);
+  }
 
   const sorted = useMemo(() => {
     const out = [...tasks].sort((a, b) => compare(sort.key, a, b, now));
@@ -83,21 +97,27 @@ export function RunTable({ tasks, now }: { tasks: Task[]; now: number }) {
               return (
                 <tr
                   key={task.id}
-                  onClick={() => router.push(`/dashboard/runs/${task.id}`)}
+                  onClick={(e) => {
+                    // Preserve open-in-new-tab / new-window; the trigger cell is a real Link too.
+                    if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                    router.push(`/dashboard/runs/${task.id}`);
+                  }}
                   className="cursor-pointer border-b border-border transition-colors last:border-0 hover:bg-muted/60"
                 >
                   <td className="px-4 py-2.5">
                     <StatusPill status={task.status} />
                   </td>
                   <td className="max-w-xs truncate px-4 py-2.5 font-medium">
-                    {/* A real link keeps the row keyboard-accessible; the row onClick is mouse sugar. */}
-                    <a
+                    {/* A real Link keeps the row keyboard-accessible + client-side nav; the row
+                        onClick is mouse sugar. Foreground (not accent) to match the timeline RunRow
+                        trigger — both views of the same list. */}
+                    <Link
                       href={`/dashboard/runs/${task.id}`}
                       onClick={(e) => e.stopPropagation()}
                       className="hover:underline"
                     >
                       {triggerLabel(task)}
-                    </a>
+                    </Link>
                   </td>
                   <td className="max-w-[12rem] truncate px-4 py-2.5 text-muted-foreground">
                     {repoLabel(task)}
