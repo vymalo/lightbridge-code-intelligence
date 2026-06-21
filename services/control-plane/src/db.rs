@@ -481,10 +481,11 @@ pub async fn list_repositories(
 }
 
 /// Register a repository seen via an `installation` / `installation_repositories` webhook as
-/// **pending** approval. Insert-only (`ON CONFLICT DO NOTHING`) so it never disturbs an
-/// already-approved repo's status or its real `default_branch`. The installation payload doesn't
-/// carry `default_branch`, so a placeholder is fine — the first PR webhook (or the index task) fills
-/// it in. Returns `true` if a new pending row was inserted.
+/// **pending** approval. New repo → inserted pending. A previously **disabled** repo (uninstalled
+/// then re-added) is re-opened to pending so the admin sees it in the queue again; an already
+/// `approved`/`pending` repo is left untouched (the `WHERE` guard), preserving its status and real
+/// `default_branch`. The installation payload carries no `default_branch`, so a placeholder is fine —
+/// the first PR webhook fills it in. Returns `true` when a row was inserted or re-pended.
 pub async fn register_pending_repository(
     pool: &PgPool,
     github_repo_id: i64,
@@ -492,10 +493,12 @@ pub async fn register_pending_repository(
     name: &str,
     default_branch: &str,
 ) -> Result<bool, sqlx::Error> {
-    let inserted = sqlx::query(
+    let affected = sqlx::query(
         "INSERT INTO repositories (github_repo_id, owner, name, default_branch, status) \
          VALUES ($1, $2, $3, $4, 'pending') \
-         ON CONFLICT (github_repo_id) DO NOTHING",
+         ON CONFLICT (github_repo_id) DO UPDATE \
+           SET status = 'pending', owner = EXCLUDED.owner, name = EXCLUDED.name \
+           WHERE repositories.status = 'disabled'",
     )
     .bind(github_repo_id)
     .bind(owner)
@@ -503,7 +506,7 @@ pub async fn register_pending_repository(
     .bind(default_branch)
     .execute(pool)
     .await?;
-    Ok(inserted.rows_affected() > 0)
+    Ok(affected.rows_affected() > 0)
 }
 
 /// Is this repository approved for work? The gate the webhook handlers check before creating any
@@ -524,12 +527,19 @@ pub async fn set_repository_status_by_github_id(
     github_repo_id: i64,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE repositories SET status = $2 WHERE github_repo_id = $1")
-        .bind(github_repo_id)
-        .bind(status)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    // Clear the approval audit on any non-approved transition (e.g. disable) so stale approver/time
+    // don't linger — mirrors `set_repository_status_by_id`.
+    sqlx::query(
+        "UPDATE repositories SET status = $2, \
+           approved_at = CASE WHEN $2 = 'approved' THEN approved_at ELSE NULL END, \
+           approved_by = CASE WHEN $2 = 'approved' THEN approved_by ELSE NULL END \
+         WHERE github_repo_id = $1",
+    )
+    .bind(github_repo_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Admin action: set a repository's approval status by its **local** id, recording who/when on
@@ -1083,6 +1093,30 @@ mod tests {
         set_repository_status_by_github_id(&pool, 5555, "disabled")
             .await
             .unwrap();
+        // Re-install of a DISABLED repo re-opens it to pending (so the admin can re-approve).
+        assert!(
+            register_pending_repository(&pool, 5555, "o", "r2", "")
+                .await
+                .unwrap(),
+            "re-registering a disabled repo re-pends it"
+        );
+        assert!(list_repositories(&pool, Some("pending"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.github_repo_id == 5555));
+        // Re-registering an APPROVED repo is a no-op (must not revert it).
+        set_repository_status_by_id(&pool, id, "approved", Some("alice"))
+            .await
+            .unwrap();
+        assert!(
+            !register_pending_repository(&pool, 4242, "o", "r", "")
+                .await
+                .unwrap(),
+            "an approved repo is not re-pended"
+        );
+        assert!(repository_approved(&pool, id).await.unwrap());
+
         // Unknown local id → None.
         assert!(
             set_repository_status_by_id(&pool, 999_999, "approved", Some("x"))

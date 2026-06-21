@@ -41,22 +41,19 @@ pub async fn list_repositories(
 
 /// `POST /admin/repositories/{id}/approve` — opt a repository in. Future PRs (and a base index, once
 /// Milestone B lands) may then run. Records the approving admin's identity for audit.
-pub async fn approve(admin: Admin, state: State<AppState>, id: Path<i64>) -> Response {
+pub async fn approve(admin: Admin, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     set_status(admin, state, id, "approved").await
 }
 
 /// `POST /admin/repositories/{id}/deny` — keep a repository out of scope (sets `disabled`). Index
 /// data purge on denial is Milestone B; this just closes the gate.
-pub async fn deny(admin: Admin, state: State<AppState>, id: Path<i64>) -> Response {
+pub async fn deny(admin: Admin, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     set_status(admin, state, id, "disabled").await
 }
 
-async fn set_status(
-    admin: Admin,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    status: &str,
-) -> Response {
+/// Shared by approve/deny. Takes the already-extracted inner types (not Axum extractor wrappers)
+/// since it's a plain helper, not a handler.
+async fn set_status(admin: Admin, state: AppState, id: i64, status: &str) -> Response {
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
