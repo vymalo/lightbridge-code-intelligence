@@ -73,9 +73,9 @@ pub struct AppState {
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
     pub app_handle: Arc<String>,
-    /// Keycloak realm role required for the admin API (approval gate, Epic #75), from `ADMIN_ROLE`.
-    /// Default `lci-admin`. A token must carry this in `realm_access.roles` to reach `/admin/*`.
-    pub admin_role: Arc<String>,
+    /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
+    /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
+    pub permissions_claim: Arc<String>,
 }
 
 impl AppState {
@@ -150,11 +150,11 @@ impl AppState {
                     .filter(|h| !h.trim().is_empty())
                     .unwrap_or_else(|| "lightbridge-assistant".to_string()),
             ),
-            admin_role: Arc::new(
-                std::env::var("ADMIN_ROLE")
+            permissions_claim: Arc::new(
+                std::env::var("PERMISSIONS_CLAIM")
                     .ok()
-                    .filter(|r| !r.trim().is_empty())
-                    .unwrap_or_else(|| "lci-admin".to_string()),
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| "permissions".to_string()),
             ),
         })
     }

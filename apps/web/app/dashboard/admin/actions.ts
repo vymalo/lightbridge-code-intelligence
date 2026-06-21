@@ -1,18 +1,19 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { isAdmin, setRepoStatus } from "@/lib/admin";
+import { hasPermission, setRepoStatus } from "@/lib/admin";
 import { currentClaims } from "@/lib/session";
 
 /**
  * Shared body for the approve/deny actions. Server Actions are public POST endpoints, so this
- * authorizes the caller (admin realm role) and validates input here too — defense in depth on top of
- * the control plane's own admin gate — and throws on failure so the UI surfaces it instead of a
- * silent "success". (Not exported: a "use server" module may only export actions.)
+ * authorizes the caller on the specific permission (`repo:approve` / `repo:deny`, ADR-0023) and
+ * validates input here too — defense in depth on top of the control plane's own gate — and throws on
+ * failure so the UI surfaces it instead of a silent "success". (Not exported: a "use server" module
+ * may only export actions.)
  */
 async function mutate(formData: FormData, action: "approve" | "deny"): Promise<void> {
-  if (!isAdmin(await currentClaims())) {
-    throw new Error("Unauthorized: admin role required");
+  if (!hasPermission(await currentClaims(), `repo:${action}`)) {
+    throw new Error(`Unauthorized: repo:${action} permission required`);
   }
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id) || id <= 0) {

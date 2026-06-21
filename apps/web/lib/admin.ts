@@ -17,15 +17,31 @@ function controlPlaneUrl(): string {
   ).replace(/\/+$/, "");
 }
 
-/** The admin realm role this deployment requires. Mirrors the control plane's `ADMIN_ROLE`. */
-export function adminRole(): string {
-  return process.env.ADMIN_ROLE?.trim() || "lci-admin";
+/** The dotted claim path the caller's permissions live under (ADR-0023). Mirrors the control plane's
+ * `PERMISSIONS_CLAIM`. */
+export function permissionsClaim(): string {
+  return process.env.PERMISSIONS_CLAIM?.trim() || "permissions";
 }
 
-/** Does the signed-in user hold the admin realm role? Gates the admin nav + screen (the control
- * plane is the real enforcement; this just avoids showing a screen that would only 403). */
-export function isAdmin(claims: SessionClaims | null): boolean {
-  return claims?.realm_access?.roles?.includes(adminRole()) ?? false;
+/** The caller's permissions, read from the configured (possibly nested) claim path. Empty when the
+ * claim is missing or not a string array. */
+export function permissions(claims: SessionClaims | null): string[] {
+  if (!claims) return [];
+  let node: unknown = claims;
+  for (const segment of permissionsClaim().split(".")) {
+    if (node && typeof node === "object" && segment in (node as Record<string, unknown>)) {
+      node = (node as Record<string, unknown>)[segment];
+    } else {
+      return [];
+    }
+  }
+  return Array.isArray(node) ? node.filter((p): p is string => typeof p === "string") : [];
+}
+
+/** Does the caller hold `permission`? Gates the admin nav + screen (the control plane is the real
+ * enforcement; this just avoids showing affordances that would only 403). */
+export function hasPermission(claims: SessionClaims | null, permission: string): boolean {
+  return permissions(claims).includes(permission);
 }
 
 function classify(status: number): "unauthenticated" | "unavailable" | "error" {
