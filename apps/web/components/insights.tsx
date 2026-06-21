@@ -12,7 +12,7 @@ import type { Task } from "@/lib/tasks";
 
 /** Operator-glance insights over the fetched run list (ADR-0024, Dub pattern): KPI cards that drill
  * into the filtered runs list, a hand-rolled runs-over-time series (single accent, no chart lib), and
- * breakdown cards with CSS bars. Server-rendered; aggregation is pure (`lib/insights`). */
+ * breakdown cards with daisyUI `progress` bars. Server-rendered; aggregation is pure (`lib/insights`). */
 export function Insights({ tasks, now }: { tasks: Task[]; now: number }) {
   const kpis = computeKpis(tasks, now);
   const series = runsPerDay(tasks, now, 14);
@@ -39,7 +39,7 @@ export function Insights({ tasks, now }: { tasks: Task[]; now: number }) {
       <Card>
         <CardHeader className="flex items-baseline justify-between">
           <CardTitle>Runs over time</CardTitle>
-          <span className="text-xs text-muted-foreground">last 14 days</span>
+          <span className="text-xs text-base-content/60">last 14 days</span>
         </CardHeader>
         <CardBody>
           <Sparkline data={series} />
@@ -58,16 +58,16 @@ function Kpi({ label, value, href }: { label: string; value: string; href: strin
   return (
     <Link
       href={href}
-      className="rounded-card border border-border bg-surface p-3 transition-colors hover:bg-muted/50"
+      className="card card-border bg-base-200 p-3 transition-colors hover:bg-base-300/50"
     >
       <div className="text-2xl font-semibold tabular-nums">{value}</div>
-      <div className="mt-0.5 text-xs text-muted-foreground">{label}</div>
+      <div className="mt-0.5 text-xs text-base-content/60">{label}</div>
     </Link>
   );
 }
 
 /** Inline SVG runs-over-time series. Fixed viewBox + non-scaling stroke so it stays crisp at any
- * width; single accent fill/stroke per the ADR-0015 contract (no chart library). */
+ * width; single-accent fill/stroke, no chart library (ADR-0027 keeps ADR-0015's restraint). */
 function Sparkline({ data }: { data: { key: string; label: string; count: number }[] }) {
   const total = data.reduce((sum, d) => sum + d.count, 0);
   const max = Math.max(1, ...data.map((d) => d.count));
@@ -92,7 +92,7 @@ function Sparkline({ data }: { data: { key: string; label: string; count: number
       <svg
         viewBox="0 0 100 32"
         preserveAspectRatio="none"
-        className="h-24 w-full text-accent"
+        className="h-24 w-full text-primary"
         aria-hidden="true"
       >
         <title>Runs over time</title>
@@ -107,7 +107,7 @@ function Sparkline({ data }: { data: { key: string; label: string; count: number
           vectorEffect="non-scaling-stroke"
         />
       </svg>
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
+      <div className="flex items-center justify-between text-xs text-base-content/60">
         <span>{data[0]?.label}</span>
         <span className="tabular-nums">
           {total} run{total === 1 ? "" : "s"} · peak {max}/day
@@ -135,7 +135,7 @@ function BreakdownCard({
       </CardHeader>
       <CardBody>
         {slices.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No data.</p>
+          <p className="text-sm text-base-content/60">No data.</p>
         ) : (
           <ul className="flex flex-col gap-2">
             {slices.map((s) => (
@@ -143,13 +143,15 @@ function BreakdownCard({
                 <span className={`w-40 shrink-0 truncate text-xs ${mono ? "font-mono" : ""}`}>
                   {s.label}
                 </span>
-                <span className="relative h-2 flex-1 overflow-hidden rounded-full bg-muted">
-                  <span
-                    className="absolute inset-y-0 left-0 rounded-full bg-accent"
-                    style={{ width: `${(s.count / max) * 100}%` }}
-                  />
-                </span>
-                <span className="w-8 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {/* Native <progress> via daisyUI — semantic + accessible (implicit meter role). */}
+                <progress
+                  className="progress progress-primary h-2 flex-1"
+                  value={s.count}
+                  max={max}
+                >
+                  {s.count}
+                </progress>
+                <span className="w-8 shrink-0 text-right text-xs tabular-nums text-base-content/60">
                   {s.count}
                 </span>
               </li>

@@ -2,7 +2,6 @@
 
 import { ChevronDown, ChevronUp } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { Pagination } from "@/components/ui/pagination";
 import { StatusPill } from "@/components/ui/status-pill";
@@ -61,7 +60,6 @@ export function RunTable({
   page: number;
   onPageChange: (page: number | null) => void;
 }) {
-  const router = useRouter();
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "created", dir: "desc" });
 
   const sorted = useMemo(() => {
@@ -81,7 +79,7 @@ export function RunTable({
       <div className="overflow-x-auto">
         <table className="table table-sm">
           <thead>
-            <tr className="text-muted-foreground">
+            <tr className="text-base-content/60">
               <Th label="Status" sortKey="status" sort={sort} onSort={toggle} />
               <Th label="Trigger" sortKey="trigger" sort={sort} onSort={toggle} />
               <Th label="Repository" sortKey="repo" sort={sort} onSort={toggle} />
@@ -95,44 +93,33 @@ export function RunTable({
               const dur = duration(task, now);
               const sha = shortSha(task.head_sha);
               return (
-                <tr
-                  key={task.id}
-                  onClick={(e) => {
-                    // Preserve open-in-new-tab / new-window; the trigger cell is a real Link too.
-                    if (e.metaKey || e.ctrlKey || e.shiftKey) return;
-                    router.push(`/dashboard/runs/${task.id}`);
-                  }}
-                  className="cursor-pointer transition-colors hover:bg-base-300/60"
-                >
+                <tr key={task.id} className="relative transition-colors hover:bg-base-300/60">
                   <td>
                     <StatusPill status={task.status} />
                   </td>
                   <td className="max-w-xs truncate font-medium">
-                    {/* A real Link keeps the row keyboard-accessible + client-side nav; the row
-                        onClick is mouse sugar. Foreground (not accent) to match the timeline RunRow
-                        trigger — both views of the same list. */}
+                    {/* Stretched link: the `after:absolute after:inset-0` overlay makes the whole row
+                        a single real anchor (keyboard, middle/ctrl-click, no-JS) without nesting an
+                        <a> around a <tr>. Foreground (not accent) to match the timeline RunRow. */}
                     <Link
                       href={`/dashboard/runs/${task.id}`}
-                      onClick={(e) => e.stopPropagation()}
-                      className="hover:underline"
+                      className="hover:underline after:absolute after:inset-0"
                     >
                       {triggerLabel(task)}
                     </Link>
                   </td>
-                  <td className="max-w-[12rem] truncate text-muted-foreground">
-                    {repoLabel(task)}
-                  </td>
-                  <td className="text-muted-foreground">
+                  <td className="max-w-[12rem] truncate text-base-content/60">{repoLabel(task)}</td>
+                  <td className="text-base-content/60">
                     {task.repo_default_branch ??
                       (sha ? <span className="font-mono">{sha}</span> : "—")}
                   </td>
                   <td
-                    className="whitespace-nowrap text-right text-muted-foreground"
+                    className="whitespace-nowrap text-right text-base-content/60"
                     title={task.created_at}
                   >
                     {relativeTime(task.created_at, now)}
                   </td>
-                  <td className="text-right font-mono text-muted-foreground">{dur ?? "—"}</td>
+                  <td className="text-right font-mono text-base-content/60">{dur ?? "—"}</td>
                 </tr>
               );
             })}
@@ -145,7 +132,7 @@ export function RunTable({
         pageCount={pageCount}
         rangeLabel={rangeLabel}
         onPageChange={onPageChange}
-        className="flex items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-xs text-muted-foreground"
+        className="flex items-center justify-between gap-3 border-t border-base-content/15 px-4 py-2.5 text-xs text-base-content/60"
       />
     </div>
   );
@@ -171,9 +158,9 @@ function Th({
         type="button"
         onClick={() => onSort(sortKey)}
         className={cn(
-          "inline-flex items-center gap-1 transition-colors hover:text-foreground",
+          "inline-flex items-center gap-1 transition-colors hover:text-base-content",
           align === "right" && "flex-row-reverse",
-          active && "text-foreground",
+          active && "text-base-content",
         )}
       >
         {label}

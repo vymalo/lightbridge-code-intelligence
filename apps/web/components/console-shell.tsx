@@ -20,9 +20,9 @@ export function ConsoleShell({
 }) {
   return (
     <div className="grid min-h-dvh grid-cols-[15rem_1fr] max-md:grid-cols-1">
-      <aside className="flex flex-col gap-6 border-r border-border bg-surface px-3 py-4 max-md:hidden">
+      <aside className="flex flex-col gap-6 border-r border-base-content/15 bg-base-200 px-3 py-4 max-md:hidden">
         <Link href="/dashboard" className="flex items-center gap-2 px-2.5">
-          <span className="flex size-6 items-center justify-center rounded-md bg-accent text-accent-foreground text-xs font-semibold">
+          <span className="flex size-6 items-center justify-center rounded-md bg-primary text-primary-content text-xs font-semibold">
             L
           </span>
           <span className="text-sm font-medium tracking-tight">Lightbridge</span>
@@ -40,7 +40,7 @@ export function ConsoleShell({
             </NavLink>
           </div>
           {/* Hairline separator between the primary group and the system/admin group. */}
-          <hr className="mx-2.5 border-border" />
+          <hr className="mx-2.5 border-base-content/15" />
           <div className="flex flex-col gap-0.5">
             {admin && (
               <NavLink href="/dashboard/admin" icon={<ShieldCheck className="size-4" />}>
@@ -55,10 +55,10 @@ export function ConsoleShell({
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="flex h-12 items-center gap-4 border-b border-border bg-surface px-4">
+        <header className="flex h-12 items-center gap-4 border-b border-base-content/15 bg-base-200 px-4">
           <span className="text-sm font-medium tracking-tight md:hidden">Lightbridge</span>
           <CommandPalette admin={Boolean(admin)} githubAppUrl={githubAppInstallUrl()} />
-          <div className="ml-auto flex items-center gap-3 text-sm text-muted-foreground">
+          <div className="ml-auto flex items-center gap-3 text-sm text-base-content/60">
             <span className="truncate" title={user}>
               {user}
             </span>

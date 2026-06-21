@@ -13,7 +13,7 @@ export default async function Runs() {
     <div className="flex flex-col gap-6">
       <div>
         <h1 className="text-lg font-medium tracking-tight">Runs</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-base-content/60">
           Every task run, most recent first. Select a run to see its output and logs.
         </p>
       </div>

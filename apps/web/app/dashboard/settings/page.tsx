@@ -15,7 +15,7 @@ export default async function Settings() {
     <div className="flex flex-col gap-6">
       <div>
         <h1 className="text-lg font-medium tracking-tight">Settings</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-base-content/60">
           Your account. Identity is managed by Keycloak (OIDC) — Lightbridge stores no credentials
           (ADR-0014).
         </p>
@@ -86,7 +86,7 @@ export default async function Settings() {
 
 function Value({ children, mono }: { children: React.ReactNode; mono?: boolean }) {
   return (
-    <span className={`break-all text-foreground ${mono ? "font-mono text-xs" : ""}`}>
+    <span className={`break-all text-base-content ${mono ? "font-mono text-xs" : ""}`}>
       {children}
     </span>
   );
@@ -102,7 +102,7 @@ function PermissionList({ perms }: { perms: string[] }) {
       {perms.map((p) => (
         <code
           key={p}
-          className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
+          className="rounded border border-base-content/15 bg-base-300 px-1.5 py-0.5 font-mono text-xs text-base-content"
         >
           {p}
         </code>

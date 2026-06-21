@@ -41,7 +41,7 @@ export function RepoList({ repos, now }: { repos: Repository[]; now: number }) {
       />
 
       {rows.length === 0 ? (
-        <p className="px-1 py-6 text-sm text-muted-foreground">No repositories match “{query}”.</p>
+        <p className="px-1 py-6 text-sm text-base-content/60">No repositories match “{query}”.</p>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {rows.map((repo) => (
@@ -56,7 +56,7 @@ export function RepoList({ repos, now }: { repos: Repository[]; now: number }) {
           pageCount={pageCount}
           rangeLabel={rangeLabel}
           onPageChange={setPage}
-          className="flex items-center justify-between gap-3 text-xs text-muted-foreground"
+          className="flex items-center justify-between gap-3 text-xs text-base-content/60"
         />
       )}
     </div>
@@ -70,7 +70,7 @@ function RepoCard({ repo, now }: { repo: Repository; now: number }) {
       <div className="flex items-start justify-between gap-3 px-4 py-3">
         <div className="min-w-0">
           <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
-          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/60">
             <span className="inline-flex items-center gap-1">
               <GitBranch className="size-3" />
               {repo.default_branch}
@@ -83,14 +83,14 @@ function RepoCard({ repo, now }: { repo: Repository; now: number }) {
         </div>
         <Pill variant={approval.variant} label={approval.label} className="shrink-0" />
       </div>
-      <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs">
+      <div className="flex items-center justify-between gap-3 border-t border-base-content/15 px-4 py-2 text-xs">
         {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
-        <span className="text-muted-foreground">Not indexed yet</span>
+        <span className="text-base-content/60">Not indexed yet</span>
         <a
           href={repoUrl(repo)}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-accent transition-colors hover:underline"
+          className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
         >
           View on GitHub
           <ExternalLink className="size-3 shrink-0" />

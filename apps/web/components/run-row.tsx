@@ -11,12 +11,12 @@ export function RunRow({ task, now }: { task: Task; now: number }) {
   return (
     <Link
       href={`/dashboard/runs/${task.id}`}
-      className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/60"
+      className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-base-300/60"
     >
       <StatusPill status={task.status} className="w-32 shrink-0 justify-start" />
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium">{triggerLabel(task)}</div>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/60">
           <span className="truncate">{repoLabel(task)}</span>
           {branch && (
             <span className="inline-flex items-center gap-1">
@@ -32,7 +32,7 @@ export function RunRow({ task, now }: { task: Task; now: number }) {
           )}
         </div>
       </div>
-      <div className="hidden shrink-0 text-right text-xs text-muted-foreground sm:block">
+      <div className="hidden shrink-0 text-right text-xs text-base-content/60 sm:block">
         <div title={task.created_at}>{relativeTime(task.created_at, now)}</div>
         {dur && <div className="mt-0.5 font-mono">{dur}</div>}
       </div>

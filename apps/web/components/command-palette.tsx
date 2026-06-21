@@ -50,15 +50,12 @@ export function CommandPalette({ admin, githubAppUrl }: { admin: boolean; github
         type="button"
         onClick={() => setOpen(true)}
         aria-label="Search"
-        className="flex h-7 items-center gap-2 rounded-md border border-border bg-background px-2 text-xs text-muted-foreground transition-colors hover:border-border-strong"
+        className="btn btn-sm btn-ghost gap-2 font-normal text-base-content/60"
       >
         <Search className="size-3.5" />
         <span className="hidden sm:inline">Search</span>
-        {/* Decorative; the button's aria-label is its accessible name, so this kbd isn't announced
-            (and aria-hidden on it trips noAriaHiddenOnFocusable). */}
-        <kbd className="ml-1 hidden rounded border border-border px-1 font-sans text-[10px] sm:inline">
-          ⌘K
-        </kbd>
+        {/* Decorative; the button's aria-label is its accessible name, so this kbd isn't announced. */}
+        <kbd className="kbd kbd-xs ml-1 hidden font-sans sm:inline">⌘K</kbd>
       </button>
 
       <Command.Dialog
@@ -66,19 +63,19 @@ export function CommandPalette({ admin, githubAppUrl }: { admin: boolean; github
         onOpenChange={setOpen}
         label="Command menu"
         overlayClassName="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm"
-        contentClassName="fixed left-1/2 top-[18%] z-50 w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 overflow-hidden rounded-card border border-border bg-surface"
+        contentClassName="fixed left-1/2 top-[18%] z-50 w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 overflow-hidden rounded-box border border-base-content/15 bg-base-200"
       >
-        <div className="flex items-center gap-2 border-b border-border px-3">
-          <Search className="size-4 shrink-0 text-muted-foreground" />
+        <div className="flex items-center gap-2 border-b border-base-content/15 px-3">
+          <Search className="size-4 shrink-0 text-base-content/60" />
           <Command.Input
             value={query}
             onValueChange={setQuery}
             placeholder="Search or jump to…"
-            className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-base-content/60"
           />
         </div>
         <Command.List className="max-h-80 overflow-y-auto p-1.5">
-          <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
+          <Command.Empty className="px-3 py-6 text-center text-sm text-base-content/60">
             No matches.
           </Command.Empty>
 
@@ -149,7 +146,7 @@ function Group({ heading, children }: { heading: string; children: ReactNode }) 
   return (
     <Command.Group
       heading={heading}
-      className="px-1 pb-1 text-xs text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:font-medium"
+      className="px-1 pb-1 text-xs text-base-content/60 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:font-medium"
     >
       {children}
     </Command.Group>
@@ -169,7 +166,7 @@ function Item({
     <Command.Item
       value={value}
       onSelect={onSelect}
-      className="flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-2 text-sm text-foreground data-[selected=true]:bg-muted"
+      className="flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-2 text-sm text-base-content data-[selected=true]:bg-base-300"
     >
       {children}
     </Command.Item>

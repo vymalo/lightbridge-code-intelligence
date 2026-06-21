@@ -111,12 +111,12 @@ export function RunLogs({ taskId }: { taskId: string }) {
 
       <pre
         ref={preRef}
-        className="max-h-96 overflow-auto rounded-md bg-base-200 p-3 font-mono text-xs leading-relaxed text-muted-foreground"
+        className="max-h-96 overflow-auto rounded-md bg-base-200 p-3 font-mono text-xs leading-relaxed text-base-content/60"
       >
         {body || (filtering ? "No lines match the current filters." : placeholder)}
       </pre>
 
-      <span className="text-xs text-muted-foreground">
+      <span className="text-xs text-base-content/60">
         {state === "streaming" && "● streaming live"}
         {state === "done" && "stream ended"}
         {state === "error" && "could not stream logs"}
