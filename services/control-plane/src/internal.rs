@@ -524,6 +524,10 @@ pub async fn post_review(
         .iter()
         .any(|f| f.severity.eq_ignore_ascii_case("error") && in_scope(f));
 
+    // Capture the agent's raw findings before `validate` consumes them — persisted with the posted
+    // review for the admin console + audit (Epic #75, Milestone C).
+    let findings_json = serde_json::to_value(&submission.findings).unwrap_or_default();
+
     let validated = crate::review::validate(submission.findings, &commentable);
     let body = crate::review::render_body(
         &submission.summary,
@@ -558,6 +562,22 @@ pub async fn post_review(
     {
         Ok(()) => {
             tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review posted");
+            // Persist a copy for the admin console + audit (best-effort — the review is already on
+            // GitHub, so a DB hiccup here must not fail the response).
+            if let Err(error) = crate::db::upsert_review(
+                pool,
+                id,
+                &submission.summary,
+                &body,
+                inline_n as i32,
+                deferred_n as i32,
+                out_of_scope_n as i32,
+                &findings_json,
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id = %id, "persisting review copy failed (non-fatal)");
+            }
             // Review delivered: 🎉 + outcome labels (best-effort).
             react(app, &state.review, &target, "hooray").await;
             add_review_labels(

@@ -1,7 +1,7 @@
 import { SESSION_COOKIE } from "@lightbridge/auth";
 import { cookies } from "next/headers";
 import type { Repository } from "@/lib/repos";
-import type { Task } from "@/lib/tasks";
+import type { Review, Task } from "@/lib/tasks";
 
 /**
  * Server-side client for the control plane's read API (resource server). Runs only in Server
@@ -60,6 +60,19 @@ export async function getTask(id: string): Promise<ApiResult<Task | null>> {
     if (res.status === 404) return { ok: true, data: null };
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as Task };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `GET /tasks/{id}/review` — the persisted review for a run, or `null` data when none recorded. */
+export async function getReview(id: string): Promise<ApiResult<Review | null>> {
+  try {
+    const res = await authedFetch(`/tasks/${encodeURIComponent(id)}/review`);
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (res.status === 404) return { ok: true, data: null };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as Review };
   } catch {
     return { ok: false, reason: "unavailable" };
   }

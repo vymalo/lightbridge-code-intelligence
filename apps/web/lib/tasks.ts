@@ -25,6 +25,28 @@ export interface Task {
   repo_default_branch: string | null;
 }
 
+/** One finding from the agent's review (mirrors `review::Finding`). */
+export interface ReviewFinding {
+  file: string;
+  line: number;
+  severity: string;
+  title: string;
+  body: string;
+  suggestion?: string | null;
+}
+
+/** A persisted review (`GET /tasks/{id}/review`, `ReviewRow` in db.rs). */
+export interface Review {
+  task_id: string;
+  summary: string;
+  body: string;
+  inline_count: number;
+  deferred_count: number;
+  out_of_scope_count: number;
+  findings: ReviewFinding[];
+  created_at: string;
+}
+
 /** The small visual set statuses collapse to (ADR-0015/0016 tokens). */
 export type StatusVariant = "pending" | "active" | "success" | "error" | "muted";
 

@@ -1,10 +1,11 @@
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { ReviewOutput } from "@/components/review-output";
 import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusPill } from "@/components/ui/status-pill";
-import { getTask } from "@/lib/api";
+import { getReview, getTask } from "@/lib/api";
 import {
   absoluteTime,
   duration,
@@ -40,6 +41,9 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
   const task = result.data;
   const now = Date.now();
   const isError = statusVisual(task.status).variant === "error";
+  // The persisted review (if any). 404 → null (older run / index task / never posted).
+  const reviewResult = await getReview(id);
+  const review = reviewResult.ok ? reviewResult.data : null;
 
   return (
     <Shell>
@@ -86,11 +90,20 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         <CardHeader>
           <CardTitle>Review output</CardTitle>
         </CardHeader>
-        <StatusLine>
-          Structured review findings will appear here once the indexer and agent runner are wired
-          (Code product epic). This run is currently {statusVisual(task.status).label.toLowerCase()}
-          .
-        </StatusLine>
+        {!reviewResult.ok ? (
+          <CardBody>
+            <ApiErrorLine result={reviewResult} />
+          </CardBody>
+        ) : review ? (
+          <CardBody>
+            <ReviewOutput review={review} />
+          </CardBody>
+        ) : (
+          <StatusLine>
+            No review was recorded for this run — it may be an indexing run, a run that hasn't
+            posted yet, or one from before review history was captured.
+          </StatusLine>
+        )}
       </Card>
 
       <Card>
