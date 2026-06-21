@@ -121,6 +121,8 @@ impl GithubApp {
 
     /// Post a PR review (`event: COMMENT`) with a body and optional inline comments. GitHub rejects
     /// the whole review if any comment's line isn't in the diff, so the caller must pre-validate.
+    /// Post the review; returns its `html_url` (the permalink to the review on the PR) when GitHub
+    /// includes it, so the console can link to what was posted.
     pub async fn create_pr_review(
         &self,
         token: &str,
@@ -129,14 +131,15 @@ impl GithubApp {
         pr: i64,
         body: &str,
         comments: &[ReviewComment],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         use anyhow::Context;
         let payload = serde_json::json!({
             "body": body,
             "event": "COMMENT",
             "comments": comments,
         });
-        self.http
+        let review: serde_json::Value = self
+            .http
             .post(format!(
                 "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews"
             ))
@@ -149,8 +152,11 @@ impl GithubApp {
             .await
             .context("posting PR review")?
             .error_for_status()
-            .context("github rejected the PR review")?;
-        Ok(())
+            .context("github rejected the PR review")?
+            .json()
+            .await
+            .context("parsing PR review response")?;
+        Ok(review["html_url"].as_str().map(str::to_string))
     }
 
     /// Fetch a repository's default branch. Used by index-on-approve (Epic #75): a repo registered

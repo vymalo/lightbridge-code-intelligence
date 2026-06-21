@@ -560,10 +560,10 @@ pub async fn post_review(
         .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
         .await
     {
-        Ok(()) => {
+        Ok(review_url) => {
             tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review posted");
             // Persist a copy for the admin console + audit (best-effort — the review is already on
-            // GitHub, so a DB hiccup here must not fail the response).
+            // GitHub, so a DB hiccup here must not fail the response). `review_url` is the permalink.
             if let Err(error) = crate::db::upsert_review(
                 pool,
                 id,
@@ -573,6 +573,7 @@ pub async fn post_review(
                 deferred_n as i32,
                 out_of_scope_n as i32,
                 &findings_json,
+                review_url.as_deref(),
             )
             .await
             {
