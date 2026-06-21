@@ -3,11 +3,17 @@ import type { Review, ReviewFinding } from "@/lib/tasks";
 /** Severity → chip tone. Unknown severities fall back to a neutral chip. */
 function severityClass(severity: string): string {
   switch (severity.toLowerCase()) {
+    case "critical":
     case "error":
       return "bg-[var(--status-error)]/15 text-[var(--status-error)]";
+    case "high":
     case "warning":
     case "warn":
       return "bg-amber-500/15 text-amber-600 dark:text-amber-400";
+    case "medium":
+    case "low":
+    case "info":
+      return "bg-blue-500/15 text-blue-600 dark:text-blue-400";
     default:
       return "bg-muted text-muted-foreground";
   }
@@ -28,8 +34,11 @@ export function ReviewOutput({ review }: { review: Review }) {
       <p className="text-xs text-muted-foreground">{counts.join(" · ")}</p>
       {review.findings.length > 0 && (
         <ul className="flex flex-col gap-3">
-          {review.findings.map((f) => (
-            <FindingItem key={`${f.file}:${f.line}:${f.severity}:${f.title}`} finding={f} />
+          {review.findings.map((f, index) => (
+            // Static, server-rendered list that never reorders — the index keeps the key unique even
+            // when two raw findings are identical (file/line/severity/title), which is possible.
+            // biome-ignore lint/suspicious/noArrayIndexKey: stable order, never reordered
+            <FindingItem key={`${f.file}:${f.line}:${index}`} finding={f} />
           ))}
         </ul>
       )}

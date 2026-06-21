@@ -90,7 +90,11 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         <CardHeader>
           <CardTitle>Review output</CardTitle>
         </CardHeader>
-        {review ? (
+        {!reviewResult.ok ? (
+          <CardBody>
+            <ApiErrorLine result={reviewResult} />
+          </CardBody>
+        ) : review ? (
           <CardBody>
             <ReviewOutput review={review} />
           </CardBody>
