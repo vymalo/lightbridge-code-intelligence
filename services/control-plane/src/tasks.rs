@@ -46,7 +46,7 @@ pub async fn list_repositories(_claims: Claims, State(state): State<AppState>) -
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    match crate::db::list_repositories(pool).await {
+    match crate::db::list_repositories(pool, None).await {
         Ok(repos) => Json(repos).into_response(),
         Err(error) => {
             tracing::error!(%error, "list repositories failed");

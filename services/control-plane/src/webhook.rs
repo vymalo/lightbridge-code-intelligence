@@ -73,16 +73,24 @@ pub async fn github_webhook(
 
     // Webhook → internal action mapping (the only events that do anything beyond being persisted):
     //
-    //   pull_request   opened                  → review task (the automatic FIRST review)
-    //   pull_request   closed                  → cancel the PR's active tasks (+ reaper stops Jobs)
-    //   pull_request   synchronize | reopened  → nothing (re-review must be asked for via @mention)
-    //   issue_comment  created, body @<handle> → review task (a manual re-review)
+    //   pull_request               opened                  → review task (the automatic FIRST review)
+    //   pull_request               closed                  → cancel the PR's active tasks
+    //   pull_request               synchronize | reopened  → nothing (re-review via @mention)
+    //   issue_comment              created, body @<handle> → review task (a manual re-review)
+    //   installation               created                 → register the installed repos as pending
+    //   installation               deleted                 → disable the installation's repos
+    //   installation_repositories  added | removed         → register pending / disable those repos
     //
+    // Repos start **pending** and need admin approval before any review/index runs (Epic #75).
     // Everything else is persisted to `github_deliveries` only.
     if state.db.is_some() {
         match event.as_str() {
             "pull_request" => handle_pull_request(&state, &payload, &delivery_id).await,
             "issue_comment" => handle_issue_comment(&state, &payload, &delivery_id).await,
+            "installation" => handle_installation(&state, &payload, &delivery_id).await,
+            "installation_repositories" => {
+                handle_installation_repositories(&state, &payload, &delivery_id).await
+            }
             _ => {}
         }
     }
@@ -141,6 +149,10 @@ async fn handle_pull_request(
             let Some(installation_id) = payload["installation"]["id"].as_i64() else {
                 return;
             };
+            // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
+            if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
+                return;
+            }
             let pr = &payload["pull_request"];
             let task = crate::db::NewTask {
                 repository_id,
@@ -250,6 +262,10 @@ async fn handle_issue_comment(
                 return;
             }
         };
+    // Approval gate (Epic #75): even an explicit @mention can't run on an unapproved repo.
+    if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
+        return;
+    }
     let run_epoch = crate::db::next_run_epoch(
         pool,
         repository_id,
@@ -304,6 +320,129 @@ async fn create_review_task(
         ),
         Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create task"),
     }
+}
+
+/// The approval gate (Epic #75): returns `true` only when the repo is admin-approved. A
+/// pending/disabled repo (or a query error — fail closed) logs and returns `false`, so no review/index
+/// task is created. This is what stops the tool from running on repos nobody opted in.
+async fn approved_or_skip(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+    delivery_id: &str,
+    pr: i64,
+) -> bool {
+    match crate::db::repository_approved(pool, repository_id).await {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::info!(
+                delivery_id,
+                pr,
+                repository_id,
+                "repository not approved; skipping (awaiting admin approval)"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(%error, delivery_id, repository_id, "approval check failed; skipping (fail closed)");
+            false
+        }
+    }
+}
+
+/// `installation` events: `created` (the App was installed on an account) registers the selected
+/// repos as **pending** approval; `deleted` (uninstalled) disables them. Repos default to pending so
+/// nothing runs until an admin approves (Epic #75). The installation payload's repo objects carry no
+/// `default_branch`; a placeholder is fine — the first PR webhook fills it in.
+async fn handle_installation(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let action = payload["action"].as_str().unwrap_or_default();
+    let repos = payload["repositories"].as_array();
+    match action {
+        "created" => register_pending(pool, repos, delivery_id).await,
+        "deleted" => disable_repos(pool, repos, delivery_id).await,
+        _ => {} // suspend/unsuspend/new_permissions_accepted → persisted only
+    }
+}
+
+/// `installation_repositories` events: repos added to / removed from an existing installation.
+/// Added → pending (await approval); removed → disabled.
+async fn handle_installation_repositories(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    register_pending(pool, payload["repositories_added"].as_array(), delivery_id).await;
+    disable_repos(
+        pool,
+        payload["repositories_removed"].as_array(),
+        delivery_id,
+    )
+    .await;
+}
+
+/// Register each repo (a webhook repo object: `id`, `full_name`) as pending approval, insert-only so
+/// an already-approved repo is untouched.
+async fn register_pending(
+    pool: &sqlx::PgPool,
+    repos: Option<&Vec<serde_json::Value>>,
+    delivery_id: &str,
+) {
+    for repo in repos.into_iter().flatten() {
+        let Some((github_repo_id, owner, name)) = repo_identity(repo) else {
+            continue;
+        };
+        match crate::db::register_pending_repository(pool, github_repo_id, owner, name, "").await {
+            Ok(true) => {
+                tracing::info!(delivery_id, repo = %format!("{owner}/{name}"), "registered pending repository (awaiting approval)")
+            }
+            Ok(false) => {} // already known — leave its status as-is
+            Err(error) => {
+                tracing::error!(%error, delivery_id, "register pending repository failed")
+            }
+        }
+    }
+}
+
+/// Mark each repo `disabled` (removed from the installation). Index-data purge is Milestone B.
+async fn disable_repos(
+    pool: &sqlx::PgPool,
+    repos: Option<&Vec<serde_json::Value>>,
+    delivery_id: &str,
+) {
+    for repo in repos.into_iter().flatten() {
+        let Some(github_repo_id) = repo["id"].as_i64() else {
+            continue;
+        };
+        if let Err(error) =
+            crate::db::set_repository_status_by_github_id(pool, github_repo_id, "disabled").await
+        {
+            tracing::error!(%error, delivery_id, github_repo_id, "disable repository failed");
+        } else {
+            tracing::info!(
+                delivery_id,
+                github_repo_id,
+                "repository disabled (removed from installation)"
+            );
+        }
+    }
+}
+
+/// Extract `(github_repo_id, owner, name)` from a webhook repo object. The installation payload uses
+/// `full_name` ("owner/name") rather than a nested owner object.
+fn repo_identity(repo: &serde_json::Value) -> Option<(i64, &str, &str)> {
+    let id = repo["id"].as_i64()?;
+    let full_name = repo["full_name"].as_str()?;
+    let (owner, name) = full_name.split_once('/')?;
+    Some((id, owner, name))
 }
 
 /// Best-effort 👀 on the PR to acknowledge a review has started. Never fails the webhook: a missing
@@ -383,6 +522,18 @@ mod tests {
             "@someone-else go",
             "lightbridge-assistant"
         ));
+    }
+
+    #[test]
+    fn repo_identity_parses_full_name() {
+        let repo = serde_json::json!({ "id": 99, "full_name": "octo/Hello-World" });
+        assert_eq!(repo_identity(&repo), Some((99, "octo", "Hello-World")));
+        // Missing id / full_name, or a malformed full_name → None (skipped, not panicked).
+        assert_eq!(repo_identity(&serde_json::json!({ "id": 1 })), None);
+        assert_eq!(
+            repo_identity(&serde_json::json!({ "id": 1, "full_name": "noslash" })),
+            None
+        );
     }
 
     #[test]
