@@ -99,6 +99,65 @@ pub async fn reconcile_embedding_dimension(
     Ok(())
 }
 
+/// A persisted review (Epic #75, Milestone C) — what the agent posted for a task, mirrored from the
+/// GitHub PR review so the admin console can show it. Serialized straight to `GET /tasks/{id}/review`.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ReviewRow {
+    pub task_id: Uuid,
+    pub summary: String,
+    pub body: String,
+    pub inline_count: i32,
+    pub deferred_count: i32,
+    pub out_of_scope_count: i32,
+    pub findings: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Persist (or replace, on a re-post) the review posted for a task. Best-effort: the review is already
+/// on GitHub by the time this is called, so a failure here is logged by the caller, not fatal.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_review(
+    pool: &PgPool,
+    task_id: Uuid,
+    summary: &str,
+    body: &str,
+    inline_count: i32,
+    deferred_count: i32,
+    out_of_scope_count: i32,
+    findings: &Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO reviews \
+         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (task_id) DO UPDATE SET \
+           summary = EXCLUDED.summary, body = EXCLUDED.body, \
+           inline_count = EXCLUDED.inline_count, deferred_count = EXCLUDED.deferred_count, \
+           out_of_scope_count = EXCLUDED.out_of_scope_count, findings = EXCLUDED.findings, \
+           created_at = now()",
+    )
+    .bind(task_id)
+    .bind(summary)
+    .bind(body)
+    .bind(inline_count)
+    .bind(deferred_count)
+    .bind(out_of_scope_count)
+    .bind(findings)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// The persisted review for a task, or `None` if none was recorded (e.g. an older run, an index task,
+/// or a review that failed to post).
+pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow>, sqlx::Error> {
+    sqlx::query_as::<_, ReviewRow>("SELECT * FROM reviews WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Persist a GitHub delivery, using its `delivery_id` PRIMARY KEY for exactly-once handling.
 /// Returns `true` if the delivery is new (inserted), `false` if it was already seen (duplicate).
 pub async fn record_delivery(
@@ -1321,6 +1380,40 @@ mod tests {
             create_index_task(&pool, id, 555).await.unwrap().is_none(),
             "no duplicate while one index task is active"
         );
+    }
+
+    /// Review persistence (Epic #75, Milestone C): upsert stores the review + findings; get returns it;
+    /// a re-post upserts (one row per task); unknown task → None.
+    #[sqlx::test]
+    async fn review_persist_and_read(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(get_review(&pool, task_id).await.unwrap().is_none());
+
+        let findings = serde_json::json!([{ "file": "a.rs", "line": 3, "severity": "error",
+            "title": "t", "body": "b" }]);
+        upsert_review(&pool, task_id, "sum", "body", 1, 2, 0, &findings)
+            .await
+            .unwrap();
+        let row = get_review(&pool, task_id).await.unwrap().unwrap();
+        assert_eq!(row.summary, "sum");
+        assert_eq!(row.inline_count, 1);
+        assert_eq!(row.deferred_count, 2);
+        assert_eq!(row.findings[0]["file"], "a.rs");
+
+        // Re-post upserts in place (still one row).
+        upsert_review(&pool, task_id, "sum2", "body2", 0, 0, 0, &findings)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_review(&pool, task_id).await.unwrap().unwrap().summary,
+            "sum2"
+        );
+
+        assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an

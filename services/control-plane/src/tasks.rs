@@ -41,6 +41,26 @@ pub async fn get(_claims: Claims, State(state): State<AppState>, Path(id): Path<
     }
 }
 
+/// `GET /tasks/{id}/review` — the persisted review for a run (summary + body + findings), or 404 when
+/// none was recorded (older run, index task, or a review that never posted).
+pub async fn get_review(
+    _claims: Claims,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::get_review(pool, id).await {
+        Ok(Some(review)) => Json(review).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no review recorded").into_response(),
+        Err(error) => {
+            tracing::error!(%error, "get review failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `GET /repositories` — connected repositories + their run activity (the Repositories view).
 pub async fn list_repositories(_claims: Claims, State(state): State<AppState>) -> Response {
     let Some(pool) = state.db.as_ref() else {

@@ -11,10 +11,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// One finding submitted by the runner (mirrors `agent-runner::review::ReviewFinding`).
-#[derive(Debug, Clone, Deserialize)]
+/// One finding submitted by the runner (mirrors `agent-runner::review::ReviewFinding`). `Serialize`
+/// so the control plane can persist the findings array verbatim (Milestone C review record).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Finding {
     pub file: String,
     pub line: u32,
