@@ -119,6 +119,15 @@ The webhook handler maps events to queue tasks:
 - Graph overlays are trickier than chunk overlays (cross-file edges may reference base nodes); Phase 2
   must define how an overlay edge to an unchanged symbol resolves (likely: resolve against the base
   layer by symbol id).
+- **Deleted files** need an explicit *tombstone* in the overlay. The shadow rule ("overlay wins for
+  files it touches") only fires when a file *appears* in the overlay — but a file the PR **deletes**
+  produces no overlay rows, so retrieval would fall back to the base and still surface the removed
+  code. The overlay must record the PR's deleted paths (`git diff --diff-filter=D`) and retrieval must
+  exclude base rows for those paths, not just for paths that have overlay rows.
+- **Reverse graph edges (base → overlay).** An unchanged base file may call a symbol the PR *changed*;
+  the base edge still points at the old base node. Phase 2 must resolve graph lookups by *symbol id*
+  with overlay-precedence (an overlay node shadows the base node of the same symbol for both forward
+  and reverse traversal), not just rewrite overlay→base edges.
 
 ## Alternatives considered
 
