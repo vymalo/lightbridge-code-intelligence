@@ -365,7 +365,7 @@ async fn handle_installation(
     let repos = payload["repositories"].as_array();
     match action {
         "created" => register_pending(pool, repos, delivery_id).await,
-        "deleted" => disable_repos(pool, repos, delivery_id).await,
+        "deleted" => disable_repos(state, repos, delivery_id).await,
         _ => {} // suspend/unsuspend/new_permissions_accepted → persisted only
     }
 }
@@ -382,7 +382,7 @@ async fn handle_installation_repositories(
     };
     register_pending(pool, payload["repositories_added"].as_array(), delivery_id).await;
     disable_repos(
-        pool,
+        state,
         payload["repositories_removed"].as_array(),
         delivery_id,
     )
@@ -412,26 +412,36 @@ async fn register_pending(
     }
 }
 
-/// Mark each repo `disabled` (removed from the installation). Index-data purge is Milestone B.
+/// Mark each repo `disabled` (removed from the installation) and purge its index data (Epic #75,
+/// Milestone B): cancel in-flight tasks + delete its `code_chunks` / Neo4j graph. The purge is
+/// spawned so it can't block the webhook's deadline.
 async fn disable_repos(
-    pool: &sqlx::PgPool,
+    state: &crate::AppState,
     repos: Option<&Vec<serde_json::Value>>,
     delivery_id: &str,
 ) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
     for repo in repos.into_iter().flatten() {
         let Some(github_repo_id) = repo["id"].as_i64() else {
             continue;
         };
-        if let Err(error) =
-            crate::db::set_repository_status_by_github_id(pool, github_repo_id, "disabled").await
+        match crate::db::set_repository_status_by_github_id(pool, github_repo_id, "disabled").await
         {
-            tracing::error!(%error, delivery_id, github_repo_id, "disable repository failed");
-        } else {
-            tracing::info!(
-                delivery_id,
-                github_repo_id,
-                "repository disabled (removed from installation)"
-            );
+            Ok(Some(repository_id)) => {
+                tracing::info!(
+                    delivery_id,
+                    github_repo_id,
+                    repository_id,
+                    "repository disabled (removed from installation); purging index data"
+                );
+                crate::lifecycle::spawn_purge(state, repository_id);
+            }
+            Ok(None) => {} // not known locally — nothing to disable/purge
+            Err(error) => {
+                tracing::error!(%error, delivery_id, github_repo_id, "disable repository failed")
+            }
         }
     }
 }

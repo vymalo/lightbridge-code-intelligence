@@ -66,6 +66,10 @@ async fn set_status(admin: Admin, state: AppState, id: i64, status: &str) -> Res
                 admin = by,
                 "admin set repository status"
             );
+            // Denial removes the repo from scope → purge its index data (Epic #75, Milestone B).
+            if status == "disabled" {
+                crate::lifecycle::spawn_purge(&state, id);
+            }
             Json(repo).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),

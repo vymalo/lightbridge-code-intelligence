@@ -14,6 +14,7 @@ mod github;
 mod internal;
 mod jwt;
 mod k8s;
+mod lifecycle;
 mod metrics;
 mod neo4j;
 mod reaper;

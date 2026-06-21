@@ -295,6 +295,47 @@ pub async fn cancel_active_tasks_for_pr(
     .await
 }
 
+/// Cancel every active (queued/running/posting) task for a repository — used when the repo is removed
+/// from the installation or denied, so in-flight Jobs are stopped (the reaper deletes them) and
+/// nothing new dispatches. Returns the cancelled task ids.
+pub async fn cancel_active_tasks_for_repo(
+    pool: &PgPool,
+    repository_id: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE tasks SET status = 'cancelled', completed_at = now(), \
+             lease_owner = NULL, lease_expires_at = NULL \
+         WHERE repository_id = $1 AND status IN ('queued', 'running', 'posting_result') \
+         RETURNING id",
+    )
+    .bind(repository_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo
+/// is removed/denied (Epic #75, Milestone B). Returns the number of rows deleted.
+pub async fn delete_code_chunks_for_repo(
+    pool: &PgPool,
+    repository_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM code_chunks WHERE repository_id = $1")
+        .bind(repository_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete a repository's indexing-state rows (`repo_index`) — completes the purge bookkeeping so a
+/// later re-add reindexes from scratch.
+pub async fn delete_repo_index_rows(pool: &PgPool, repository_id: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM repo_index WHERE repository_id = $1")
+        .bind(repository_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Cancelled tasks that still have a Kubernetes Job to clean up (the reaper deletes the Job, then
 /// clears `job_name` so the row isn't returned again).
 pub async fn list_cancelled_with_job(
@@ -521,25 +562,26 @@ pub async fn repository_approved(pool: &PgPool, repository_id: i64) -> Result<bo
 }
 
 /// Set a repository's approval status by its **GitHub** id (webhook path — e.g. mark `disabled` when
-/// removed from the installation). No-op if the repo isn't known locally.
+/// removed from the installation). Returns the repo's **local** id (so the caller can purge its index
+/// data), or `None` if the repo isn't known locally.
 pub async fn set_repository_status_by_github_id(
     pool: &PgPool,
     github_repo_id: i64,
     status: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<i64>, sqlx::Error> {
     // Clear the approval audit on any non-approved transition (e.g. disable) so stale approver/time
     // don't linger — mirrors `set_repository_status_by_id`.
-    sqlx::query(
+    sqlx::query_scalar(
         "UPDATE repositories SET status = $2, \
            approved_at = CASE WHEN $2 = 'approved' THEN approved_at ELSE NULL END, \
            approved_by = CASE WHEN $2 = 'approved' THEN approved_by ELSE NULL END \
-         WHERE github_repo_id = $1",
+         WHERE github_repo_id = $1 \
+         RETURNING id",
     )
     .bind(github_repo_id)
     .bind(status)
-    .execute(pool)
+    .fetch_optional(pool)
     .await
-    .map(|_| ())
 }
 
 /// Admin action: set a repository's approval status by its **local** id, recording who/when on
@@ -1124,6 +1166,51 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Data purge (Epic #75, Milestone B): cancelling a repo's tasks is scoped to that repo, and the
+    /// delete helpers are safe no-ops on an empty repo.
+    #[sqlx::test]
+    async fn purge_cancels_only_target_repo_tasks(pool: PgPool) {
+        let repo_a = seed(&pool).await;
+        let repo_b = upsert_repository(&pool, 9001, "octo", "other", "main")
+            .await
+            .unwrap();
+        create_task(&pool, &pr_task(repo_a, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        create_task(&pool, &pr_task(repo_b, "h2"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Cancels only repo_a's active task; repo_b's stays cancellable.
+        assert_eq!(
+            cancel_active_tasks_for_repo(&pool, repo_a)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            cancel_active_tasks_for_repo(&pool, repo_a)
+                .await
+                .unwrap()
+                .is_empty(),
+            "already cancelled → no-op"
+        );
+        assert_eq!(
+            cancel_active_tasks_for_repo(&pool, repo_b)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Delete helpers are safe no-ops with nothing indexed.
+        assert_eq!(delete_code_chunks_for_repo(&pool, repo_a).await.unwrap(), 0);
+        assert_eq!(delete_repo_index_rows(&pool, repo_a).await.unwrap(), 0);
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an
