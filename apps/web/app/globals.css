@@ -1,10 +1,47 @@
 @import "tailwindcss";
+@plugin "daisyui";
 
 /*
- * Web console design language — ADR-0015.
- * Monochrome neutral base; color reserved for semantic status only. Depth via thin borders and
- * tonal shifts, not shadows. Light default + full dark mode from one token set (prefers-color-scheme).
+ * Web console design language — daisyUI (ADR-0027) on Tailwind v4, dark-only with the `dracula`
+ * theme. daisyUI is the component layer + palette; surfaces migrate to daisyUI classes
+ * (btn/card/badge/…) over several PRs. During the migration the ADR-0015 token names below are
+ * BRIDGED onto daisyUI's tokens so existing components keep working until they're moved.
  */
+
+@plugin "daisyui/theme" {
+  name: "dracula";
+  default: true;
+  prefersdark: false;
+  color-scheme: "dark";
+  --color-base-100: oklch(28.822% 0.022 277.508);
+  --color-base-200: oklch(26.805% 0.02 277.508);
+  --color-base-300: oklch(24.787% 0.019 277.508);
+  --color-base-content: oklch(97.747% 0.007 106.545);
+  --color-primary: oklch(75.461% 0.183 346.812);
+  --color-primary-content: oklch(15.092% 0.036 346.812);
+  --color-secondary: oklch(74.202% 0.148 301.883);
+  --color-secondary-content: oklch(14.84% 0.029 301.883);
+  --color-accent: oklch(83.392% 0.124 66.558);
+  --color-accent-content: oklch(16.678% 0.024 66.558);
+  --color-neutral: oklch(39.445% 0.032 275.524);
+  --color-neutral-content: oklch(87.889% 0.006 275.524);
+  --color-info: oklch(88.263% 0.093 212.846);
+  --color-info-content: oklch(17.652% 0.018 212.846);
+  --color-success: oklch(87.099% 0.219 148.024);
+  --color-success-content: oklch(17.419% 0.043 148.024);
+  --color-warning: oklch(95.533% 0.134 112.757);
+  --color-warning-content: oklch(19.106% 0.026 112.757);
+  --color-error: oklch(68.22% 0.206 24.43);
+  --color-error-content: oklch(13.644% 0.041 24.43);
+  --radius-selector: 1rem;
+  --radius-field: 0.5rem;
+  --radius-box: 1rem;
+  --size-selector: 0.21875rem;
+  --size-field: 0.21875rem;
+  --border: 0.5px;
+  --depth: 0;
+  --noise: 1;
+}
 
 @theme inline {
   --color-background: var(--background);
@@ -13,7 +50,7 @@
   --color-surface-foreground: var(--surface-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
-  --color-border: var(--border);
+  --color-border: var(--border-color);
   --color-border-strong: var(--border-strong);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
@@ -22,86 +59,57 @@
   --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, monospace;
 
-  --radius-card: 8px;
+  --radius-card: var(--radius-box);
 }
 
+/*
+ * Bridge: the ADR-0015 utility names (bg-surface, text-foreground, border-border, text-accent, the
+ * status pills…) mapped onto daisyUI's dracula tokens. As each surface moves to daisyUI components
+ * these get retired; until then nothing breaks.
+ */
 :root {
-  /* Light — near-white canvas, slightly raised surfaces, ink-not-black text. */
-  --background: oklch(0.99 0 0);
-  --foreground: oklch(0.21 0.01 260);
-  --surface: oklch(1 0 0);
-  --surface-foreground: oklch(0.21 0.01 260);
-  --muted: oklch(0.96 0.005 260);
-  --muted-foreground: oklch(0.52 0.01 260);
-  --border: oklch(0.92 0.004 260);
-  --border-strong: oklch(0.86 0.006 260);
-  --accent: oklch(0.55 0.16 264);
-  --accent-foreground: oklch(0.99 0 0);
-  --ring: oklch(0.55 0.16 264);
+  --background: var(--color-base-100);
+  --foreground: var(--color-base-content);
+  --surface: var(--color-base-200);
+  --surface-foreground: var(--color-base-content);
+  --muted: var(--color-base-300);
+  --muted-foreground: color-mix(in oklch, var(--color-base-content) 62%, transparent);
+  --border-color: color-mix(in oklch, var(--color-base-content) 14%, transparent);
+  --border-strong: color-mix(in oklch, var(--color-base-content) 26%, transparent);
+  --accent: var(--color-primary);
+  --accent-foreground: var(--color-primary-content);
+  --ring: var(--color-primary);
 
-  /* Semantic status accents (foreground ink + subtle tinted fill for pills). */
-  --status-pending: oklch(0.52 0.01 260);
-  --status-pending-fill: oklch(0.95 0.005 260);
-  --status-active: oklch(0.55 0.16 264);
-  --status-active-fill: oklch(0.95 0.03 264);
-  --status-success: oklch(0.52 0.13 155);
-  --status-success-fill: oklch(0.95 0.04 155);
-  --status-error: oklch(0.55 0.2 25);
-  --status-error-fill: oklch(0.95 0.04 25);
-  --status-warn: oklch(0.6 0.13 75);
-  --status-warn-fill: oklch(0.95 0.05 85);
-  --status-muted: oklch(0.6 0.01 260);
-  --status-muted-fill: oklch(0.95 0.004 260);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    /* Dark — the references skew dark and our users live in dark IDEs. */
-    --background: oklch(0.17 0.005 260);
-    --foreground: oklch(0.93 0.005 260);
-    --surface: oklch(0.2 0.006 260);
-    --surface-foreground: oklch(0.93 0.005 260);
-    --muted: oklch(0.24 0.006 260);
-    --muted-foreground: oklch(0.66 0.01 260);
-    --border: oklch(0.28 0.007 260);
-    --border-strong: oklch(0.34 0.008 260);
-    --accent: oklch(0.7 0.14 264);
-    --accent-foreground: oklch(0.17 0.005 260);
-    --ring: oklch(0.7 0.14 264);
-
-    --status-pending: oklch(0.7 0.01 260);
-    --status-pending-fill: oklch(0.27 0.006 260);
-    --status-active: oklch(0.72 0.13 264);
-    --status-active-fill: oklch(0.3 0.05 264);
-    --status-success: oklch(0.75 0.14 155);
-    --status-success-fill: oklch(0.3 0.05 155);
-    --status-error: oklch(0.7 0.16 25);
-    --status-error-fill: oklch(0.31 0.07 25);
-    --status-warn: oklch(0.78 0.13 80);
-    --status-warn-fill: oklch(0.32 0.06 80);
-    --status-muted: oklch(0.6 0.008 260);
-    --status-muted-fill: oklch(0.26 0.006 260);
-  }
+  /* Status pills → daisyUI semantic colors. */
+  --status-pending: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+  --status-pending-fill: var(--color-base-300);
+  --status-active: var(--color-info);
+  --status-active-fill: color-mix(in oklch, var(--color-info) 22%, transparent);
+  --status-success: var(--color-success);
+  --status-success-fill: color-mix(in oklch, var(--color-success) 22%, transparent);
+  --status-error: var(--color-error);
+  --status-error-fill: color-mix(in oklch, var(--color-error) 22%, transparent);
+  --status-warn: var(--color-warning);
+  --status-warn-fill: color-mix(in oklch, var(--color-warning) 22%, transparent);
+  --status-muted: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+  --status-muted-fill: var(--color-base-300);
 }
 
 @layer base {
   * {
-    border-color: var(--border);
-  }
-  html {
-    color-scheme: light dark;
+    border-color: var(--border-color);
   }
   body {
-    background: var(--background);
-    color: var(--foreground);
+    background: var(--color-base-100);
+    color: var(--color-base-content);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }
 }
 
 /*
- * Status pills (ADR-0016 status model). One class per visual variant; the component picks the
- * variant from TaskStatus. Capsule shape, tinted fill + status ink, hairline ring.
+ * Status pills (ADR-0016 status model) — kept until the runs/detail surfaces move to daisyUI `badge`.
+ * Capsule shape, tinted fill + status ink.
  */
 @layer components {
   .status-pill {
