@@ -63,11 +63,13 @@ pub struct KubeLauncher {
     agent_config_map: Option<String>,
     /// The runner container's `resources` block (requests/limits), set verbatim when present.
     resources: Option<Value>,
-    /// An `ownerReference` (to the agent ServiceAccount) stamped on every Job for k8s GC + traceability.
-    /// `None` when the SA UID couldn't be read (e.g. missing RBAC) — Jobs are then created un-owned,
-    /// as before. Owner must be same-namespace as the Job (k8s forbids cross-namespace ownerRefs), so
-    /// the same-ns ServiceAccount is the anchor rather than the cross-ns dispatcher.
-    owner_reference: Option<Value>,
+    /// Handle to the agent ServiceAccount, used to resolve its UID for the Job `ownerReference`.
+    sa: Api<ServiceAccount>,
+    /// Lazily-resolved Job `ownerReference` (to the agent SA) for k8s GC + traceability. `None` means
+    /// "not resolved yet" — `launch` retries on each call until it succeeds, so a not-yet-created SA
+    /// or a transient API error at startup doesn't permanently leave Jobs un-owned. Owner must be the
+    /// same-namespace SA (k8s forbids cross-namespace ownerRefs), not the cross-ns dispatcher.
+    owner_reference: tokio::sync::Mutex<Option<Value>>,
 }
 
 /// The default Job runtime cap when `AGENT_JOB_DEADLINE_SECONDS` is unset or unparseable.
@@ -145,10 +147,11 @@ impl KubeLauncher {
             "AGENT_CONFIG_CONFIGMAP",
         );
         let resources = agent.and_then(|a| a.resources.clone());
-        // Best-effort: read the agent SA's UID so each Job can carry an ownerReference to it (same
-        // namespace, stable). No UID (missing RBAC / SA) → Jobs are created un-owned, as before.
-        let owner_reference = owner_reference(&client, &namespace, &service_account).await;
         Ok(Self {
+            // The SA's UID (for the Job ownerReference) is resolved lazily on first launch, not here:
+            // at startup the SA may not exist yet (Helm install ordering) or the API may be briefly
+            // unavailable, and resolving once would then leave Jobs permanently un-owned.
+            sa: Api::namespaced(client.clone(), &namespace),
             jobs: Api::namespaced(client, &namespace),
             image,
             service_account,
@@ -159,16 +162,15 @@ impl KubeLauncher {
             review_system_prompt,
             agent_config_map,
             resources,
-            owner_reference,
+            owner_reference: tokio::sync::Mutex::new(None),
         })
     }
 }
 
 /// Read the agent ServiceAccount's UID and shape it into a Job `ownerReference`. Best-effort: a
 /// failure (RBAC, missing SA) is logged and yields `None` so Job creation still works un-owned.
-async fn owner_reference(client: &Client, namespace: &str, sa_name: &str) -> Option<Value> {
-    let sas: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
-    match sas.get(sa_name).await {
+async fn fetch_owner_reference(sa: &Api<ServiceAccount>, sa_name: &str) -> Option<Value> {
+    match sa.get(sa_name).await {
         Ok(sa) => sa.metadata.uid.map(|uid| {
             json!({
                 "apiVersion": "v1",
@@ -191,6 +193,16 @@ async fn owner_reference(client: &Client, namespace: &str, sa_name: &str) -> Opt
 impl TaskLauncher for KubeLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String> {
         let name = job_name(task);
+        // Resolve the SA ownerReference lazily + cached: fetch on first launch (when the SA exists),
+        // retry on each launch until it succeeds, then reuse. So a startup race or transient API
+        // error doesn't permanently leave Jobs un-owned.
+        let owner_reference = {
+            let mut cache = self.owner_reference.lock().await;
+            if cache.is_none() {
+                *cache = fetch_owner_reference(&self.sa, &self.service_account).await;
+            }
+            cache.clone()
+        };
         let manifest = job_manifest(
             &name,
             JobConfig {
@@ -203,7 +215,7 @@ impl TaskLauncher for KubeLauncher {
                 review_system_prompt: self.review_system_prompt.as_deref(),
                 agent_config_map: self.agent_config_map.as_deref(),
                 resources: self.resources.as_ref(),
-                owner_reference: self.owner_reference.as_ref(),
+                owner_reference: owner_reference.as_ref(),
             },
             task,
         );

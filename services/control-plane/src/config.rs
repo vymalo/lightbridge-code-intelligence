@@ -22,6 +22,20 @@ pub struct FileConfig {
     pub agent: AgentSection,
     pub dispatcher: DispatcherSection,
     pub review: ReviewSection,
+    pub embeddings: EmbeddingsSection,
+}
+
+/// Embedding-store safety. The `code_chunks.embedding` column is a fixed-width `vector(N)`; changing
+/// the embedding model to a different dimension is **destructive** (every stored vector is the wrong
+/// width). When `dimension` is set and differs from the live column, the control plane wipes
+/// `code_chunks` and migrates the column — but **only if `allow_reindex_on_dim_change`** is true;
+/// otherwise it fails loud (refuses to start) so a typo can't silently destroy the index.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingsSection {
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    pub dimension: Option<i64>,
+    pub allow_reindex_on_dim_change: bool,
 }
 
 /// Review-feedback knobs the control plane applies to the PR: lifecycle reactions and outcome labels.

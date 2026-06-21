@@ -31,6 +31,23 @@ pub fn opencode_config(review: &ReviewConfig, mcp_env: &[(String, String)]) -> V
         })
     };
 
+    // Per-model generation params (temperature/top_p/max_tokens), passed as the model's `options` to
+    // the OpenAI-compatible provider. Only present when configured — otherwise the model's defaults.
+    let mut model_entry = json!({ "name": review.model.clone() });
+    let mut options = serde_json::Map::new();
+    if let Some(temperature) = review.temperature {
+        options.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = review.top_p {
+        options.insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(max_tokens) = review.max_tokens {
+        options.insert("max_tokens".to_string(), json!(max_tokens));
+    }
+    if !options.is_empty() {
+        model_entry["options"] = Value::Object(options);
+    }
+
     json!({
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -42,7 +59,7 @@ pub fn opencode_config(review: &ReviewConfig, mcp_env: &[(String, String)]) -> V
                     "apiKey": "{env:LLM_API_KEY}",
                 },
                 "models": {
-                    review.model.clone(): { "name": review.model.clone() }
+                    review.model.clone(): model_entry,
                 }
             }
         },
@@ -72,7 +89,19 @@ mod tests {
             model: "qwen-coder".to_string(),
             system_prompt: None,
             max_diff_chars: 60_000,
+            temperature: Some(0.2),
+            top_p: None,
+            max_tokens: Some(4096),
         }
+    }
+
+    #[test]
+    fn model_options_carry_configured_params() {
+        let cfg = opencode_config(&review(), &[]);
+        let opts = &cfg["provider"]["eaig"]["models"]["qwen-coder"]["options"];
+        assert_eq!(opts["temperature"], serde_json::json!(0.2));
+        assert_eq!(opts["max_tokens"], serde_json::json!(4096));
+        assert!(opts.get("top_p").is_none(), "unset params are omitted");
     }
 
     #[test]

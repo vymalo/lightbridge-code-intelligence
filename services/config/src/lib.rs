@@ -224,15 +224,13 @@ mod tests {
             size: Option<usize>,
         }
         // A `{env:…}`-substituted numeric field arrives as a string; it must still deserialize.
-        let dir = std::env::temp_dir().join("lbcfg-num");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("c.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
         std::fs::write(&path, r#"{ "timeout": "{env:T:-45}", "size": 1000 }"#).unwrap();
 
         let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
         assert_eq!(cfg.timeout, Some(45), "numeric string from default coerces");
         assert_eq!(cfg.size, Some(1000), "literal number still works");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -243,9 +241,8 @@ mod tests {
             model: String,
             timeout: u64,
         }
-        let dir = std::env::temp_dir().join("lbcfg-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("c.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
         std::fs::write(&path, r#"{ "model": "{env:M:-m0}", "timeout": 30 }"#).unwrap();
 
         let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
@@ -254,6 +251,5 @@ mod tests {
 
         let cfg2: Cfg = load_with(&path, &env_of(&[("M", "real")])).unwrap();
         assert_eq!(cfg2.model, "real");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
