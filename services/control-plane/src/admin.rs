@@ -1,9 +1,9 @@
 //! Admin API for the approval gate (Epic #75, Milestone A).
 //!
 //! The GitHub App can be installed on any org/repo, but a repository is **not** indexed or reviewed
-//! until an admin approves it (so nobody can point the tool at arbitrary private repos). These
-//! endpoints — gated by the [`Admin`] extractor (a valid OIDC token carrying the configured admin
-//! realm role) — let an admin see the pending queue and approve/deny repos.
+//! until approved (so nobody can point the tool at arbitrary private repos). These endpoints are
+//! gated by **permissions** carried in the OIDC token (`repo:read`/`repo:approve`/`repo:deny`,
+//! ADR-0023) via the [`Caller`] extractor.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
-use crate::jwt::Admin;
+use crate::jwt::Caller;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -23,10 +23,13 @@ pub struct RepoListQuery {
 /// `GET /admin/repositories[?status=pending]` — repositories for the admin console; filter by status
 /// to show the approval queue.
 pub async fn list_repositories(
-    _admin: Admin,
+    caller: Caller,
     State(state): State<AppState>,
     Query(query): Query<RepoListQuery>,
 ) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
@@ -39,25 +42,34 @@ pub async fn list_repositories(
     }
 }
 
-/// `POST /admin/repositories/{id}/approve` — opt a repository in. Future PRs (and a base index, once
-/// Milestone B lands) may then run. Records the approving admin's identity for audit.
-pub async fn approve(admin: Admin, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    set_status(admin, state, id, "approved").await
+/// `POST /admin/repositories/{id}/approve` — opt a repository in (opens the gate + triggers its base
+/// index). Requires `repo:approve`. Records the approver's identity for audit.
+pub async fn approve(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(e) = caller.require("repo:approve") {
+        return e.into_response();
+    }
+    set_status(caller, state, id, "approved").await
 }
 
-/// `POST /admin/repositories/{id}/deny` — keep a repository out of scope (sets `disabled`). Index
-/// data purge on denial is Milestone B; this just closes the gate.
-pub async fn deny(admin: Admin, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    set_status(admin, state, id, "disabled").await
+/// `POST /admin/repositories/{id}/deny` — keep a repository out of scope (sets `disabled` + purges
+/// its index data). Requires `repo:deny`.
+pub async fn deny(caller: Caller, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    if let Err(e) = caller.require("repo:deny") {
+        return e.into_response();
+    }
+    set_status(caller, state, id, "disabled").await
 }
 
-/// Shared by approve/deny. Takes the already-extracted inner types (not Axum extractor wrappers)
-/// since it's a plain helper, not a handler.
-async fn set_status(admin: Admin, state: AppState, id: i64, status: &str) -> Response {
+/// Shared by approve/deny (permission already checked by the caller). Plain helper, not a handler.
+async fn set_status(caller: Caller, state: AppState, id: i64, status: &str) -> Response {
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    let by = admin.0.identity();
+    let by = caller.claims.identity();
     match crate::db::set_repository_status_by_id(pool, id, status, Some(by)).await {
         Ok(Some(repo)) => {
             tracing::info!(

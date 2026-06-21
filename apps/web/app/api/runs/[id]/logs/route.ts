@@ -1,5 +1,6 @@
 import { PassThrough, Readable } from "node:stream";
 import { CoreV1Api, KubeConfig, Log } from "@kubernetes/client-node";
+import { hasPermission } from "@/lib/admin";
 import { getTask } from "@/lib/api";
 import { currentClaims } from "@/lib/session";
 
@@ -26,8 +27,11 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ): Promise<Response> {
-  // Only signed-in users; the task lookup below is itself OIDC-authorized against the control plane.
-  if (!(await currentClaims())) return text("unauthenticated", 401);
+  // Requires the `task:logs` permission (ADR-0023); the task lookup below is also OIDC-authorized
+  // against the control plane.
+  const claims = await currentClaims();
+  if (!claims) return text("unauthenticated", 401);
+  if (!hasPermission(claims, "task:logs")) return text("missing task:logs permission", 403);
 
   const { id } = await params;
   const task = await getTask(id);

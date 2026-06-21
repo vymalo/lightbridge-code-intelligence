@@ -34,33 +34,44 @@ pub struct Claims {
     pub name: Option<String>,
     /// Expiry (unix seconds) — validated by jsonwebtoken.
     pub exp: usize,
-    /// Keycloak realm roles (`realm_access.roles`). Used for the admin gate ([`Admin`]); absent for
-    /// non-Keycloak IdPs or tokens without a realm-role mapper.
-    #[serde(default)]
-    pub realm_access: Option<RealmAccess>,
-}
-
-/// Keycloak's `realm_access` claim — the realm-level roles assigned to the token's subject.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RealmAccess {
-    #[serde(default)]
-    pub roles: Vec<String>,
+    /// All other claims, captured so the **permissions** list can be read from a *configurable* claim
+    /// path (ADR-0023) — including nested paths the IdP/gateway chooses.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Claims {
-    /// True when the token carries `role` among its realm roles.
-    pub fn has_realm_role(&self, role: &str) -> bool {
-        self.realm_access
-            .as_ref()
-            .is_some_and(|ra| ra.roles.iter().any(|r| r == role))
-    }
-
     /// A human-readable identity for audit (`approved_by`): username, else email, else subject.
     pub fn identity(&self) -> &str {
         self.preferred_username
             .as_deref()
             .or(self.email.as_deref())
             .unwrap_or(&self.sub)
+    }
+
+    /// The caller's permissions, read from the dotted `claim_path` (ADR-0023). The claim value is a
+    /// JSON array of strings; anything else (missing claim, wrong type) yields an empty set →
+    /// fail-closed authorization.
+    pub fn permissions(&self, claim_path: &str) -> std::collections::HashSet<String> {
+        // Navigate the dotted path through the flattened extra claims.
+        let mut node: Option<&serde_json::Value> = None;
+        for (i, segment) in claim_path.split('.').enumerate() {
+            node = if i == 0 {
+                self.extra.get(segment)
+            } else {
+                node.and_then(|n| n.get(segment))
+            };
+            if node.is_none() {
+                return std::collections::HashSet::new();
+            }
+        }
+        node.and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -104,7 +115,7 @@ pub enum AuthError {
     JwksUnavailable,
     /// `OIDC_ISSUER` is not configured — the resource server cannot validate anything.
     Disabled,
-    /// Authenticated, but the caller lacks the required admin role.
+    /// Authenticated, but the caller lacks the required permission.
     Forbidden,
 }
 
@@ -115,7 +126,7 @@ impl IntoResponse for AuthError {
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid token"),
             AuthError::JwksUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "jwks unavailable"),
             AuthError::Disabled => (StatusCode::SERVICE_UNAVAILABLE, "oidc not configured"),
-            AuthError::Forbidden => (StatusCode::FORBIDDEN, "admin role required"),
+            AuthError::Forbidden => (StatusCode::FORBIDDEN, "missing required permission"),
         };
         (status, msg).into_response()
     }
@@ -220,21 +231,36 @@ impl FromRequestParts<AppState> for Claims {
     }
 }
 
-/// Extractor that authenticates AND authorizes an **admin** request: a valid token whose realm roles
-/// include the configured admin role (`state.admin_role`, from `ADMIN_ROLE`, default `lci-admin`).
-/// Wraps the verified [`Claims`]. 401 for a bad/missing token; 403 when authenticated but not an admin.
-pub struct Admin(pub Claims);
+/// Extractor that authenticates a request AND carries the caller's **permissions** (ADR-0023), read
+/// from the configured claim (`state.permissions_claim`, from `PERMISSIONS_CLAIM`, default
+/// `permissions`). Handlers call [`Caller::require`] to authorize a specific capability.
+pub struct Caller {
+    pub claims: Claims,
+    pub permissions: std::collections::HashSet<String>,
+}
 
-impl FromRequestParts<AppState> for Admin {
+impl Caller {
+    /// `Ok(())` if the caller holds `permission`, else `Forbidden` (403). Fail-closed: a token without
+    /// the permissions claim has an empty set and is denied.
+    pub fn require(&self, permission: &str) -> Result<(), AuthError> {
+        if self.permissions.contains(permission) {
+            Ok(())
+        } else {
+            Err(AuthError::Forbidden)
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for Caller {
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, AuthError> {
         let claims = Claims::from_request_parts(parts, state).await?;
-        if claims.has_realm_role(&state.admin_role) {
-            Ok(Admin(claims))
-        } else {
-            Err(AuthError::Forbidden)
-        }
+        let permissions = claims.permissions(&state.permissions_claim);
+        Ok(Caller {
+            claims,
+            permissions,
+        })
     }
 }
 
@@ -248,10 +274,12 @@ fn bearer_token(parts: &Parts) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Protected route: returns the caller's verified claims. First authenticated endpoint — proves
-/// the resource-server validation path end-to-end.
-pub async fn me(claims: Claims) -> Json<Claims> {
-    Json(claims)
+/// Protected route: the caller's verified identity + effective permissions (ADR-0023). The web reads
+/// this to show/hide capability-gated affordances.
+pub async fn me(caller: Caller) -> Json<serde_json::Value> {
+    let mut perms: Vec<String> = caller.permissions.into_iter().collect();
+    perms.sort();
+    Json(serde_json::json!({ "claims": caller.claims, "permissions": perms }))
 }
 
 /// Convenience for building the validator from env (None when `OIDC_ISSUER` is unset).
@@ -330,37 +358,37 @@ mod tests {
         encode(&header, &claims, &key).expect("sign token")
     }
 
-    #[test]
-    fn realm_role_gate_and_identity() {
-        let with_role = Claims {
+    fn claims_with(extra: serde_json::Value) -> Claims {
+        Claims {
             sub: "u1".into(),
             email: Some("a@b.c".into()),
             preferred_username: Some("alice".into()),
             name: None,
             exp: 0,
-            realm_access: Some(RealmAccess {
-                roles: vec!["offline_access".into(), "lci-admin".into()],
-            }),
-        };
-        assert!(with_role.has_realm_role("lci-admin"));
-        assert!(!with_role.has_realm_role("other"));
-        assert_eq!(
-            with_role.identity(),
-            "alice",
-            "username preferred for audit"
-        );
+            extra: extra.as_object().cloned().unwrap_or_default(),
+        }
+    }
 
-        // No realm_access (non-Keycloak token) → not an admin; identity falls back email → sub.
-        let none = Claims {
-            sub: "u2".into(),
-            email: Some("e@x".into()),
-            preferred_username: None,
-            name: None,
-            exp: 0,
-            realm_access: None,
-        };
-        assert!(!none.has_realm_role("lci-admin"));
-        assert_eq!(none.identity(), "e@x");
+    #[test]
+    fn permissions_read_from_configured_claim() {
+        // Top-level claim.
+        let c = claims_with(json!({ "permissions": ["repo:read", "repo:approve"] }));
+        let perms = c.permissions("permissions");
+        assert!(perms.contains("repo:approve") && perms.contains("repo:read"));
+        assert!(!perms.contains("repo:deny"));
+        assert_eq!(c.identity(), "alice", "username preferred for audit");
+
+        // Nested dotted path.
+        let nested = claims_with(json!({ "code_intelligence": { "permissions": ["task:logs"] } }));
+        assert!(nested
+            .permissions("code_intelligence.permissions")
+            .contains("task:logs"));
+
+        // Missing / wrong-typed claim → empty set (fail-closed).
+        assert!(claims_with(json!({})).permissions("permissions").is_empty());
+        assert!(claims_with(json!({ "permissions": "not-an-array" }))
+            .permissions("permissions")
+            .is_empty());
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 import { Check, X } from "lucide-react";
 import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
-import { isAdmin, listPendingRepos } from "@/lib/admin";
+import { hasPermission, listPendingRepos } from "@/lib/admin";
 import type { Repository } from "@/lib/repos";
 import { repoSlug } from "@/lib/repos";
 import { currentClaims } from "@/lib/session";
@@ -11,14 +11,14 @@ export const dynamic = "force-dynamic";
 
 export default async function AdminPage() {
   const claims = await currentClaims();
-  if (!isAdmin(claims)) {
+  if (!hasPermission(claims, "repo:approve")) {
     return (
       <div className="flex flex-col gap-5">
         <h1 className="text-lg font-medium tracking-tight">Repository approvals</h1>
         <Card>
           <StatusLine>
-            You need the admin role to manage repository approvals. Ask an administrator to grant
-            it.
+            You need the <code>repo:approve</code> permission to manage repository approvals. Ask an
+            administrator to grant it.
           </StatusLine>
         </Card>
       </div>
