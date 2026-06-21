@@ -36,6 +36,8 @@ export interface ReviewFinding {
   title: string;
   body: string;
   suggestion?: string | null;
+  /** Links to supporting resources (docs, CWE, RFCs). */
+  resources?: string[];
 }
 
 /** A persisted review (`GET /tasks/{id}/review`, `ReviewRow` in db.rs). */
