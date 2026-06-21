@@ -31,4 +31,4 @@ lci:
         main:
           image:
             repository: ghcr.io/vymalo/lightbridge-web
-            tag: "sha-d31186f"
+            tag: "sha-ed12e41"
