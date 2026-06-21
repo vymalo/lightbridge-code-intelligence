@@ -95,24 +95,31 @@ export function RunLogs({ taskId }: { taskId: string }) {
     }
   }, [shown, filtering]);
 
+  const body = text ? shown.join("\n") : "";
+
   const copy = async () => {
-    if (!navigator?.clipboard) return;
-    await navigator.clipboard.writeText(shown.join("\n"));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    if (!navigator?.clipboard || !body) return;
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard can reject (document not focused, permissions) — ignore; the button just won't flip.
+    }
   };
 
   const download = () => {
-    const blob = new Blob([text], { type: "text/plain" });
+    if (!body) return;
+    // Download what's shown (filtered), to match Copy. Defer revoke so the click resolves first.
+    const blob = new Blob([body], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = `run-${taskId}.log`;
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
-  const body = text ? shown.join("\n") : "";
   const placeholder = state === "streaming" ? "Connecting to the run's logs…" : "No log output.";
 
   return (
@@ -141,11 +148,11 @@ export function RunLogs({ taskId }: { taskId: string }) {
           />
         </div>
         <div className="ml-auto flex items-center gap-1">
-          <LogAction onClick={copy} label={copied ? "Copied" : "Copy"} disabled={!text}>
+          <LogAction onClick={copy} label={copied ? "Copied" : "Copy"} disabled={!body}>
             {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {copied ? "Copied" : "Copy"}
           </LogAction>
-          <LogAction onClick={download} label="Download" disabled={!text}>
+          <LogAction onClick={download} label="Download" disabled={!body}>
             <Download className="size-3.5" />
             Download
           </LogAction>

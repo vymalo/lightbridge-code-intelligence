@@ -66,59 +66,77 @@ export function ReviewOutput({ review }: { review: Review }) {
 function FindingItem({ finding }: { finding: ReviewFinding }) {
   const hasDetail = Boolean(finding.body || finding.suggestion || finding.resources?.length);
   const defaultOpen = ["critical", "error"].includes(finding.severity.toLowerCase());
+
+  // No body/suggestion/resources → a static row, not a `<details>` (an expandable-but-empty box
+  // reads as broken).
+  if (!hasDetail) {
+    return (
+      <li>
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border p-3">
+          <FindingHeader finding={finding} />
+        </div>
+      </li>
+    );
+  }
+
   return (
     <li>
       <details open={defaultOpen} className="group rounded-md border border-border">
         <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 p-3 [&::-webkit-details-marker]:hidden">
-          <ChevronRight
-            className={`size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90 ${
-              hasDetail ? "" : "invisible"
-            }`}
-          />
-          <span
-            className={`rounded px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wide ${severityClass(finding.severity)}`}
-          >
-            {finding.severity}
-          </span>
-          <span className="text-sm font-medium">{finding.title}</span>
-          <span className="ml-auto font-mono text-xs text-muted-foreground">
-            {finding.file}:{finding.line}
-          </span>
+          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+          <FindingHeader finding={finding} />
         </summary>
-        {hasDetail && (
-          <div className="border-t border-border px-3 pb-3 pt-2.5">
-            {finding.body && (
-              <p className="whitespace-pre-wrap text-sm text-muted-foreground">{finding.body}</p>
-            )}
-            {finding.suggestion && (
-              <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-xs">
-                {finding.suggestion}
-              </pre>
-            )}
-            {finding.resources && finding.resources.length > 0 && (
-              <div className="mt-2">
-                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  Resources
-                </span>
-                <ul className="mt-1 flex flex-col gap-0.5">
-                  {finding.resources.map((url) => (
-                    <li key={url}>
-                      <a
-                        href={url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="break-all text-xs text-accent transition-colors hover:underline"
-                      >
-                        {url}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-        )}
+        <div className="border-t border-border px-3 pb-3 pt-2.5">
+          {finding.body && (
+            <p className="whitespace-pre-wrap text-sm text-muted-foreground">{finding.body}</p>
+          )}
+          {finding.suggestion && (
+            <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-xs">
+              {finding.suggestion}
+            </pre>
+          )}
+          {finding.resources && finding.resources.length > 0 && (
+            <div className="mt-2">
+              <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Resources
+              </span>
+              <ul className="mt-1 flex flex-col gap-0.5">
+                {finding.resources.map((url, index) => (
+                  // Static list that never reorders; index keeps the key unique when a URL repeats.
+                  // biome-ignore lint/suspicious/noArrayIndexKey: stable order, never reordered
+                  <li key={index}>
+                    <a
+                      href={url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="break-all text-xs text-accent transition-colors hover:underline"
+                    >
+                      {url}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
       </details>
     </li>
+  );
+}
+
+/** The shared collapsed header for a finding: severity chip · title · file:line. */
+function FindingHeader({ finding }: { finding: ReviewFinding }) {
+  return (
+    <>
+      <span
+        className={`rounded px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wide ${severityClass(finding.severity)}`}
+      >
+        {finding.severity}
+      </span>
+      <span className="text-sm font-medium">{finding.title}</span>
+      <span className="ml-auto font-mono text-xs text-muted-foreground">
+        {finding.file}:{finding.line}
+      </span>
+    </>
   );
 }
