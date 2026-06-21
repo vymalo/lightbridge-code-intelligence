@@ -1,6 +1,7 @@
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { CommandSnippet } from "@/components/command-snippet";
 import { ReviewOutput } from "@/components/review-output";
 import { RunLogs } from "@/components/run-logs";
 import { ApiErrorLine, StatusLine } from "@/components/states";
@@ -22,6 +23,11 @@ export const dynamic = "force-dynamic";
 
 // Task ids are UUIDs; reject malformed paths up front so we don't round-trip to the control plane.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Agents namespace the runner Jobs live in (mirrors the control plane's AGENT_NAMESPACE). */
+function agentsNamespace(): string {
+  return process.env.AGENT_NAMESPACE?.trim() || "lightbridge-agents";
+}
 
 export default async function RunDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -112,8 +118,12 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
           <CardTitle>Logs</CardTitle>
         </CardHeader>
         {task.job_name ? (
-          <CardBody>
+          <CardBody className="flex flex-col gap-3">
             <RunLogs taskId={task.id} />
+            <CommandSnippet
+              label="Or stream from your terminal:"
+              command={`kubectl -n ${agentsNamespace()} logs -f -l batch.kubernetes.io/job-name=${task.job_name}`}
+            />
           </CardBody>
         ) : (
           <StatusLine>Run logs will stream here once the dispatcher executes the task.</StatusLine>
