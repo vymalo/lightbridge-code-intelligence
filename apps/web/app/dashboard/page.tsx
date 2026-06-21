@@ -1,20 +1,13 @@
 import Link from "next/link";
+import { Insights } from "@/components/insights";
 import { RunRow } from "@/components/run-row";
 import { ApiErrorLine, EmptyState } from "@/components/states";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { listTasks } from "@/lib/api";
 import { githubAppInstallUrl } from "@/lib/config";
-import { type StatusVariant, statusVisual } from "@/lib/tasks";
 
 // Task state changes server-side; always render fresh.
 export const dynamic = "force-dynamic";
-
-const SUMMARY: { variant: StatusVariant; label: string }[] = [
-  { variant: "active", label: "Running" },
-  { variant: "pending", label: "Pending" },
-  { variant: "success", label: "Succeeded" },
-  { variant: "error", label: "Failed" },
-];
 
 export default async function Overview() {
   const result = await listTasks();
@@ -52,21 +45,7 @@ export default async function Overview() {
         </EmptyState>
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {SUMMARY.map(({ variant, label }) => {
-              const count = result.data.filter(
-                (t) => statusVisual(t.status).variant === variant,
-              ).length;
-              return (
-                <Card key={variant}>
-                  <CardBody>
-                    <div className="text-2xl font-semibold tabular-nums">{count}</div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">{label}</div>
-                  </CardBody>
-                </Card>
-              );
-            })}
-          </div>
+          <Insights tasks={result.data} now={now} />
 
           <Card>
             <CardHeader className="flex items-center justify-between">

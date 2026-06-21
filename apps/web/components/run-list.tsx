@@ -18,12 +18,27 @@ const FILTERS: { value: StatusVariant | "all"; label: string }[] = [
 ];
 
 type View = "timeline" | "table";
+type Filter = StatusVariant | "all";
+
+// Seed the status filter from a drill-through param (e.g. an Overview KPI links to ?status=success);
+// fall back to "all" for any unknown value.
+function normalizeStatus(value: string | undefined): Filter {
+  return FILTERS.some((f) => f.value === value) ? (value as Filter) : "all";
+}
 
 /** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024) —
  * all client-side over the fetched page. `now` is passed from the server so relative times don't
- * cause hydration drift. */
-export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
-  const [filter, setFilter] = useState<StatusVariant | "all">("all");
+ * cause hydration drift. `initialStatus` seeds the filter from the URL (KPI drill-through). */
+export function RunList({
+  tasks,
+  now,
+  initialStatus,
+}: {
+  tasks: Task[];
+  now: number;
+  initialStatus?: string;
+}) {
+  const [filter, setFilter] = useState<Filter>(() => normalizeStatus(initialStatus));
   const [repo, setRepo] = useState<string>("all");
   const [query, setQuery] = useState("");
   const [view, setView] = useState<View>("timeline");
