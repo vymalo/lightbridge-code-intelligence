@@ -49,10 +49,13 @@ export function CommandPalette({ admin, githubAppUrl }: { admin: boolean; github
       <button
         type="button"
         onClick={() => setOpen(true)}
+        aria-label="Search"
         className="flex h-7 items-center gap-2 rounded-md border border-border bg-background px-2 text-xs text-muted-foreground transition-colors hover:border-border-strong"
       >
         <Search className="size-3.5" />
         <span className="hidden sm:inline">Search</span>
+        {/* Decorative; the button's aria-label is its accessible name, so this kbd isn't announced
+            (and aria-hidden on it trips noAriaHiddenOnFocusable). */}
         <kbd className="ml-1 hidden rounded border border-border px-1 font-sans text-[10px] sm:inline">
           ⌘K
         </kbd>
@@ -118,8 +121,9 @@ export function CommandPalette({ admin, githubAppUrl }: { admin: boolean; github
             <Item
               value="open github app install"
               onSelect={() => {
-                setOpen(false);
+                // Open synchronously first so the user-gesture context isn't lost (popup blocker).
                 window.open(githubAppUrl, "_blank", "noopener,noreferrer");
+                setOpen(false);
               }}
             >
               <ExternalLink className="size-4" />

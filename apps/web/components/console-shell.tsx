@@ -39,7 +39,7 @@ export function ConsoleShell({
             </NavLink>
           </div>
           {/* Hairline separator between the primary group and the system/admin group. */}
-          <div className="mx-2.5 border-t border-border" />
+          <hr className="mx-2.5 border-border" />
           <div className="flex flex-col gap-0.5">
             {admin && (
               <NavLink href="/dashboard/admin" icon={<ShieldCheck className="size-4" />}>
