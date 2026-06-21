@@ -1,4 +1,4 @@
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ApiErrorLine, StatusLine } from "@/components/states";
@@ -9,8 +9,10 @@ import {
   absoluteTime,
   duration,
   repoLabel,
+  repoUrl,
   shortSha,
   statusVisual,
+  targetUrl,
   triggerLabel,
 } from "@/lib/tasks";
 
@@ -63,10 +65,10 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         </CardHeader>
         <CardBody>
           <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-            <Field label="Repository" value={repoLabel(task)} />
+            <Field label="Repository" value={repoLabel(task)} href={repoUrl(task)} />
             <Field label="Branch" value={task.repo_default_branch ?? "—"} />
-            <Field label="Trigger" value={triggerLabel(task)} />
-            <Field label="Delivery" value={task.github_delivery_id} mono />
+            <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task)} />
+            <Field label="Delivery" value={task.github_delivery_id ?? "—"} mono />
             <Field label="Base SHA" value={shortSha(task.base_sha) ?? "—"} mono />
             <Field label="Head SHA" value={shortSha(task.head_sha) ?? "—"} mono />
             <Field label="Created" value={absoluteTime(task.created_at)} />
@@ -116,11 +118,35 @@ function Shell({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Field({
+  label,
+  value,
+  mono,
+  href,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  href?: string | null;
+}) {
   return (
     <div>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className={`mt-0.5 break-all text-sm ${mono ? "font-mono" : ""}`}>{value}</dd>
+      <dd className={`mt-0.5 break-all text-sm ${mono ? "font-mono" : ""}`}>
+        {href ? (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-accent transition-colors hover:underline"
+          >
+            {value}
+            <ExternalLink className="size-3 shrink-0" />
+          </a>
+        ) : (
+          value
+        )}
+      </dd>
     </div>
   );
 }
