@@ -89,7 +89,7 @@ pub async fn run<L: TaskLauncher>(
     loop {
         drain(&pool, &launcher, &owner, &cfg).await;
 
-        // Wait for an enqueue notification, the reap tick, or the poll fallback — whichever fires.
+        // Wait for an enqueue notification, the reap tick, the poll fallback, or shutdown.
         tokio::select! {
             recv = listener.recv() => {
                 if let Err(error) = recv {
@@ -104,7 +104,42 @@ pub async fn run<L: TaskLauncher>(
                 }
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
+            // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so
+            // we never die mid-claim/launch leaving a task claimed-but-not-launched. In-flight Jobs
+            // keep running independently; the successor's reaper reconciles them.
+            _ = shutdown_signal() => {
+                tracing::info!(owner, "received shutdown signal; stopping dispatcher loop");
+                break;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Resolves on SIGTERM (Kubernetes pod termination) or Ctrl-C, for a clean dispatcher shutdown. We
+/// run on Linux/macOS; the non-Unix arm falls back to Ctrl-C so the code still compiles.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        // Can't install the handler — never resolve (the orchestrator's SIGKILL still stops us).
+        Err(error) => {
+            tracing::warn!(%error, "could not install SIGTERM handler");
+            return std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "could not install Ctrl-C handler");
+        std::future::pending::<()>().await;
     }
 }
 
