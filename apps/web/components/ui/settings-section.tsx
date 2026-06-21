@@ -14,10 +14,10 @@ export function SettingsSection({
 }) {
   return (
     <section className={cn("flex flex-col gap-2", className)}>
-      <h2 className="px-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+      <h2 className="px-1 text-xs font-medium uppercase tracking-wide text-base-content/60">
         {title}
       </h2>
-      <div className="divide-y divide-border rounded-card border border-border bg-surface">
+      <div className="divide-y divide-base-content/15 rounded-box border border-base-content/15 bg-base-200">
         {children}
       </div>
     </section>
@@ -41,9 +41,9 @@ export function SettingsRow({
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-3">
       <div className="min-w-0">
         <div className="text-sm font-medium">{label}</div>
-        {description && <div className="mt-0.5 text-xs text-muted-foreground">{description}</div>}
+        {description && <div className="mt-0.5 text-xs text-base-content/60">{description}</div>}
       </div>
-      <div className="shrink-0 text-sm text-muted-foreground">{control ?? children}</div>
+      <div className="shrink-0 text-sm text-base-content/60">{control ?? children}</div>
     </div>
   );
 }

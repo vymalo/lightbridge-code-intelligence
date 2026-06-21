@@ -84,7 +84,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
       </div>
 
       {isError && (
-        <Card className="border-[var(--status-error)]">
+        <Card className="border-error">
           <CardBody>
             <StatusLine tone="error">
               This run ended in a {statusVisual(task.status).label.toLowerCase()} state. Detailed
@@ -164,7 +164,7 @@ function Shell({ children }: { children: React.ReactNode }) {
     <div className="flex flex-col gap-5">
       <Link
         href="/dashboard/runs"
-        className="inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+        className="inline-flex w-fit items-center gap-1.5 text-sm text-base-content/60 transition-colors hover:text-base-content"
       >
         <ArrowLeft className="size-4" />
         Runs
@@ -187,14 +187,14 @@ function Field({
 }) {
   return (
     <div>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dt className="text-xs text-base-content/60">{label}</dt>
       <dd className={`mt-0.5 break-all text-sm ${mono ? "font-mono" : ""}`}>
         {href ? (
           <a
             href={href}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-accent transition-colors hover:underline"
+            className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
           >
             {value}
             <ExternalLink className="size-3 shrink-0" />

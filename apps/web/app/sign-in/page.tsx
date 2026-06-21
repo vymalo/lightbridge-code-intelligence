@@ -8,12 +8,12 @@ export default function SignInPage() {
       <Card>
         <CardBody className="flex flex-col gap-4 p-6">
           <div className="flex items-center gap-2.5">
-            <span className="flex size-7 items-center justify-center rounded-md bg-accent text-sm font-semibold text-accent-foreground">
+            <span className="flex size-7 items-center justify-center rounded-md bg-primary text-sm font-semibold text-primary-content">
               L
             </span>
             <h1 className="text-lg font-medium tracking-tight">Sign in</h1>
           </div>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-sm text-base-content/60">
             Authentication is handled by Keycloak (OIDC). You'll be redirected to sign in, then
             returned here — the app manages no credentials of its own (see ADR-0014).
           </p>

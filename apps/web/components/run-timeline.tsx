@@ -19,12 +19,12 @@ export function RunTimeline({ tasks, now }: { tasks: Task[]; now: number }) {
     <div className="flex flex-col">
       {groups.map((group) => (
         <section key={group.key}>
-          <h3 className="sticky top-0 z-10 bg-surface/95 px-4 py-2 text-xs font-medium text-muted-foreground backdrop-blur">
+          <h3 className="sticky top-0 z-10 bg-base-200/95 px-4 py-2 text-xs font-medium text-base-content/60 backdrop-blur">
             {group.label}
           </h3>
           {/* Thin rail to the left of the day's runs (depth via border, not shadow — ADR-0015). */}
-          <div className="ml-5 border-l border-border">
-            <div className="divide-y divide-border">
+          <div className="ml-5 border-l border-base-content/15">
+            <div className="divide-y divide-base-content/15">
               {group.tasks.map((task) => (
                 <RunRow key={task.id} task={task} now={now} />
               ))}

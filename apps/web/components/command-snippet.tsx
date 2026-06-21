@@ -11,8 +11,8 @@ export function CommandSnippet({ command, label }: { command: string; label?: st
 
   return (
     <div className="flex flex-col gap-1.5">
-      {label && <span className="text-xs text-muted-foreground">{label}</span>}
-      <div className="flex items-center gap-2 rounded-md border border-border bg-base-200 px-2.5 py-1.5">
+      {label && <span className="text-xs text-base-content/60">{label}</span>}
+      <div className="flex items-center gap-2 rounded-md border border-base-content/15 bg-base-200 px-2.5 py-1.5">
         <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs">
           {command}
         </code>

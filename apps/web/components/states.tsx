@@ -19,7 +19,7 @@ export function EmptyState({
   return (
     <div className="flex min-h-[40dvh] flex-col items-center justify-center gap-3 text-center">
       <h2 className="text-base font-medium">{title}</h2>
-      <p className="max-w-md text-sm text-muted-foreground">{children}</p>
+      <p className="max-w-md text-sm text-base-content/60">{children}</p>
       {action && <div className="mt-1">{action}</div>}
     </div>
   );
@@ -34,9 +34,7 @@ export function StatusLine({
   children: ReactNode;
 }) {
   return (
-    <p
-      className={`px-4 py-3 text-sm ${tone === "error" ? "text-[var(--status-error)]" : "text-muted-foreground"}`}
-    >
+    <p className={`px-4 py-3 text-sm ${tone === "error" ? "text-error" : "text-base-content/60"}`}>
       {children}
     </p>
   );

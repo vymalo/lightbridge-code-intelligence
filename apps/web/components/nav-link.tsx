@@ -26,8 +26,8 @@ export function NavLink({
       className={cn(
         "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors",
         active
-          ? "bg-muted font-medium text-foreground"
-          : "text-muted-foreground hover:bg-muted hover:text-foreground",
+          ? "bg-base-300 font-medium text-base-content"
+          : "text-base-content/60 hover:bg-base-300 hover:text-base-content",
       )}
     >
       <span className="flex size-4 items-center justify-center text-current">{icon}</span>

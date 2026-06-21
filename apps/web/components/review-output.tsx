@@ -1,22 +1,23 @@
 import { ChevronRight, ExternalLink } from "lucide-react";
+import { cn } from "@/lib/cn";
 import type { Review, ReviewFinding } from "@/lib/tasks";
 
-/** Severity → chip tone. Unknown severities fall back to a neutral chip. */
-function severityClass(severity: string): string {
+/** Severity → daisyUI badge color. Unknown severities fall back to a neutral (ghost) chip. */
+function severityBadge(severity: string): string {
   switch (severity.toLowerCase()) {
     case "critical":
     case "error":
-      return "bg-[var(--status-error)]/15 text-[var(--status-error)]";
+      return "badge-error";
     case "high":
     case "warning":
     case "warn":
-      return "bg-amber-500/15 text-amber-600 dark:text-amber-400";
+      return "badge-warning";
     case "medium":
     case "low":
     case "info":
-      return "bg-blue-500/15 text-blue-600 dark:text-blue-400";
+      return "badge-info";
     default:
-      return "bg-muted text-muted-foreground";
+      return "badge-ghost";
   }
 }
 
@@ -33,13 +34,13 @@ export function ReviewOutput({ review }: { review: Review }) {
     <div className="flex flex-col gap-4">
       {review.summary && <p className="text-sm leading-relaxed">{review.summary}</p>}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs text-muted-foreground">{counts.join(" · ")}</p>
+        <p className="text-xs text-base-content/60">{counts.join(" · ")}</p>
         {review.review_url && (
           <a
             href={review.review_url}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-xs text-accent transition-colors hover:underline"
+            className="inline-flex items-center gap-1 text-xs text-primary transition-colors hover:underline"
           >
             View on GitHub
             <ExternalLink className="size-3 shrink-0" />
@@ -72,7 +73,7 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
   if (!hasDetail) {
     return (
       <li>
-        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border p-3">
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-base-content/15 p-3">
           <FindingHeader finding={finding} />
         </div>
       </li>
@@ -81,23 +82,23 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
 
   return (
     <li>
-      <details open={defaultOpen} className="group rounded-md border border-border">
+      <details open={defaultOpen} className="group rounded-md border border-base-content/15">
         <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 p-3 [&::-webkit-details-marker]:hidden">
-          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+          <ChevronRight className="size-3.5 shrink-0 text-base-content/60 transition-transform group-open:rotate-90" />
           <FindingHeader finding={finding} />
         </summary>
-        <div className="border-t border-border px-3 pb-3 pt-2.5">
+        <div className="border-t border-base-content/15 px-3 pb-3 pt-2.5">
           {finding.body && (
-            <p className="whitespace-pre-wrap text-sm text-muted-foreground">{finding.body}</p>
+            <p className="whitespace-pre-wrap text-sm text-base-content/60">{finding.body}</p>
           )}
           {finding.suggestion && (
-            <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-xs">
+            <pre className="mt-2 overflow-x-auto rounded bg-base-300 p-2 font-mono text-xs">
               {finding.suggestion}
             </pre>
           )}
           {finding.resources && finding.resources.length > 0 && (
             <div className="mt-2">
-              <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              <span className="text-[11px] font-medium uppercase tracking-wide text-base-content/60">
                 Resources
               </span>
               <ul className="mt-1 flex flex-col gap-0.5">
@@ -109,7 +110,7 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
                       href={url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="break-all text-xs text-accent transition-colors hover:underline"
+                      className="break-all text-xs text-primary transition-colors hover:underline"
                     >
                       {url}
                     </a>
@@ -129,12 +130,15 @@ function FindingHeader({ finding }: { finding: ReviewFinding }) {
   return (
     <>
       <span
-        className={`rounded px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wide ${severityClass(finding.severity)}`}
+        className={cn(
+          "badge badge-soft badge-xs font-medium uppercase tracking-wide",
+          severityBadge(finding.severity),
+        )}
       >
         {finding.severity}
       </span>
       <span className="text-sm font-medium">{finding.title}</span>
-      <span className="ml-auto font-mono text-xs text-muted-foreground">
+      <span className="ml-auto font-mono text-xs text-base-content/60">
         {finding.file}:{finding.line}
       </span>
     </>

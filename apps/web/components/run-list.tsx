@@ -8,6 +8,7 @@ import { RunTimeline } from "@/components/run-timeline";
 import { StatusLine } from "@/components/states";
 import { SearchInput } from "@/components/ui/search-input";
 import { cn } from "@/lib/cn";
+import { useLocalStorageState } from "@/lib/hooks/use-local-storage-state";
 import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/tasks";
 
 const FILTER_VALUES = ["all", "active", "pending", "success", "error", "muted"] as const;
@@ -21,10 +22,13 @@ const FILTERS: { value: (typeof FILTER_VALUES)[number]; label: string }[] = [
 ];
 
 const VIEW_VALUES = ["timeline", "table"] as const;
+type View = (typeof VIEW_VALUES)[number];
+const isView = (value: string): value is View => (VIEW_VALUES as readonly string[]).includes(value);
 
 /** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024,
- * daisyUI in ADR-0027). All state lives in the URL via nuqs (shareable/bookmarkable); `now` is
- * server-passed so relative times don't drift on hydration. Filtering is client-side over the page. */
+ * daisyUI in ADR-0027). Filters/search/page live in the URL via nuqs (shareable/bookmarkable); the
+ * view toggle is a personal preference, so it persists to localStorage instead. `now` is server-passed
+ * so relative times don't drift on hydration. Filtering is client-side over the page. */
 export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
   const [filter, setFilter] = useQueryState(
     "status",
@@ -32,10 +36,7 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
   );
   const [repo, setRepo] = useQueryState("repo", { defaultValue: "all", clearOnDefault: true });
   const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
-  const [view, setView] = useQueryState(
-    "view",
-    parseAsStringLiteral(VIEW_VALUES).withDefault("timeline"),
-  );
+  const [view, setView] = useLocalStorageState<View>("lci.runs.view", "timeline", isView);
   const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
 
   // Repos present in this page, for the repo filter dropdown.
@@ -58,8 +59,8 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
   const resetPage = () => setPage(null);
 
   return (
-    <div className="overflow-hidden rounded-box border border-border bg-base-200">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2.5">
+    <div className="overflow-hidden rounded-box border border-base-content/15 bg-base-200">
+      <div className="flex flex-wrap items-center gap-2 border-b border-base-content/15 px-3 py-2.5">
         <div className="join">
           {FILTERS.map((f) => (
             <button

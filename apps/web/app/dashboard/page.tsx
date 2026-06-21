@@ -18,7 +18,7 @@ export default async function Overview() {
     <div className="flex flex-col gap-6">
       <div>
         <h1 className="text-lg font-medium tracking-tight">Overview</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-base-content/60">
           Task runs across your connected repositories.
         </p>
       </div>
@@ -53,12 +53,12 @@ export default async function Overview() {
               <CardTitle>Recent runs</CardTitle>
               <Link
                 href="/dashboard/runs"
-                className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+                className="text-xs text-base-content/60 underline-offset-2 hover:underline"
               >
                 View all
               </Link>
             </CardHeader>
-            <div className="divide-y divide-border">
+            <div className="divide-y divide-base-content/15">
               {result.data.slice(0, 8).map((task) => (
                 <RunRow key={task.id} task={task} now={now} />
               ))}

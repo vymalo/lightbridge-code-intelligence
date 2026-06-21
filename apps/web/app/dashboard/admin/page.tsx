@@ -35,7 +35,7 @@ export default async function AdminPage() {
     <div className="flex flex-col gap-5">
       <div>
         <h1 className="text-lg font-medium tracking-tight">Repository approvals</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-base-content/60">
           Newly added repositories stay pending until approved — only then are they indexed or
           reviewed. Decisions are reversible: deny an approved repo to take it back out of scope, or
           approve a denied one to bring it in (re-approving re-indexes it).
@@ -108,7 +108,7 @@ function Section({
       {repos.length === 0 ? (
         <StatusLine>{empty}</StatusLine>
       ) : (
-        <ul className="divide-y divide-border">
+        <ul className="divide-y divide-base-content/15">
           {repos.map((repo) => (
             <RepoRow key={repo.id} repo={repo} canApprove={canApprove} canDeny={canDeny} />
           ))}
@@ -132,7 +132,7 @@ function RepoRow({
     <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
       <div className="min-w-0">
         <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
-        <div className="mt-0.5 font-mono text-xs text-muted-foreground">
+        <div className="mt-0.5 font-mono text-xs text-base-content/60">
           github id {repo.github_repo_id}
         </div>
       </div>
