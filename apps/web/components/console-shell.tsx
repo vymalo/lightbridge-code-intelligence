@@ -1,10 +1,19 @@
-import { GitPullRequest, LayoutGrid, ListChecks, Settings } from "lucide-react";
+import { GitPullRequest, LayoutGrid, ListChecks, Settings, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { NavLink } from "@/components/nav-link";
 
-/** The console chrome (ADR-0016): a left sidebar nav + a slim top bar around contained content. */
-export function ConsoleShell({ user, children }: { user: string; children: ReactNode }) {
+/** The console chrome (ADR-0016): a left sidebar nav + a slim top bar around contained content.
+ * `admin` reveals the approval screen's nav entry (Epic #75) — the control plane still enforces it. */
+export function ConsoleShell({
+  user,
+  admin,
+  children,
+}: {
+  user: string;
+  admin?: boolean;
+  children: ReactNode;
+}) {
   return (
     <div className="grid min-h-dvh grid-cols-[15rem_1fr] max-md:grid-cols-1">
       <aside className="flex flex-col gap-6 border-r border-border bg-surface px-3 py-4 max-md:hidden">
@@ -24,6 +33,11 @@ export function ConsoleShell({ user, children }: { user: string; children: React
           <NavLink href="/dashboard/repositories" icon={<GitPullRequest className="size-4" />}>
             Repositories
           </NavLink>
+          {admin && (
+            <NavLink href="/dashboard/admin" icon={<ShieldCheck className="size-4" />}>
+              Approvals
+            </NavLink>
+          )}
           <NavLink href="/dashboard/settings" icon={<Settings className="size-4" />}>
             Settings
           </NavLink>

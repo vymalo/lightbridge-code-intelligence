@@ -8,6 +8,8 @@ export interface SessionClaims {
   email?: string;
   preferred_username?: string;
   name?: string;
+  /** Keycloak realm roles, used for the admin gate (Epic #75). Absent for non-Keycloak IdPs. */
+  realm_access?: { roles?: string[] };
   /** Expiry, unix seconds. */
   exp: number;
 }
