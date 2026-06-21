@@ -10,6 +10,8 @@ export function CommandSnippet({ command, label }: { command: string; label?: st
 
   const copy = async () => {
     try {
+      // navigator.clipboard is undefined in insecure contexts / older browsers.
+      if (!navigator?.clipboard) return;
       await navigator.clipboard.writeText(command);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);

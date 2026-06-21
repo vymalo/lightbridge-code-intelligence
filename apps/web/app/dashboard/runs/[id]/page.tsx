@@ -24,9 +24,16 @@ export const dynamic = "force-dynamic";
 // Task ids are UUIDs; reject malformed paths up front so we don't round-trip to the control plane.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Agents namespace the runner Jobs live in (mirrors the control plane's AGENT_NAMESPACE). */
+// A safe Kubernetes resource name (DNS-label-ish). Used to validate values before they go into the
+// copyable shell command, so a quirky job name / namespace can't smuggle shell metacharacters
+// (pastejacking) into a command a user might paste.
+const K8S_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/i;
+
+/** Agents namespace the runner Jobs live in (mirrors the control plane's AGENT_NAMESPACE); falls
+ * back to the default if the env is unset or not a valid k8s name. */
 function agentsNamespace(): string {
-  return process.env.AGENT_NAMESPACE?.trim() || "lightbridge-agents";
+  const ns = process.env.AGENT_NAMESPACE?.trim() || "lightbridge-agents";
+  return K8S_NAME_RE.test(ns) ? ns : "lightbridge-agents";
 }
 
 export default async function RunDetail({ params }: { params: Promise<{ id: string }> }) {
@@ -120,10 +127,12 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         {task.job_name ? (
           <CardBody className="flex flex-col gap-3">
             <RunLogs taskId={task.id} />
-            <CommandSnippet
-              label="Or stream from your terminal:"
-              command={`kubectl -n ${agentsNamespace()} logs -f -l batch.kubernetes.io/job-name=${task.job_name}`}
-            />
+            {K8S_NAME_RE.test(task.job_name) && (
+              <CommandSnippet
+                label="Or stream from your terminal:"
+                command={`kubectl -n ${agentsNamespace()} logs -f -l batch.kubernetes.io/job-name=${task.job_name}`}
+              />
+            )}
           </CardBody>
         ) : (
           <StatusLine>Run logs will stream here once the dispatcher executes the task.</StatusLine>
