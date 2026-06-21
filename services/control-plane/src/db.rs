@@ -43,6 +43,62 @@ pub async fn connect_from_env() -> anyhow::Result<Option<PgPool>> {
     Ok(Some(pool))
 }
 
+/// Reconcile the `code_chunks.embedding` column width to the configured `dimension` (ADR-0018). The
+/// pgvector column is a fixed-width `vector(N)`, so changing the embedding model's dimension is
+/// **destructive** — every stored vector is the wrong width. No-op when the column already matches
+/// (or isn't present / has no fixed dim). On a mismatch: if `allow_clear`, **TRUNCATE `code_chunks`
+/// and ALTER the column** to the new width; else return `Err` (fail loud) so a config typo can't
+/// silently wipe the semantic index. Idempotent + safe to run from each role at startup.
+pub async fn reconcile_embedding_dimension(
+    pool: &PgPool,
+    dimension: i64,
+    allow_clear: bool,
+) -> anyhow::Result<()> {
+    use anyhow::bail;
+    // pgvector stores the dimension in the column's `atttypmod` (== N for `vector(N)`, -1 if none).
+    // `to_regclass` resolves the table via the active search_path and yields NULL (→ no row) when it
+    // doesn't exist, so this is schema-safe and a no-op before the table is created.
+    let current: Option<i32> = sqlx::query_scalar(
+        "SELECT atttypmod FROM pg_attribute \
+         WHERE attrelid = to_regclass('code_chunks') AND attname = 'embedding' AND NOT attisdropped",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(current) = current.filter(|&m| m > 0).map(i64::from) else {
+        return Ok(()); // no code_chunks/embedding column or no fixed dimension yet — nothing to do
+    };
+    if current == dimension {
+        return Ok(());
+    }
+    if !allow_clear {
+        bail!(
+            "embedding dimension changed ({current} → {dimension}) but \
+             embeddings.allow_reindex_on_dim_change is false; refusing to wipe code_chunks. \
+             Set the flag to reindex from scratch, or revert the dimension."
+        );
+    }
+    tracing::warn!(
+        from = current,
+        to = dimension,
+        "embedding dimension changed; TRUNCATE code_chunks + ALTER column (reindex from scratch)"
+    );
+    // Atomic: TRUNCATE + ALTER in one transaction so a failed ALTER can't leave the table truncated
+    // but still at the old width (an inconsistent state the next startup wouldn't detect).
+    let mut tx = pool.begin().await?;
+    sqlx::query("TRUNCATE TABLE code_chunks")
+        .execute(&mut *tx)
+        .await?;
+    // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
+    // safe; the vector type width can't be a bind parameter.
+    sqlx::query(&format!(
+        "ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector({dimension})"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Persist a GitHub delivery, using its `delivery_id` PRIMARY KEY for exactly-once handling.
 /// Returns `true` if the delivery is new (inserted), `false` if it was already seen (duplicate).
 pub async fn record_delivery(
@@ -712,6 +768,46 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_none(), "the claimed task is no longer queued");
+    }
+
+    /// Embedding-dimension reconcile: same dim → no-op; a change without the flag fails loud; with the
+    /// flag it wipes + migrates the column to the new width.
+    async fn embedding_dim(pool: &PgPool) -> i32 {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'code_chunks' AND a.attname = 'embedding' AND NOT a.attisdropped",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn reconcile_embedding_dimension_guards_and_migrates(pool: PgPool) {
+        // Migrations create code_chunks.embedding as vector(4096) (ADR-0018).
+        assert_eq!(embedding_dim(&pool).await, 4096);
+
+        // Same dimension → no-op.
+        reconcile_embedding_dimension(&pool, 4096, false)
+            .await
+            .unwrap();
+        assert_eq!(embedding_dim(&pool).await, 4096);
+
+        // A change without the flag fails loud (no destruction).
+        assert!(reconcile_embedding_dimension(&pool, 1536, false)
+            .await
+            .is_err());
+        assert_eq!(
+            embedding_dim(&pool).await,
+            4096,
+            "column untouched when not allowed"
+        );
+
+        // With the flag, the column migrates to the new width.
+        reconcile_embedding_dimension(&pool, 1536, true)
+            .await
+            .unwrap();
+        assert_eq!(embedding_dim(&pool).await, 1536);
     }
 
     /// `cancel_active_tasks_for_pr` cancels a PR's active task; `next_run_epoch` bumps so a manual

@@ -76,15 +76,31 @@ pub struct AppState {
 impl AppState {
     async fn from_env() -> anyhow::Result<Self> {
         let metrics = metrics::install();
-        // The file config is optional (ConfigMap-mounted); the `review` section drives PR feedback.
-        let review = config::load_file_config()
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "invalid control-plane config file; using defaults");
-                None
-            })
-            .map(|f| f.review)
+        // The file config is optional (ConfigMap-mounted): `review` drives PR feedback, `embeddings`
+        // guards the vector column's dimension.
+        let file_config = config::load_file_config().unwrap_or_else(|error| {
+            tracing::error!(%error, "invalid control-plane config file; using defaults");
+            None
+        });
+        let review = file_config
+            .as_ref()
+            .map(|f| f.review.clone())
+            .unwrap_or_default();
+        let embeddings = file_config
+            .as_ref()
+            .map(|f| f.embeddings.clone())
             .unwrap_or_default();
         let db = db::connect_from_env().await?;
+        // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
+        // reindex-from-scratch (when allowed) or fail loud — never silently mismatch.
+        if let (Some(pool), Some(dimension)) = (db.as_ref(), embeddings.dimension) {
+            db::reconcile_embedding_dimension(
+                pool,
+                dimension,
+                embeddings.allow_reindex_on_dim_change,
+            )
+            .await?;
+        }
         let neo4j = match neo4j::connect_from_env().await {
             Ok(handle) => handle.map(Arc::new),
             // A graph store outage shouldn't stop the control plane from serving everything else;

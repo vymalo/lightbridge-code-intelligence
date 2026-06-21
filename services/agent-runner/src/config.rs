@@ -46,6 +46,15 @@ pub struct ReviewFile {
     pub system_prompt_file: Option<String>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_diff_chars: Option<usize>,
+    /// Generation params for the review model, passed through to opencode.json (the OpenAI-compatible
+    /// provider). All optional — unset means the model/provider default. Numeric-string tolerant so
+    /// `{env:…}`-substituted values (always strings) still deserialize.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    pub temperature: Option<f64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    pub top_p: Option<f64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    pub max_tokens: Option<i64>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -147,6 +156,10 @@ pub struct ReviewConfig {
     pub system_prompt: Option<String>,
     /// Ceiling on the diff pasted into the prompt; from `review.max_diff_chars` or the default.
     pub max_diff_chars: usize,
+    /// Generation params for the review model (→ opencode.json). `None` = provider/model default.
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<i64>,
 }
 
 impl ReviewConfig {
@@ -168,6 +181,9 @@ impl ReviewConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
         }))
     }
 
@@ -198,6 +214,9 @@ impl ReviewConfig {
             model: require_field("review", "model", &r.model)?,
             system_prompt,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
+            temperature: r.temperature,
+            top_p: r.top_p,
+            max_tokens: r.max_tokens,
         }))
     }
 }
