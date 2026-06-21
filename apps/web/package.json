@@ -9,6 +9,7 @@
     "lint": "biome check ."
   },
   "dependencies": {
+    "@kubernetes/client-node": "^1.0.0",
     "@lightbridge/auth": "workspace:*",
     "clsx": "^2.1.1",
     "jose": "^5.9.6",

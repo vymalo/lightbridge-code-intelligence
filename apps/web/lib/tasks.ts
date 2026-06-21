@@ -23,6 +23,9 @@ export interface Task {
   repo_owner: string | null;
   repo_name: string | null;
   repo_default_branch: string | null;
+  /** The dispatched Kubernetes Job name, used to stream the run's logs. `null` before dispatch or
+   * after the Job is cleaned up. */
+  job_name: string | null;
 }
 
 /** One finding from the agent's review (mirrors `review::Finding`). */

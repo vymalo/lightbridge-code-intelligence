@@ -2,6 +2,7 @@ import { ArrowLeft, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ReviewOutput } from "@/components/review-output";
+import { RunLogs } from "@/components/run-logs";
 import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusPill } from "@/components/ui/status-pill";
@@ -110,7 +111,13 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         <CardHeader>
           <CardTitle>Logs</CardTitle>
         </CardHeader>
-        <StatusLine>Run logs will stream here once the dispatcher executes the task.</StatusLine>
+        {task.job_name ? (
+          <CardBody>
+            <RunLogs taskId={task.id} />
+          </CardBody>
+        ) : (
+          <StatusLine>Run logs will stream here once the dispatcher executes the task.</StatusLine>
+        )}
       </Card>
     </Shell>
   );
