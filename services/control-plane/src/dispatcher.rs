@@ -77,6 +77,7 @@ pub async fn run<L: TaskLauncher>(
     launcher: L,
     owner: String,
     cfg: DispatcherConfig,
+    neo4j: Option<std::sync::Arc<neo4rs::Graph>>,
 ) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen(db::TASK_QUEUED_CHANNEL).await?;
@@ -102,6 +103,8 @@ pub async fn run<L: TaskLauncher>(
                 if let Err(error) = reaper::reap_once(&pool, &launcher).await {
                     tracing::error!(%error, "reaper cycle failed");
                 }
+                // Durable backstop for repo data purge (a spawned purge can be lost on restart).
+                crate::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
             // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so
