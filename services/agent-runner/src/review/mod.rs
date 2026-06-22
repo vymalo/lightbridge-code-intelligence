@@ -11,6 +11,7 @@
 //! servers from a project `opencode.json` (`opencode mcp list` → `✓ connected`).
 
 mod config;
+pub mod native;
 mod parse;
 
 pub use config::opencode_config;
