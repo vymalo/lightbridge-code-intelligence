@@ -255,6 +255,8 @@ fn app(state: AppState) -> Router {
         )
         // The structured review → validated GitHub PR review (slice 6).
         .route("/internal/tasks/{id}/review", post(internal::post_review))
+        // An `ask` run's conversational answer → a single reply comment (ADR-0033).
+        .route("/internal/tasks/{id}/answer", post(internal::post_answer))
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }

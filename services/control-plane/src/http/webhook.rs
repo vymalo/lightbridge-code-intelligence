@@ -133,6 +133,32 @@ fn parse_instruction(body: &str, handle: &str) -> Option<String> {
     Some(instruction.chars().take(MAX_INSTRUCTION_CHARS).collect())
 }
 
+/// Resolve the run kind (ADR-0033) from a parsed instruction: an explicit review request →
+/// `"review"`, any other free text (a question) → `"ask"`. A bare `@mention` (no instruction) is a
+/// plain `"review"` handled by the caller.
+///
+/// This is the cheap keyword heuristic the ADR calls for; the model is the intended tie-breaker for
+/// genuinely ambiguous text (future work). We deliberately match only *unambiguous* review verbs
+/// (`review`/`audit`/`recheck`/`lgtm`) and leave softer words like "check"/"look at" to fall through
+/// to `ask`, so a question such as "can you check why this panics?" is answered, not diff-reviewed —
+/// the exact failure mode from ai-helm#436.
+fn classify_kind(instruction: &str) -> &'static str {
+    let lower = instruction.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "review" {
+        return "review";
+    }
+    // Tokenize on non-alphanumeric so "re-review", "review!", and "review this" all match; a
+    // `review`-prefix also catches "reviewing"/"reviewed".
+    let asks_for_review = lower.split(|c: char| !c.is_alphanumeric()).any(|tok| {
+        tok.starts_with("review") || matches!(tok, "rereview" | "recheck" | "audit" | "lgtm")
+    });
+    if asks_for_review {
+        "review"
+    } else {
+        "ask"
+    }
+}
+
 /// `pull_request` events. `opened` → the automatic first review. `closed` → cancel the PR's active
 /// tasks (the reaper then stops their Jobs). `synchronize`/`reopened` do nothing — a re-review is
 /// requested with an `@<handle>` comment ([`handle_issue_comment`]).
@@ -198,6 +224,7 @@ async fn handle_pull_request(
                 target_type: "pull_request".to_string(),
                 target_id: pr_number,
                 command_text: "review".to_string(),
+                kind: "review".to_string(), // an auto-opened PR is always a diff-scoped review
                 base_sha: pr["base"]["sha"].as_str().map(str::to_string),
                 head_sha: pr["head"]["sha"].as_str().map(str::to_string),
                 run_epoch: 0, // the automatic first review
@@ -320,21 +347,25 @@ async fn handle_issue_comment(
     )
     .await
     .unwrap_or(0);
+    // Carry the user's free-text instruction into the task → prompt (#138); a bare @mention defaults
+    // to a plain review. The instruction also resolves the run kind (ADR-0033): a question becomes an
+    // `ask` (answered as a reply comment) rather than being forced through a diff-scoped review.
+    let instruction = parse_instruction(body, &state.app_handle);
+    let kind = instruction.as_deref().map_or("review", classify_kind);
+    let command_text = instruction.unwrap_or_else(|| "review".to_string());
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
         github_delivery_id: delivery_id.to_string(),
         target_type: "pull_request".to_string(),
         target_id: pr_number,
-        // Carry the user's free-text instruction into the task → prompt (#138); a bare @mention
-        // defaults to a plain review.
-        command_text: parse_instruction(body, &state.app_handle)
-            .unwrap_or_else(|| "review".to_string()),
+        command_text,
+        kind: kind.to_string(),
         base_sha,
         head_sha,
         run_epoch,
     };
-    tracing::info!(delivery_id, pr = pr_number, "@mention re-review requested");
+    tracing::info!(delivery_id, pr = pr_number, kind, "@mention requested");
     create_review_task(state, pool, task, owner, name, delivery_id).await;
 }
 
@@ -640,6 +671,27 @@ mod tests {
         );
         // Non-ASCII immediately after `@` must not panic the slice.
         assert_eq!(parse_instruction("@日本語 hello", h), None);
+    }
+
+    #[test]
+    fn classify_kind_routes_questions_to_ask_and_review_requests_to_review() {
+        // Explicit review requests → review.
+        assert_eq!(classify_kind("review"), "review");
+        assert_eq!(classify_kind("please re-review the auth path"), "review");
+        assert_eq!(classify_kind("Re-review this"), "review");
+        assert_eq!(classify_kind("audit the new endpoint"), "review");
+        assert_eq!(classify_kind("reviewing again after my fix"), "review");
+        assert_eq!(classify_kind("lgtm? do a final review"), "review");
+
+        // Free-text questions → ask (the ai-helm#436 class).
+        assert_eq!(
+            classify_kind("can you propose a better implementation?"),
+            "ask"
+        );
+        assert_eq!(classify_kind("why does this use a mutex here?"), "ask");
+        assert_eq!(classify_kind("explain the retry logic"), "ask");
+        // Soft verbs that aren't unambiguous review commands fall through to ask.
+        assert_eq!(classify_kind("can you check why this panics?"), "ask");
     }
 
     #[test]

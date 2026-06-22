@@ -12,12 +12,12 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams};
-use super::tools::{tool_defs, ToolOutcome, Tools};
+use super::tools::{ask_tool_defs, tool_defs, ToolOutcome, Tools};
 use crate::bootstrap::client::ControlPlaneClient;
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
-use crate::review::{ReviewResult, DEFAULT_REVIEW_GUIDANCE};
+use crate::review::{ReviewResult, DEFAULT_ASK_GUIDANCE, DEFAULT_REVIEW_GUIDANCE};
 
 /// Hard ceiling on model turns, so a model that never submits can't loop forever (each turn is one
 /// chat round-trip; tool calls within a turn don't count separately).
@@ -96,11 +96,128 @@ pub async fn run_native_review(
                 ToolOutcome::Continue(result) => {
                     messages.push(ChatMessage::tool(call.id.as_str(), result));
                 }
+                // `submit_answer` isn't advertised for a review, but guard the shared dispatch: steer
+                // the model back to the review contract rather than ending the run.
+                ToolOutcome::Answer(_) => messages.push(ChatMessage::tool(
+                    call.id.as_str(),
+                    "This is a review run — call `submit_findings`, not `submit_answer`."
+                        .to_string(),
+                )),
             }
         }
     }
 
     anyhow::bail!("review agent did not submit findings within {MAX_TURNS} turns")
+}
+
+/// The native **ask** contract (ADR-0033): the analogue of [`NATIVE_CONTRACT`] for a conversational
+/// answer. The run ends when the model calls `submit_answer`. Appended after the ask guidance.
+const ASK_CONTRACT: &str = "\
+Answer the user's question about this pull request and the codebase. Investigate with the \
+search/graph tools before answering — ground every claim in what you find; you may not edit files \
+or run commands.\n\
+- Lead with the answer, then the why. Be direct and concrete; GitHub-flavored Markdown, short code \
+blocks where they help.\n\
+- When you propose a change, show the concrete code — you are advising, not committing it.\n\
+- When you have the answer, call `submit_answer` exactly once with your full Markdown reply. Do not \
+answer in prose outside the tool.\n\
+- If you genuinely cannot answer, call `abort` with a reason.";
+
+/// Run the native **ask** loop (ADR-0033) and return the Markdown answer the model submits. Mirrors
+/// [`run_native_review`] but over the `ask` tool surface ([`ask_tool_defs`]) — the run ends with a
+/// conversational answer instead of findings.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_native_ask(
+    review: &ReviewConfig,
+    question: &str,
+    diff: Option<&PrDiff>,
+    attribution: &[(String, String)],
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    task_id: Uuid,
+) -> anyhow::Result<String> {
+    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
+        .with_attribution(attribution);
+    let tools = Tools {
+        client,
+        embedder,
+        task_id,
+    };
+    let defs = ask_tool_defs();
+    let params = ChatParams {
+        temperature: review.temperature,
+        top_p: review.top_p,
+        max_tokens: review.max_tokens,
+    };
+
+    let mut messages = build_ask_messages(review, question, diff);
+
+    for turn in 0..MAX_TURNS {
+        let completion = chat
+            .complete(&messages, &defs, params)
+            .await
+            .with_context(|| format!("ask chat turn {turn}"))?;
+        let assistant = completion.message;
+        let calls = assistant.tool_calls.clone();
+        messages.push(assistant);
+
+        if calls.is_empty() {
+            messages.push(ChatMessage::user(
+                "Use the provided tools to investigate, then call `submit_answer` with your \
+                 Markdown answer (or `abort` with a reason). Do not reply in prose.",
+            ));
+            continue;
+        }
+
+        for call in &calls {
+            match tools.dispatch(call).await {
+                ToolOutcome::Answer(answer) => return Ok(answer),
+                ToolOutcome::Abort(reason) => anyhow::bail!("ask agent aborted: {reason}"),
+                ToolOutcome::Continue(result) => {
+                    messages.push(ChatMessage::tool(call.id.as_str(), result));
+                }
+                // `submit_findings` isn't advertised for an ask; steer back to `submit_answer`.
+                ToolOutcome::Submit(_) => messages.push(ChatMessage::tool(
+                    call.id.as_str(),
+                    "This is an ask run — call `submit_answer`, not `submit_findings`.".to_string(),
+                )),
+            }
+        }
+    }
+
+    anyhow::bail!("ask agent did not submit an answer within {MAX_TURNS} turns")
+}
+
+/// Assemble the system (ask guidance + contract) and user (question + diff as context) messages for
+/// an ask run. The diff, when present, is supplied as context to ground the answer — there is no
+/// scope rule (an answer isn't pinned to diff lines).
+fn build_ask_messages(
+    review: &ReviewConfig,
+    question: &str,
+    diff: Option<&PrDiff>,
+) -> Vec<ChatMessage> {
+    let system = format!("{DEFAULT_ASK_GUIDANCE}\n\n{ASK_CONTRACT}");
+
+    let mut user = format!("The user asked: {question}");
+    if let Some(pr) = diff {
+        user.push_str(&format!(
+            "\n\nFor context, this pull request changes {} file(s):\n{}",
+            pr.files.len(),
+            pr.files
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        user.push_str("\n\nUnified diff (context for your answer):\n```diff\n");
+        user.push_str(truncate_on_boundary(&pr.diff, review.max_diff_chars));
+        if pr.diff.len() > review.max_diff_chars {
+            user.push_str("\n… [diff truncated] …");
+        }
+        user.push_str("\n```");
+    }
+
+    vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
 /// Assemble the system (guidance + contract) and user (command + diff) messages. Mirrors the OpenCode
@@ -332,6 +449,93 @@ mod tests {
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
         let err = run_native_review(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
+            .await
+            .expect_err("abort is an error");
+        assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
+    }
+
+    // The ask prompt carries the question and (when present) the diff as context.
+    #[test]
+    fn build_ask_messages_carries_the_question() {
+        let review = review_config("http://unused/v1".to_string());
+        let msgs = build_ask_messages(&review, "why a mutex here?", None);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        let user = msgs[1].content.as_deref().expect("user content");
+        assert!(
+            user.contains("why a mutex here?"),
+            "question reaches prompt: {user}"
+        );
+    }
+
+    // ── Positive e2e (ask): search → results → submit_answer → Markdown answer ──────────────────
+    #[tokio::test]
+    async fn native_ask_searches_then_answers() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                tool_call_reply(
+                    "lightbridge_vector_semantic_search",
+                    r#"{"query":"locking strategy"}"#,
+                ),
+                tool_call_reply(
+                    "submit_answer",
+                    r#"{"answer":"The mutex guards the shared cache; prefer an RwLock for read-heavy access."}"#,
+                ),
+            ],
+        )
+        .await;
+
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "file_path": "cache.rs", "language": "rust", "chunk_type": "function",
+                "symbol_name": "get", "start_line": 1, "end_line": 9,
+                "content": "fn get() {}", "score": 0.9
+            }])))
+            .mount(&cp)
+            .await;
+
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let answer = run_native_ask(
+            &review,
+            "why a mutex here?",
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+        )
+        .await
+        .expect("answer");
+        assert!(answer.contains("RwLock"), "got: {answer}");
+    }
+
+    // ── Negative e2e (ask): abort surfaces as an error ──────────────────────────────────────────
+    #[tokio::test]
+    async fn native_ask_abort_is_an_error() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![tool_call_reply("abort", r#"{"reason":"question unclear"}"#)],
+        )
+        .await;
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new("http://unused", "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let err = run_native_ask(&review, "huh?", None, &[], &cpc, &embc, Uuid::nil())
             .await
             .expect_err("abort is an error");
         assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");

@@ -91,6 +91,9 @@ pub struct TaskContextResponse {
     pub target_type: String,
     pub target_id: i64,
     pub command: String,
+    /// Run kind (ADR-0033): `review` (diff-scoped findings, the default) or `ask` (a conversational
+    /// answer posted as a single reply comment). The runner branches on this.
+    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo already has a semantic index. The runner skips the full re-index on a review
@@ -146,6 +149,7 @@ pub async fn get_context(
         target_type: context.target_type,
         target_id: context.target_id,
         command: context.command_text,
+        kind: context.kind,
         base_sha: context.base_sha,
         head_sha: context.head_sha,
         repo_indexed,
@@ -617,6 +621,71 @@ pub async fn post_review(
             // Review couldn't be posted: 😕 (best-effort).
             react(app, &state.review, &target, "confused").await;
             (StatusCode::BAD_GATEWAY, "could not post review").into_response()
+        }
+    }
+}
+
+/// Body for `POST /internal/tasks/{id}/answer` — the agent's conversational answer (ADR-0033 `ask`).
+#[derive(Debug, Deserialize)]
+pub struct AnswerSubmission {
+    pub answer: String,
+}
+
+/// `POST /internal/tasks/{id}/answer` — post the agent's answer for an `ask` run (ADR-0033) as a
+/// single reply comment on the issue/PR thread. Unlike [`post_review`], the answer is **not**
+/// diff-validated and carries no inline comments: a question deserves a direct reply, not a review.
+/// Both PRs and issues use the `issues/{n}/comments` endpoint, so this works for either target.
+pub async fn post_answer(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(submission): Json<AnswerSubmission>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(app) = state.github.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
+    };
+
+    let context = match crate::db::get_task_context(pool, id).await {
+        Ok(Some(context)) => context,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for answer failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    let token = match app.installation_token(context.installation_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "mint installation token failed");
+            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
+        }
+    };
+
+    let issue = context.target_id;
+    let body = crate::review::render_answer_body(&submission.answer);
+    let target = ReviewTarget {
+        token: &token,
+        owner: &context.owner,
+        repo: &context.name,
+        pr: issue,
+    };
+    match app
+        .create_issue_comment(&token, &context.owner, &context.name, issue, &body)
+        .await
+    {
+        Ok(comment_url) => {
+            tracing::info!(task_id = %id, target = issue, url = comment_url.as_deref().unwrap_or(""), "answer posted");
+            react(app, &state.review, &target, "hooray").await;
+            Json(serde_json::json!({ "answered": true, "url": comment_url })).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "posting answer comment failed");
+            react(app, &state.review, &target, "confused").await;
+            (StatusCode::BAD_GATEWAY, "could not post answer").into_response()
         }
     }
 }

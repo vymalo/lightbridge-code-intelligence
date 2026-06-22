@@ -202,6 +202,9 @@ pub struct TaskRow {
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
+    /// Run kind (ADR-0033): `review` (diff-scoped findings) or `ask` (a conversational answer).
+    /// Defaults to `review` for rows created before migration 0011.
+    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     pub status: String,
@@ -234,6 +237,9 @@ pub struct NewTask {
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
+    /// Run kind (ADR-0033): `review` or `ask`. Resolved from the inbound comment by the webhook;
+    /// an automatic PR-opened review is always `review`.
+    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Re-run discriminator (RFC-0001). `0` for the automatic first review; an explicit re-review
@@ -294,8 +300,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued') \
+         target_id, command_text, kind, base_sha, head_sha, run_epoch, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued') \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id",
@@ -307,6 +313,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.target_type)
     .bind(task.target_id)
     .bind(&task.command_text)
+    .bind(&task.kind)
     .bind(&task.base_sha)
     .bind(&task.head_sha)
     .bind(task.run_epoch)
@@ -827,6 +834,9 @@ pub struct TaskContextRow {
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
+    /// Run kind (ADR-0033): `review` or `ask`. The runner branches on this — a `review` produces
+    /// diff-scoped findings, an `ask` produces a conversational answer.
+    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
 }
@@ -839,7 +849,7 @@ pub async fn get_task_context(
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
-                t.target_type, t.target_id, t.command_text, t.base_sha, t.head_sha \
+                t.target_type, t.target_id, t.command_text, t.kind, t.base_sha, t.head_sha \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )
@@ -1069,6 +1079,7 @@ mod tests {
             target_type: "pull_request".to_string(),
             target_id: 7,
             command_text: "review".to_string(),
+            kind: "review".to_string(),
             base_sha: Some("base".to_string()),
             head_sha: Some(head.to_string()),
             run_epoch: 0,
@@ -1261,6 +1272,7 @@ mod tests {
                     target_type: "pull_request".to_string(),
                     target_id: n as i64,
                     command_text: "review".to_string(),
+                    kind: "review".to_string(),
                     base_sha: None,
                     head_sha: None,
                     run_epoch: 0,
@@ -1512,6 +1524,7 @@ mod tests {
         assert_eq!(context.default_branch, "main");
         assert_eq!(context.installation_id, 99);
         assert_eq!(context.command_text, "review");
+        assert_eq!(context.kind, "review", "run kind round-trips (ADR-0033)");
         assert_eq!(context.head_sha.as_deref(), Some("head1"));
 
         assert!(

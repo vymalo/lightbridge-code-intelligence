@@ -225,6 +225,37 @@ async fn run(
     // A standalone `index` task (target_type `repository`, Epic #75) indexes the default branch only —
     // there's no PR to review, so skip the review step regardless of LLM config.
     let review_summary = match review_config.filter(|_| context.command != "index") {
+        // ADR-0033 `ask`: answer the question and post a single reply comment (not diff-scoped).
+        Some(review) if context.kind == "ask" => {
+            let diff = clone::pr_diff(&checkout, &context).await;
+            match review::run_ask(
+                review,
+                &context.command,
+                diff.as_ref(),
+                &attribution,
+                client,
+                &embedder,
+                config.task_id,
+            )
+            .await
+            {
+                Ok(answer) => {
+                    tracing::info!(chars = answer.len(), "ask complete");
+                    // Non-fatal: a post failure shouldn't fail a task whose work already succeeded.
+                    match client.submit_answer(config.task_id, &answer).await {
+                        Ok(()) => "answer posted".to_string(),
+                        Err(error) => {
+                            tracing::warn!(%error, "submitting answer failed (non-fatal)");
+                            "answer (post failed)".to_string()
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ask failed (non-fatal)");
+                    "ask failed".to_string()
+                }
+            }
+        }
         Some(review) => {
             // Scope the review to the PR's change set when we can compute it (best-effort; an
             // unavailable base commit just yields an unscoped review).

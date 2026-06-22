@@ -163,6 +163,43 @@ impl GithubApp {
         Ok(review.html_url)
     }
 
+    /// Post a plain comment on an issue or PR thread (`POST issues/{n}/comments`). Used for the `ask`
+    /// run kind (ADR-0033): a conversational answer, not a diff-scoped review. PRs share the issues
+    /// comment endpoint, so this works for either target. Returns the comment's `html_url` when present.
+    pub async fn create_issue_comment(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        issue: i64,
+        body: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use anyhow::Context;
+        #[derive(Deserialize)]
+        struct CommentResponse {
+            html_url: Option<String>,
+        }
+        let comment: CommentResponse = self
+            .http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/issues/{issue}/comments"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("posting issue comment")?
+            .error_for_status()
+            .context("github rejected the issue comment")?
+            .json()
+            .await
+            .context("parsing issue comment response")?;
+        Ok(comment.html_url)
+    }
+
     /// Fetch a repository's default branch. Used by index-on-approve (Epic #75): a repo registered
     /// via an installation webhook has no `default_branch` (that payload omits it), so we resolve it
     /// before indexing.

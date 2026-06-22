@@ -20,12 +20,21 @@ pub struct TaskContext {
     pub target_type: String,
     pub target_id: i64,
     pub command: String,
+    /// Run kind (ADR-0033): `review` (diff-scoped findings) or `ask` (a conversational answer). The
+    /// runner branches on this. Defaults to `review` if an older control plane omits the field.
+    #[serde(default = "default_run_kind")]
+    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo already has a semantic index — review reuses it instead of re-indexing
     /// (ADR-0025). Defaults to `false` (index) if an older control plane omits the field.
     #[serde(default)]
     pub repo_indexed: bool,
+}
+
+/// Default run kind when the control plane omits it (back-compat): a diff-scoped review.
+fn default_run_kind() -> String {
+    "review".to_string()
 }
 
 impl TaskContext {
@@ -254,6 +263,23 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /internal/tasks/{id}/answer` — submit the agent's conversational answer for an `ask`
+    /// run (ADR-0033); the control plane posts it as a single reply comment on the thread.
+    pub async fn submit_answer(&self, task_id: Uuid, answer: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/answer", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "answer": answer }))
+            .send()
+            .await
+            .context("submitting answer")?
+            .error_for_status()
+            .context("control plane rejected the answer")?;
+        Ok(())
+    }
+
     /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (Graphify → Neo4j).
     pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -386,6 +412,7 @@ mod tests {
             target_type: "pull_request".into(),
             target_id: 7,
             command: "review".into(),
+            kind: "review".into(),
             base_sha: None,
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,
