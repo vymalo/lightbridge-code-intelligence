@@ -20,9 +20,12 @@ pub use parse::{parse_review, ReviewFinding, ReviewResult};
 use std::path::Path;
 
 use anyhow::Context;
+use uuid::Uuid;
 
-use crate::bootstrap::config::ReviewConfig;
+use crate::bootstrap::client::ControlPlaneClient;
+use crate::bootstrap::config::{ReviewAgent, ReviewConfig};
 use crate::clone::PrDiff;
+use crate::indexer::embeddings::EmbeddingsClient;
 
 /// The provider id we register the eaig gateway under in opencode.json; the model is referenced as
 /// `eaig/<model>`.
@@ -65,11 +68,44 @@ as a GitHub suggestion. Put any supporting links (docs, CWE, RFCs) in `resources
 Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
 {\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
 
+/// Produce the structured review, dispatching on the configured agent (ADR-0026): the native
+/// in-process loop (`REVIEW_AGENT=native`) or the OpenCode subprocess (default). Both submit the same
+/// [`ReviewResult`]; the control plane validates + writes it back (ADR-0022), unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_review(
+    checkout: &Path,
+    review: &ReviewConfig,
+    command: &str,
+    diff: Option<&PrDiff>,
+    attribution: &[(String, String)],
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    task_id: Uuid,
+) -> anyhow::Result<ReviewResult> {
+    match review.agent {
+        ReviewAgent::Native => {
+            native::agent::run_native_review(
+                review,
+                command,
+                diff,
+                attribution,
+                client,
+                embedder,
+                task_id,
+            )
+            .await
+        }
+        ReviewAgent::OpenCode => {
+            run_opencode_review(checkout, review, command, diff, attribution).await
+        }
+    }
+}
+
 /// Run the OpenCode review over `checkout` and return the parsed structured result.
 ///
 /// Writes `opencode.json` into `checkout` (ephemeral Job disk), then spawns
 /// `opencode run --model eaig/<model> --dir <checkout> --print-logs <prompt>` and parses its output.
-pub async fn run_review(
+async fn run_opencode_review(
     checkout: &Path,
     review: &ReviewConfig,
     command: &str,

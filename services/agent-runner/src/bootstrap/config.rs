@@ -141,8 +141,29 @@ fn require_field(section: &str, name: &str, value: &str) -> anyhow::Result<Strin
 /// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
 /// gateway in prod; ADR-0021). Like embeddings, **no default model** so a misconfigured Job fails
 /// loudly. Optional as a whole: absent `LLM_MODEL`, the runner skips the review step (indexing-only).
+/// Which review agent the runner drives (ADR-0026). `REVIEW_AGENT=native` opts into the in-process
+/// Rust loop; anything else (incl. unset) keeps the OpenCode subprocess. Phased migration — the
+/// default flips to `Native` once the loop is dogfooded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewAgent {
+    #[default]
+    OpenCode,
+    Native,
+}
+
+impl ReviewAgent {
+    fn from_env() -> Self {
+        match std::env::var("REVIEW_AGENT") {
+            Ok(v) if v.eq_ignore_ascii_case("native") => Self::Native,
+            _ => Self::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewConfig {
+    /// Which agent produces the review (ADR-0026); from `REVIEW_AGENT`.
+    pub agent: ReviewAgent,
     /// Base URL of the OpenAI-compatible chat endpoint (the `provider.options.baseURL` opencode uses).
     pub base_url: String,
     /// API key for the gateway.
@@ -174,6 +195,7 @@ impl ReviewConfig {
             return Ok(None);
         }
         Ok(Some(Self {
+            agent: ReviewAgent::from_env(),
             base_url: require("LLM_BASE_URL")?,
             api_key: require("LLM_API_KEY")?,
             model: require("LLM_MODEL")?,
@@ -209,6 +231,7 @@ impl ReviewConfig {
                 .filter(|s| !s.trim().is_empty()),
         };
         Ok(Some(Self {
+            agent: ReviewAgent::from_env(),
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
             model: require_field("review", "model", &r.model)?,

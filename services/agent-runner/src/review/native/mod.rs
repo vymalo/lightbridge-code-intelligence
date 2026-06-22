@@ -9,8 +9,8 @@
 //!
 //! - [`chat`] — the Chat Completions client (request/response types + tool-call protocol).
 //! - [`tools`] — the agent's tool surface (retrieval + control) and the in-process dispatcher.
-//!
-//! Still to come (next PR): the loop itself, behind `REVIEW_AGENT=native|opencode`.
+//! - [`agent`] — the loop ([`agent::run_native_review`]), selected by `REVIEW_AGENT=native`.
 
+pub mod agent;
 pub mod chat;
 pub mod tools;

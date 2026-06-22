@@ -232,6 +232,9 @@ async fn run(
                 &context.command,
                 diff.as_ref(),
                 &attribution,
+                client,
+                &embedder,
+                config.task_id,
             )
             .await
             {
