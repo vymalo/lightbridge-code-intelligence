@@ -57,3 +57,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0035](0035-review-feedback-signal.md) | Capture 👍/👎 on posted reviews as a quality feedback signal (persist comment IDs, store + display) | Proposed |
 | [0036](0036-auto-read-agent-instruction-files.md) | Auto-read conventional agent instruction files (AGENTS.md → CLAUDE.md → …) as review context, ranked, untrusted | Proposed |
 | [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Proposed |
+| [0038](0038-per-repo-review-model.md) | Per-repository review model selected in the admin UI from an operator allowlist (admin-owned, not the author-owned repo file) | Proposed |
