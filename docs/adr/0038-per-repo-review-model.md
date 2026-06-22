@@ -47,8 +47,7 @@ stored on the repository (control-plane DB). When the dispatcher builds a review
 - **Allowlist, not free text.** The operator configures the set of models the gateway actually serves
   (chart config); the UI offers exactly those, plus "Default". This keeps a misconfiguration from
   ever reaching a Job and gives the UI a clean dropdown.
-- **Admin-gated.** Setting the model requires the same permission as the rest of repo administration
-  ([ADR-0023](0023-db-backed-rbac.md)); it is **not** exposed in the author-owned repo file
+- **Admin-gated.** Setting the model requires a dedicated permission (such as repo:write or reusing repo:approve under ADR-0023); it is **not** exposed in the author-owned repo file
   ([ADR-0030](0030-repo-review-config.md)) — a PR author must not be able to select the most expensive
   model on the org's budget.
 - **Just the model first.** Generation params (temperature/top_p/max_tokens) and a per-run/per-kind
