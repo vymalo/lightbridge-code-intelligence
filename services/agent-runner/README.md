@@ -14,9 +14,11 @@ does the heavy repository work, and reports results back — holding no standing
    the control plane.
 4. **Structural graph**: Graphify → the control plane writes Neo4j (best-effort / non-fatal,
    [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
-5. **Review**: the agent reasons over the repo using retrieval tools and submits findings. Today via
-   **OpenCode** (headless); being replaced by a **native Rust agent loop** with structured tool calls
-   ([ADR-0026](../../docs/adr/0026-native-review-agent.md)).
+5. **Review**: the agent reasons over the repo using the retrieval tools and returns findings by
+   **calling the `submit_findings` tool** (validated at the tool boundary — no stdout scraping). The
+   default is the **native Rust agent loop** ([ADR-0026](../../docs/adr/0026-native-review-agent.md));
+   `REVIEW_AGENT=opencode` falls back to the legacy OpenCode subprocess (kept until a real-gateway
+   dogfood confirms native, then removed with OpenCode/Bun from the image).
 6. **Report** terminal status; the control plane validates findings against the PR diff and posts the
    review ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md)).
 
