@@ -900,7 +900,8 @@ pub struct CodeChunk {
     pub start_line: i32,
     pub end_line: i32,
     pub content: String,
-    /// 1536-dimensional embedding vector (text-embedding-3-small; see ADR-0018).
+    /// Embedding vector. Its length must match the `code_chunks.embedding` column — 4096 for
+    /// `qwen3-embedding-8b` (migration 0005), configurable per deployment (ADR-0018).
     pub embedding: Vec<f32>,
 }
 
@@ -1560,10 +1561,14 @@ mod tests {
             .id
     }
 
-    /// A 1536-dim one-hot vector (a 1.0 at `hot`, zeros elsewhere) — distinct directions give
-    /// clean, predictable cosine ordering for the search test.
+    /// Dimension of the `code_chunks.embedding` column under the migrations (migration 0005,
+    /// `qwen3-embedding-8b`). Test vectors must match it or the `vector(N)` insert is rejected.
+    const EMBED_DIM: usize = 4096;
+
+    /// A one-hot vector sized to the embedding column (a 1.0 at `hot`, zeros elsewhere) — distinct
+    /// directions give clean, predictable cosine ordering for the search test.
     fn one_hot(hot: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; 1536];
+        let mut v = vec![0.0_f32; EMBED_DIM];
         v[hot] = 1.0;
         v
     }
