@@ -11,10 +11,10 @@
 //! (Graphify → Neo4j, slice 3) → review (OpenCode over the MCP tools, slice 5) → report. Indexing is
 //! required; the structural graph and the review are best-effort and non-fatal.
 
-use agent_runner::client::ControlPlaneClient;
+use agent_runner::bootstrap::client::ControlPlaneClient;
+use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
 use agent_runner::clone;
-use agent_runner::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
-use agent_runner::embeddings::EmbeddingsClient;
+use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review};
 
 #[tokio::main]
@@ -40,7 +40,7 @@ async fn main() -> std::process::ExitCode {
 
     // Optional JSON config file (ConfigMap-mounted); when absent, each config falls back to env. A
     // malformed file is a misconfiguration we surface as a failed task rather than silently ignore.
-    let file_config = match agent_runner::config::load_file_config() {
+    let file_config = match agent_runner::bootstrap::config::load_file_config() {
         Ok(file_config) => file_config,
         Err(error) => {
             let detail = error.to_string();
@@ -145,7 +145,9 @@ async fn cancelled_upstream(client: &ControlPlaneClient, task_id: uuid::Uuid) {
         match client.task_status(task_id).await {
             Ok(status) if is_terminal_status(&status) => return,
             Ok(_) => {}
-            Err(error) => tracing::debug!(%error, "cancellation poll failed (transient); continuing"),
+            Err(error) => {
+                tracing::debug!(%error, "cancellation poll failed (transient); continuing")
+            }
         }
     }
 }
@@ -208,7 +210,9 @@ async fn run(
         };
         (chunks, graph)
     } else {
-        tracing::info!("repo already indexed — reusing the base index (skipping re-index for review)");
+        tracing::info!(
+            "repo already indexed — reusing the base index (skipping re-index for review)"
+        );
         (0, "reused base index".to_string())
     };
 

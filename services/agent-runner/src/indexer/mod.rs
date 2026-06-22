@@ -4,6 +4,7 @@
 //! internal API — the runner has no direct DB access). See docs/indexing-and-storage.md.
 
 pub mod chunker;
+pub mod embeddings;
 pub mod graph;
 pub mod language;
 
@@ -11,8 +12,8 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use crate::client::{ChunkBatch, ChunkPayload, ControlPlaneClient, TaskContext};
-use crate::embeddings::EmbeddingsClient;
+use crate::bootstrap::client::{ChunkBatch, ChunkPayload, ControlPlaneClient, TaskContext};
+use crate::indexer::embeddings::EmbeddingsClient;
 
 /// How many chunks we embed and submit in one round-trip. Balances request size vs latency.
 /// Most embedding APIs accept up to 2048 items; 32 is a safe default that keeps batches small

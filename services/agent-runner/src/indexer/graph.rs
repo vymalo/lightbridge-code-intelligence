@@ -13,8 +13,10 @@ use std::path::Path;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::client::TaskContext;
-use crate::client::{ControlPlaneClient, GraphBatch, GraphEdgePayload, GraphNodePayload};
+use crate::bootstrap::client::TaskContext;
+use crate::bootstrap::client::{
+    ControlPlaneClient, GraphBatch, GraphEdgePayload, GraphNodePayload,
+};
 
 /// Graphify's `graph.json` shape (only the fields we consume). `update` writes edges under `links`
 /// (older `extract` used `edges`); accept either.

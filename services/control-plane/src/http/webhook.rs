@@ -23,7 +23,7 @@ pub async fn github_webhook(
 ) -> impl IntoResponse {
     let signature = header(&headers, "x-hub-signature-256");
     if !verify_signature(state.github_webhook_secret.as_bytes(), &body, &signature) {
-        crate::metrics::webhook_signature_failure();
+        crate::http::metrics::webhook_signature_failure();
         tracing::warn!("invalid webhook signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature");
     }
@@ -63,12 +63,12 @@ pub async fn github_webhook(
             .insert(delivery_id.clone()),
     };
     if !is_new {
-        crate::metrics::webhook_duplicate();
+        crate::http::metrics::webhook_duplicate();
         tracing::info!(delivery_id, "duplicate delivery");
         return (StatusCode::ACCEPTED, "duplicate delivery");
     }
 
-    crate::metrics::webhook_delivery(&event);
+    crate::http::metrics::webhook_delivery(&event);
     tracing::info!(delivery_id, event, "accepted webhook");
 
     // Webhook → internal action mapping (the only events that do anything beyond being persisted):
@@ -320,7 +320,7 @@ async fn create_review_task(
     let (pr, installation_id, run_epoch) = (task.target_id, task.installation_id, task.run_epoch);
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
-            crate::metrics::task_created();
+            crate::http::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr, run_epoch, "created review task");
             let state = state.clone();
             let (owner, name) = (owner.to_string(), name.to_string());
@@ -470,7 +470,7 @@ async fn disable_repos(
                     repository_id,
                     "repository disabled (removed from installation); purging index data"
                 );
-                crate::lifecycle::spawn_purge(state, repository_id);
+                crate::queue::lifecycle::spawn_purge(state, repository_id);
             }
             Ok(None) => {} // not known locally — nothing to disable/purge
             Err(error) => {

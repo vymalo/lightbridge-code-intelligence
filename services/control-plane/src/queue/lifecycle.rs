@@ -55,7 +55,7 @@ pub async fn purge_repository_data(
         .await
         .map_err(|error| tracing::warn!(%error, repository_id, "purge: delete repo_index failed"));
     let nodes = match neo4j {
-        Some(graph) => crate::neo4j::delete_repo_graph(graph, repository_id)
+        Some(graph) => crate::integrations::neo4j::delete_repo_graph(graph, repository_id)
             .await
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, repository_id, "purge: delete graph failed");
@@ -81,18 +81,21 @@ const PURGE_RECONCILE_BATCH: i64 = 20;
 /// the right home for this (not a per-repo k8s Job): purge writes to Postgres + Neo4j directly, and
 /// only the control plane holds those credentials (ADR-0020/0002). Idempotent.
 pub async fn reconcile_purges(pool: &PgPool, neo4j: Option<&neo4rs::Graph>) {
-    let repos = match crate::db::list_disabled_repos_needing_purge(pool, PURGE_RECONCILE_BATCH).await
-    {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::warn!(%error, "purge reconcile: listing disabled repos failed");
-            return;
-        }
-    };
+    let repos =
+        match crate::db::list_disabled_repos_needing_purge(pool, PURGE_RECONCILE_BATCH).await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "purge reconcile: listing disabled repos failed");
+                return;
+            }
+        };
     if repos.is_empty() {
         return;
     }
-    tracing::info!(count = repos.len(), "purge reconcile: re-purging repos with leftover data");
+    tracing::info!(
+        count = repos.len(),
+        "purge reconcile: re-purging repos with leftover data"
+    );
     for repository_id in repos {
         purge_repository_data(pool, neo4j, repository_id).await;
     }

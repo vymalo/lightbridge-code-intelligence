@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use crate::config::ReviewConfig;
+use crate::bootstrap::config::ReviewConfig;
 
 /// Absolute paths to the bundled MCP server binaries (installed by the Dockerfile).
 const VECTOR_MCP_BIN: &str = "/usr/local/bin/lightbridge-vector-mcp";

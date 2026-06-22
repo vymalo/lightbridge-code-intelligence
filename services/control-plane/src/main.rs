@@ -5,23 +5,36 @@
 //! in dev) on protected routes. It does not issue tokens or store credentials; identity comes from
 //! the validated JWT claims (see ADR-0014). Persistence is Postgres via hand-written SQLx
 //! (cratestack codegen deferred — ADR-0005).
+//!
+//! # Module map
+//!
+//! Three concern groups (each its own submodule directory) sit on a few foundational modules:
+//!
+//! - [`http`] — the HTTP surface (`serve` role): [`webhook`](http::webhook) (GitHub webhooks, HMAC +
+//!   delivery-id dedup), [`internal`](http::internal) (runner bootstrap/results API),
+//!   [`admin`](http::admin) (dashboard admin), [`metrics`](http::metrics) (Prometheus `/metrics`).
+//!   Routing + auth middleware live in this file.
+//! - [`queue`] — queue & dispatch (`dispatcher` role): [`dispatcher`](queue::dispatcher) (claim +
+//!   launch one Job per task), [`reaper`](queue::reaper) (Job GC + data-purge reconciler),
+//!   [`lifecycle`](queue::lifecycle) (task state machine), [`tasks`](queue::tasks) (queue persistence).
+//! - [`integrations`] — external systems the control plane owns credentials for:
+//!   [`github`](integrations::github) (App auth + token mint + review write-back),
+//!   [`k8s`](integrations::k8s) (Job manifests), [`neo4j`](integrations::neo4j) (graph writes).
+//!
+//! Foundational modules at the crate root: [`config`] (typed config load), [`db`] (pool +
+//! migrations), [`jwt`] (OIDC token validation), [`types`] (shared domain types), [`review`]
+//! (review validation).
 
-mod admin;
+mod http;
+mod integrations;
+mod queue;
+
+// Foundational modules the groups above build on.
 mod config;
 mod db;
-mod dispatcher;
-mod github;
-mod internal;
 mod jwt;
-mod k8s;
-mod lifecycle;
-mod metrics;
-mod neo4j;
-mod reaper;
 mod review;
-mod tasks;
 mod types;
-mod webhook;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -38,6 +51,11 @@ use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
 use jwt::JwtValidator;
+// Bring the grouped modules into scope under their bare names. `crate::` is required to
+// disambiguate from the extern `http` / `metrics` crates pulled in by axum.
+use crate::http::{admin, internal, metrics, webhook};
+use crate::integrations::{github, k8s, neo4j};
+use crate::queue::{dispatcher, tasks};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -401,7 +419,14 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
     // The pod name is a natural, unique lease owner; fall back to a generic label off-cluster.
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "dispatcher".to_string());
     // Pass Neo4j so the dispatcher's loop can run the durable purge reconciler (graph + pg cleanup).
-    dispatcher::run(pool, launcher, owner, dispatcher_config, state.neo4j.clone()).await
+    dispatcher::run(
+        pool,
+        launcher,
+        owner,
+        dispatcher_config,
+        state.neo4j.clone(),
+    )
+    .await
 }
 
 /// Serve `/metrics` (+ `/healthz`) on `METRICS_ADDR` for roles without a main HTTP server.

@@ -23,7 +23,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 
 use crate::db;
-use crate::k8s::{JobLiveness, TaskLauncher};
+use crate::integrations::k8s::{JobLiveness, TaskLauncher};
 
 /// How many times a task is retried before the reaper gives up and marks it `failed`. `attempts` is
 /// incremented on every claim, so this bounds total dispatch attempts.
@@ -98,11 +98,11 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
         // starve the other stuck tasks in the batch.
         let result: Result<(), sqlx::Error> = match decide(liveness, task.attempts, MAX_ATTEMPTS) {
             ReapAction::RenewLease => db::renew_lease(pool, task.id, LEASE_RENEWAL).await.map(|_| {
-                crate::metrics::reap_outcome("renewed");
+                crate::http::metrics::reap_outcome("renewed");
             }),
             ReapAction::MarkSucceeded => {
                 db::set_task_status(pool, task.id, "succeeded").await.map(|_| {
-                    crate::metrics::reap_outcome("succeeded");
+                    crate::http::metrics::reap_outcome("succeeded");
                     tracing::info!(task_id = %task.id, "reaper: Job completed but report was lost; marked succeeded");
                 })
             }
@@ -112,7 +112,7 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
                     .await
                     .map(|requeued| {
                         if requeued {
-                            crate::metrics::reap_outcome("requeued");
+                            crate::http::metrics::reap_outcome("requeued");
                             tracing::warn!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task requeued");
                         }
                     })
@@ -120,7 +120,7 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
             ReapAction::Fail => {
                 delete_dead_job(launcher, &task).await;
                 db::set_task_status(pool, task.id, "failed").await.map(|_| {
-                    crate::metrics::reap_outcome("failed");
+                    crate::http::metrics::reap_outcome("failed");
                     tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
                 })
             }
@@ -143,7 +143,7 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
         match launcher.delete_job(name).await {
             Ok(()) => match db::clear_job_name(pool, task.id).await {
                 Ok(()) => {
-                    crate::metrics::reap_outcome("cancelled");
+                    crate::http::metrics::reap_outcome("cancelled");
                     tracing::info!(task_id = %task.id, "reaper: stopped cancelled task's Job");
                 }
                 Err(error) => {

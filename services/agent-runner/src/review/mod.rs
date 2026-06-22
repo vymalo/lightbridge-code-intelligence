@@ -20,8 +20,8 @@ use std::path::Path;
 
 use anyhow::Context;
 
+use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
-use crate::config::ReviewConfig;
 
 /// The provider id we register the eaig gateway under in opencode.json; the model is referenced as
 /// `eaig/<model>`.

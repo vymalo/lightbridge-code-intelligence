@@ -2,7 +2,7 @@
 //! (wiremock) — no live service. They pin the wire shape the control plane's `internal.rs` must
 //! keep: bearer auth, the task-context JSON, and the status callback.
 
-use agent_runner::client::ControlPlaneClient;
+use agent_runner::bootstrap::client::ControlPlaneClient;
 use uuid::Uuid;
 use wiremock::matchers::{bearer_token, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -89,7 +89,7 @@ async fn report_status_posts_the_status_with_bearer() {
 
 #[tokio::test]
 async fn submit_chunks_posts_batch_with_bearer() {
-    use agent_runner::client::{ChunkBatch, ChunkPayload};
+    use agent_runner::bootstrap::client::{ChunkBatch, ChunkPayload};
 
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
@@ -102,7 +102,8 @@ async fn submit_chunks_posts_batch_with_bearer() {
         .mount(&server)
         .await;
 
-    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client =
+        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
     client
         .submit_chunks(
             task_id,
@@ -126,7 +127,7 @@ async fn submit_chunks_posts_batch_with_bearer() {
 
 #[tokio::test]
 async fn submit_graph_posts_nodes_and_edges_with_bearer() {
-    use agent_runner::client::{GraphBatch, GraphEdgePayload, GraphNodePayload};
+    use agent_runner::bootstrap::client::{GraphBatch, GraphEdgePayload, GraphNodePayload};
 
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
@@ -139,7 +140,8 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
         .mount(&server)
         .await;
 
-    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client =
+        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
     client
         .submit_graph(
             task_id,
@@ -180,7 +182,8 @@ async fn search_posts_embedding_and_parses_hits() {
         .mount(&server)
         .await;
 
-    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client =
+        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
     let hits = client
         .search(task_id, &[0.1, 0.2, 0.3], 5)
         .await
@@ -204,7 +207,8 @@ async fn graph_get_callers_posts_op_and_parses_symbols() {
         .mount(&server)
         .await;
 
-    let client = agent_runner::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client =
+        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
     let callers = client
         .graph_get_callers(task_id, "src_math_add", 10)
         .await

@@ -299,27 +299,34 @@ pub async fn ingest_graph(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let nodes: Vec<crate::neo4j::GraphNode> = batch
+    let nodes: Vec<crate::integrations::neo4j::GraphNode> = batch
         .nodes
         .into_iter()
-        .map(|n| crate::neo4j::GraphNode {
+        .map(|n| crate::integrations::neo4j::GraphNode {
             node_id: n.node_id,
             label: n.label,
             source_file: n.source_file,
             start_line: n.start_line,
         })
         .collect();
-    let edges: Vec<crate::neo4j::GraphEdge> = batch
+    let edges: Vec<crate::integrations::neo4j::GraphEdge> = batch
         .edges
         .into_iter()
-        .map(|e| crate::neo4j::GraphEdge {
+        .map(|e| crate::integrations::neo4j::GraphEdge {
             source: e.source,
             target: e.target,
             relation: e.relation,
         })
         .collect();
 
-    match crate::neo4j::upsert_graph(neo4j, repository_id, &batch.commit_sha, &nodes, &edges).await
+    match crate::integrations::neo4j::upsert_graph(
+        neo4j,
+        repository_id,
+        &batch.commit_sha,
+        &nodes,
+        &edges,
+    )
+    .await
     {
         Ok((n, e)) => {
             tracing::info!(task_id = %id, nodes = n, edges = e, "graph ingested");
@@ -437,13 +444,15 @@ pub async fn graph_query(
             let Some(term) = req.term.as_deref() else {
                 return (StatusCode::BAD_REQUEST, "find_symbol requires `term`").into_response();
             };
-            crate::neo4j::find_symbol(neo4j, repository_id, &commit, term, limit).await
+            crate::integrations::neo4j::find_symbol(neo4j, repository_id, &commit, term, limit)
+                .await
         }
         "get_callers" => {
             let Some(node_id) = req.node_id.as_deref() else {
                 return (StatusCode::BAD_REQUEST, "get_callers requires `node_id`").into_response();
             };
-            crate::neo4j::get_callers(neo4j, repository_id, &commit, node_id, limit).await
+            crate::integrations::neo4j::get_callers(neo4j, repository_id, &commit, node_id, limit)
+                .await
         }
         other => {
             return (
@@ -544,10 +553,10 @@ pub async fn post_review(
         &validated.deferred,
         validated.out_of_scope,
     );
-    let comments: Vec<crate::github::ReviewComment> = validated
+    let comments: Vec<crate::integrations::github::ReviewComment> = validated
         .inline
         .iter()
-        .map(|c| crate::github::ReviewComment {
+        .map(|c| crate::integrations::github::ReviewComment {
             path: c.path.clone(),
             line: c.line,
             side: "RIGHT",
@@ -621,7 +630,7 @@ struct ReviewTarget<'a> {
 /// Best-effort PR reaction for review lifecycle feedback (👀 started / 🎉 done / 😕 errored). A
 /// disabled toggle or any GitHub error is a no-op — review delivery never fails over a reaction.
 async fn react(
-    app: &crate::github::GithubApp,
+    app: &crate::integrations::github::GithubApp,
     review: &crate::config::ReviewSection,
     target: &ReviewTarget<'_>,
     content: &str,
@@ -640,7 +649,7 @@ async fn react(
 /// Best-effort outcome labels from config: `label_reviewed` always (when set), `label_findings` when
 /// the review had in-scope findings, `label_error` when any were `error`-severity.
 async fn add_review_labels(
-    app: &crate::github::GithubApp,
+    app: &crate::integrations::github::GithubApp,
     review: &crate::config::ReviewSection,
     target: &ReviewTarget<'_>,
     has_findings: bool,
