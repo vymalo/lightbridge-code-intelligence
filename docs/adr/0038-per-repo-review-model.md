@@ -45,7 +45,7 @@ stored on the repository (control-plane DB). When the dispatcher builds a review
 `LLM_MODEL` with the repo's chosen model, falling back to the global default when none is set.
 
 - **Allowlist, not free text.** The operator configures the set of models the gateway actually serves
-  (chart config); the UI offers exactly those, plus "Default". This keeps a misconfiguration from
+  (chart config), which the control plane exposes via an API endpoint (such as GET /admin/models); the UI offers exactly those, plus "Default". This keeps a misconfiguration from
   ever reaching a Job and gives the UI a clean dropdown.
 - **Admin-gated.** Setting the model requires a dedicated permission (such as repo:write or reusing repo:approve under ADR-0023); it is **not** exposed in the author-owned repo file
   ([ADR-0030](0030-repo-review-config.md)) — a PR author must not be able to select the most expensive
