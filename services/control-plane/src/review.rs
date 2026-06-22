@@ -144,13 +144,15 @@ pub struct InlineComment {
 }
 
 /// The result of validating findings against the PR diff: comments to anchor inline, findings on a
-/// changed file that couldn't anchor to an exact line (rendered into the body), and the count of
-/// findings dropped for landing outside the PR's changed files (out of scope for a PR review).
+/// changed file that couldn't anchor to an exact line (rendered into the body), and findings on files
+/// the PR doesn't touch (out of scope for a PR review).
 #[derive(Debug, Default)]
 pub struct ValidatedReview {
     pub inline: Vec<InlineComment>,
     pub deferred: Vec<Finding>,
-    pub out_of_scope: usize,
+    /// Findings on files outside the PR's diff. Surfaced in a collapsible body section rather than
+    /// silently dropped (ADR-0033 "no silent drops") — the body still notes the count.
+    pub out_of_scope: Vec<Finding>,
 }
 
 /// The RIGHT-side (new file) line numbers that are commentable for one file's unified-diff `patch` —
@@ -223,7 +225,7 @@ pub fn validate(
         }
         let in_changed_file = commentable.contains_key(&finding.file);
         if scope_known && !in_changed_file {
-            review.out_of_scope += 1; // outside the PR diff — not this PR's concern
+            review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
             continue;
         }
         let anchorable = commentable
@@ -290,36 +292,48 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// Render the review body in the AI-governance shape: the agent's scoped assessment, any findings on
-/// changed files that couldn't be pinned to an inline line, a transparency note when out-of-scope
-/// findings were omitted, and the working-agreement disclosure (AI output is untrusted; a human owns
-/// the decision).
-pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: usize) -> String {
+/// changed files that couldn't be pinned to an inline line, a **collapsible** section for findings
+/// outside the PR's diff (surfaced, not silently dropped — ADR-0033), and the working-agreement
+/// disclosure (AI output is untrusted; a human owns the decision).
+pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]) -> String {
     let mut body = format!("## Lightbridge review\n\n{summary}");
+
+    // A finding as a `- badges **title** — `file:line`` bullet + indented resource links. Shared by
+    // the changed-files notes and the out-of-scope section so every finding reads the same.
+    let render_finding = |body: &mut String, f: &Finding| {
+        body.push_str(&format!(
+            "\n- {} **{}** — `{}:{}`\n  {}",
+            f.level_badges(),
+            f.title,
+            f.file,
+            f.line,
+            // Indent continuation lines so a multi-line body stays inside the list item (Gemini #153).
+            f.body.replace('\n', "\n  ")
+        ));
+        for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
+            body.push_str(&format!("\n  - {link}"));
+        }
+    };
 
     if !deferred.is_empty() {
         body.push_str("\n\n### Notes on changed files\n");
         body.push_str("_Findings on this PR's changes that couldn't be pinned to a diff line._\n");
         for f in deferred {
-            // Same badge + title format as inline comments (ADR-0032), plus the location and any
-            // resource links (no committable suggestion — these aren't anchored to a diff line).
-            body.push_str(&format!(
-                "\n- {} **{}** — `{}:{}`\n  {}",
-                f.level_badges(),
-                f.title,
-                f.file,
-                f.line,
-                f.body
-            ));
-            for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
-                body.push_str(&format!("\n  - {link}"));
-            }
+            render_finding(&mut body, f);
         }
     }
 
-    if out_of_scope > 0 {
+    if !out_of_scope.is_empty() {
+        // Surface, don't drop: a collapsed `<details>` keeps the review scoped to the change while
+        // leaving the observations recoverable (ADR-0033). `<details>` works in GitHub markdown.
+        let n = out_of_scope.len();
         body.push_str(&format!(
-            "\n\n_{out_of_scope} observation(s) about code outside this PR's diff were omitted to keep the review scoped to the change._"
+            "\n\n<details>\n<summary>{n} observation(s) about code outside this PR's diff</summary>\n"
         ));
+        for f in out_of_scope {
+            render_finding(&mut body, f);
+        }
+        body.push_str("\n</details>");
     }
 
     body.push_str(
@@ -419,9 +433,11 @@ mod tests {
             "unanchored finding on a changed file is kept in the body"
         );
         assert_eq!(
-            review.out_of_scope, 1,
-            "finding on a file the PR doesn't touch is dropped as out of scope"
+            review.out_of_scope.len(),
+            1,
+            "finding on a file the PR doesn't touch is kept (surfaced), not dropped"
         );
+        assert_eq!(review.out_of_scope[0].file, "other.rs");
     }
 
     #[test]
@@ -448,7 +464,7 @@ mod tests {
 
         // The model returned a `./`-prefixed path; it must still match the diff, not be dropped.
         let review = validate(vec![finding("./src/main.rs", 2, "x")], &commentable);
-        assert_eq!(review.out_of_scope, 0, "normalized path is in scope");
+        assert_eq!(review.out_of_scope.len(), 0, "normalized path is in scope");
         assert_eq!(review.inline.len(), 1);
         assert_eq!(
             review.inline[0].path, "src/main.rs",
@@ -474,17 +490,28 @@ mod tests {
     fn validate_unknown_scope_defers_instead_of_dropping() {
         // Empty `commentable` = we couldn't determine the change set → defer, don't drop.
         let review = validate(vec![finding("a.rs", 1, "x")], &HashMap::new());
-        assert_eq!(review.out_of_scope, 0);
+        assert_eq!(review.out_of_scope.len(), 0);
         assert_eq!(review.deferred.len(), 1);
     }
 
     #[test]
-    fn render_body_includes_summary_deferred_scope_note_and_disclosure() {
-        let body = render_body("Looks risky.", &[finding("a.rs", 5, "Issue")], 3);
+    fn render_body_includes_summary_deferred_out_of_scope_section_and_disclosure() {
+        let body = render_body(
+            "Looks risky.",
+            &[finding("a.rs", 5, "Issue")],
+            &[finding("vendor/lib.rs", 9, "Unrelated nit")],
+        );
         assert!(body.contains("Looks risky."));
         assert!(body.contains("Issue"));
         assert!(body.contains("`a.rs:5`"));
-        assert!(body.contains("3 observation(s)"), "out-of-scope note shown");
+        // Out-of-scope findings are surfaced in a collapsible section (not dropped, ADR-0033) —
+        // count line + recoverable content.
+        assert!(body.contains("<details>"), "collapsible section present");
+        assert!(body.contains("1 observation(s) about code outside this PR's diff"));
+        assert!(
+            body.contains("Unrelated nit") && body.contains("`vendor/lib.rs:9`"),
+            "the out-of-scope finding's content is recoverable"
+        );
         assert!(
             body.contains("AI-generated review"),
             "governance disclosure"
