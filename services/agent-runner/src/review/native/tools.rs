@@ -135,13 +135,14 @@ pub fn tool_defs() -> Vec<ToolDef> {
                             "properties": {
                                 "file": { "type": "string", "description": "Path from repo root." },
                                 "line": { "type": "integer", "description": "A line this diff adds or changes." },
-                                "severity": { "type": "string", "enum": ["info", "warning", "error"] },
+                                "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
+                                "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
                                 "title": { "type": "string", "description": "Short (≤ ~8 words)." },
                                 "body": { "type": "string", "description": "Why it matters." },
                                 "suggestion": { "type": "string", "description": "Optional exact replacement source for `line` (no diff markers)." },
                                 "resources": { "type": "array", "items": { "type": "string" }, "description": "Optional supporting URLs." },
                             },
-                            "required": ["file", "line", "severity", "title", "body"],
+                            "required": ["file", "line", "priority", "category", "title", "body"],
                         },
                     },
                 },
@@ -212,9 +213,10 @@ impl Tools<'_> {
                 Ok(review) => ToolOutcome::Submit(review),
                 // Don't end the run on a bad payload — tell the model the expected shape so it retries.
                 Err(e) => ToolOutcome::Continue(format!(
-                    "{e} Expected {{\"summary\": string, \"findings\": [{{\"file\", \"line\" (int), \
-                     \"severity\" (info|warning|error), \"title\", \"body\", optional \"suggestion\", \
-                     optional \"resources\"}}]}}."
+                    "{e} Expected JSON like {{\"summary\": \"…\", \"findings\": [{{\"file\": \"path\", \
+                     \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"…\", \
+                     \"body\": \"…\", \"suggestion\": \"optional\", \"resources\": [\"optional\"]}}]}}. \
+                     priority is P0|P1|P2; category is security|correctness|quality|style|performance."
                 )),
             },
             REPORT_PROGRESS => match parse::<NoteArgs>(args) {
@@ -360,7 +362,7 @@ mod tests {
         let cp = ControlPlaneClient::new("http://unused", "tok");
         let emb = EmbeddingsClient::new("http://unused", "key", "model");
         let args = r#"{"summary":"Looks risky.","findings":[
-            {"file":"a.rs","line":7,"severity":"error","title":"No expiry check","body":"accepts expired tokens","suggestion":"if expired { return Err }"}
+            {"file":"a.rs","line":7,"priority":"P0","category":"security","title":"No expiry check","body":"accepts expired tokens","suggestion":"if expired { return Err }"}
         ]}"#;
         match tools(&cp, &emb)
             .dispatch(&call(SUBMIT_FINDINGS, args))
@@ -370,6 +372,8 @@ mod tests {
                 assert_eq!(review.summary, "Looks risky.");
                 assert_eq!(review.findings.len(), 1);
                 assert_eq!(review.findings[0].file, "a.rs");
+                assert_eq!(review.findings[0].priority.as_deref(), Some("P0"));
+                assert_eq!(review.findings[0].category.as_deref(), Some("security"));
                 assert_eq!(
                     review.findings[0].suggestion.as_deref(),
                     Some("if expired { return Err }")

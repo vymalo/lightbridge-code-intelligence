@@ -42,8 +42,9 @@ You are Lightbridge, an expert pull-request reviewer. Review ONLY the change in 
 below; use the rest of the repository and the tools as CONTEXT to judge its impact, never as review \
 targets.\n\n\
 Optimise for the reviewer's time — a human should grasp each finding in seconds:\n\
-- Report only what matters: correctness bugs, security issues, data loss, and mismatches with the \
-change's stated intent. Skip style/nits unless they cause real harm.\n\
+- Review ALL dimensions — security, correctness, quality, style, performance — but triage ruthlessly \
+by priority: P0/P1 only for real harm (bugs, security, data loss, intent mismatches); file style and \
+quality observations as P2 so they never crowd out blockers.\n\
 - Be brief and concrete. Title ≤ ~8 words. Body 1–2 sentences: what's wrong and why it matters — no \
 restating the code, no hedging, no praise.\n\
 - Favour a few high-confidence findings over many shallow ones. If the change is sound, say so in \
@@ -60,13 +61,14 @@ Keep `summary` to 1–3 sentences: does the change do what it intends, and is it
 /// operator-overridable.
 pub const OUTPUT_CONTRACT: &str = "\
 Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; never \
-comment on untouched code. Set `severity` to `error` (must fix), `warning` (should fix), or `info` \
-(minor/FYI). Each finding has a standard shape: a short `title`, a `body` that is the detailed \
-explanation, an optional `suggestion`, and optional `resources`. When you propose a fix, put the \
-EXACT replacement source for that one line in `suggestion` (no diff markers, no fences) so it applies \
-as a GitHub suggestion. Put any supporting links (docs, CWE, RFCs) in `resources` as full URLs.\n\n\
+comment on untouched code. Give each finding a `priority` — `P0` (must fix), `P1` (should fix), or \
+`P2` (minor/FYI) — and a `category` — `security`, `correctness`, `quality`, `style`, or `performance`. \
+Each finding also has a short `title`, a `body` that is the detailed explanation, an optional \
+`suggestion`, and optional `resources`. When you propose a fix, put the EXACT replacement source for \
+that one line in `suggestion` (no diff markers, no fences) so it applies as a GitHub suggestion. Put \
+any supporting links (docs, CWE, RFCs) in `resources` as full URLs.\n\n\
 Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
-{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"severity\": \"info|warning|error\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
+{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
 
 /// Produce the structured review, dispatching on the configured agent (ADR-0026): the native
 /// in-process loop (`REVIEW_AGENT=native`) or the OpenCode subprocess (default). Both submit the same
