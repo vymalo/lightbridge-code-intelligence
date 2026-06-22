@@ -168,13 +168,22 @@ Trade-off: the base index tracks the **default branch**, so it can go stale as t
 Follow-up (not yet built): a periodic/push-driven re-index of the default branch, or incremental
 diff-only indexing for reviews, so search also covers brand-new PR symbols.
 
-## Future direction: control sidecar + externally-defined pipeline (ADR-0028, proposed)
+## Future direction (proposed ADRs 0028–0031)
 
 Today the runner's pipeline (clone → index → graph → review) is **hardcoded** in
 `agent-runner/src/main.rs:run()`, and the Job is a single container whose shape is built in
-`control-plane/src/k8s.rs:job_manifest()`. [ADR-0028](adr/0028-agent-job-control-sidecar-external-pipeline.md)
-(**proposed**) would restructure the Job into a small **control sidecar** (bootstrap, ordering,
-status, the self-cancel poll, log shipping) plus **heavy main container(s)**, with the **step list
-defined externally** (a ConfigMap now, a CRD later) so an operator can add a step (e.g. SAST) or a
-volume without code changes — while preserving the trust-boundary properties (ADR-0002/0017/0020/0022).
-One Job per task (ADR-0004) is unchanged.
+`control-plane/src/k8s.rs:job_manifest()`. A set of **proposed** ADRs reshapes this:
+
+- **[ADR-0028](adr/0028-agent-job-control-sidecar.md)** — restructure the Job into a small **control
+  sidecar** (bootstrap, ordering, status, the self-cancel poll, log shipping) + a **single configurable
+  main container** (the heavy work). The pipeline stays a **closed built-in set**, expressed as internal
+  ordered config (so conditions like ADR-0025 reuse are declared, and phases are resource-sized). One
+  Job per task (ADR-0004) is unchanged; the trust boundary (ADR-0002/0017/0020/0022) is preserved.
+- **[ADR-0029](adr/0029-focused-review-not-generic-runner.md)** — scope boundary: Lightbridge stays a
+  **focused code-review system, not a generic step/CI runner**. We explicitly reject arbitrary
+  `command`/SAST steps in the Job, a `ReviewJob` CRD/operator, and external workflow engines —
+  extensibility belongs at the *understanding* layer, not the *execution* path.
+- **[ADR-0030](adr/0030-repo-review-config.md)** / **[ADR-0031](adr/0031-review-skills-commands.md)** —
+  that understanding layer: an optional `.lightbridge-code-review.jsonc` lets a repo declare conventions,
+  focus/ignore paths, instructions, and named **skills/commands** (`@mention`-invokable) that ground the
+  review — read as **data, never executed**, and still validated/posted on the trusted side (ADR-0022).
