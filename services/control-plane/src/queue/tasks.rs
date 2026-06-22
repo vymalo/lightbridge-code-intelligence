@@ -129,6 +129,28 @@ pub async fn get_transcript(
     }
 }
 
+/// `GET /tasks/{id}/feedback` — 👍/👎 reactions captured on the run's posted comments (ADR-0035),
+/// with the file/line of the finding each reacts to. Empty array when none. Gated `review:read`.
+pub async fn get_feedback(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(e) = caller.require("review:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::get_feedback(pool, id).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "get feedback failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `GET /repositories` — connected repositories + their run activity (the Repositories view).
 pub async fn list_repositories(caller: Caller, State(state): State<AppState>) -> Response {
     if let Err(e) = caller.require("repo:read") {

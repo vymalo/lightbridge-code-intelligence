@@ -250,6 +250,157 @@ pub async fn get_transcript(
     .await
 }
 
+// ── ADR-0035 review feedback (poll reactions on our comments) ───────────────────────────────────
+
+/// A comment we created at write-back, recorded so the poller knows what to poll. `kind` selects the
+/// reactions endpoint (`inline` → pulls/comments, `reply` → issues/comments); `file`/`line` correlate
+/// an inline comment to its finding.
+#[derive(Debug, Clone)]
+pub struct ReviewCommentRef {
+    pub github_comment_id: i64,
+    pub kind: String,
+    pub file: Option<String>,
+    pub line: Option<i32>,
+}
+
+/// Record the comment ids created for a task (idempotent — a re-post DO NOTHINGs on the existing id).
+pub async fn store_review_comments(
+    pool: &PgPool,
+    task_id: Uuid,
+    comments: &[ReviewCommentRef],
+) -> Result<(), sqlx::Error> {
+    for c in comments {
+        sqlx::query(
+            "INSERT INTO review_comments (id, task_id, github_comment_id, kind, file, line) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (kind, github_comment_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(task_id)
+        .bind(c.github_comment_id)
+        .bind(&c.kind)
+        .bind(&c.file)
+        .bind(c.line)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// A comment the poller should check for reactions, with the repo coordinates + installation needed to
+/// mint a token and hit the reactions API.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PollableComment {
+    pub task_id: Uuid,
+    pub github_comment_id: i64,
+    pub kind: String,
+    pub owner: String,
+    pub name: String,
+    pub installation_id: i64,
+}
+
+/// Comments to poll this cycle (ADR-0035), within `within_days`, **tiered by age** so API usage stays
+/// flat regardless of repo activity instead of re-reading every comment every cycle: fresh comments
+/// (< 1 day) every cycle, 1–3 days old ~1-in-12 cycles, 3+ days old ~1-in-72 cycles. The tier filter
+/// is a deterministic `comment_id % N == current_cycle % N` (the cycle index is wall-clock /
+/// `interval_secs`), so it needs no per-comment state and spreads load evenly across cycles. Joined to
+/// the repo for owner/name/installation.
+pub async fn list_pollable_comments(
+    pool: &PgPool,
+    within_days: i32,
+    interval_secs: i64,
+) -> Result<Vec<PollableComment>, sqlx::Error> {
+    sqlx::query_as::<_, PollableComment>(
+        "SELECT rc.task_id, rc.github_comment_id, rc.kind, r.owner, r.name, t.installation_id \
+         FROM review_comments rc \
+         JOIN tasks t ON t.id = rc.task_id \
+         JOIN repositories r ON r.id = t.repository_id \
+         WHERE t.created_at > now() - ($1 * interval '1 day') \
+           AND ( \
+             rc.created_at > now() - interval '1 day' \
+             OR (rc.created_at BETWEEN now() - interval '3 days' AND now() - interval '1 day' \
+                 AND (rc.github_comment_id % 12) = (extract(epoch from now())::bigint / $2) % 12) \
+             OR (rc.created_at < now() - interval '3 days' \
+                 AND (rc.github_comment_id % 72) = (extract(epoch from now())::bigint / $2) % 72) \
+           ) \
+         ORDER BY rc.created_at",
+    )
+    .bind(within_days)
+    .bind(interval_secs.max(1))
+    .fetch_all(pool)
+    .await
+}
+
+/// Reconcile the reactions on one comment with GitHub (ADR-0035): insert any new `(reactor, reaction)`
+/// and delete any that have disappeared (the un-react case — no webhook needed). `reactions` is the
+/// current full set from the API; an empty set removes all stored feedback for the comment.
+pub async fn reconcile_comment_feedback(
+    pool: &PgPool,
+    task_id: Uuid,
+    github_comment_id: i64,
+    kind: &str,
+    reactions: &[(String, String)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for (reactor, reaction) in reactions {
+        sqlx::query(
+            "INSERT INTO review_feedback \
+             (id, task_id, github_comment_id, comment_kind, reactor, reaction) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (github_comment_id, comment_kind, reactor, reaction) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(task_id)
+        .bind(github_comment_id)
+        .bind(kind)
+        .bind(reactor)
+        .bind(reaction)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // Drop feedback no longer present on GitHub. `reactor` and `reaction` are constrained values (a
+    // GitHub login and a fixed reaction vocabulary), so `|` is a safe key separator. An empty
+    // `present` set makes `<> ALL('{}')` true for every row → all are deleted.
+    let present: Vec<String> = reactions.iter().map(|(u, c)| format!("{u}|{c}")).collect();
+    sqlx::query(
+        "DELETE FROM review_feedback \
+         WHERE github_comment_id = $1 AND comment_kind = $2 \
+           AND (reactor || '|' || reaction) <> ALL($3)",
+    )
+    .bind(github_comment_id)
+    .bind(kind)
+    .bind(&present)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// One stored reaction, serialized to `GET /tasks/{id}/feedback` (ADR-0035). `file`/`line` are joined
+/// from the comment so the dashboard can show feedback per finding.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct FeedbackRow {
+    pub github_comment_id: i64,
+    pub comment_kind: String,
+    pub reactor: String,
+    pub reaction: String,
+    pub file: Option<String>,
+    pub line: Option<i32>,
+}
+
+/// All feedback recorded for a task (ADR-0035), for the dashboard.
+pub async fn get_feedback(pool: &PgPool, task_id: Uuid) -> Result<Vec<FeedbackRow>, sqlx::Error> {
+    sqlx::query_as::<_, FeedbackRow>(
+        "SELECT f.github_comment_id, f.comment_kind, f.reactor, f.reaction, rc.file, rc.line \
+         FROM review_feedback f \
+         LEFT JOIN review_comments rc \
+           ON rc.github_comment_id = f.github_comment_id AND rc.kind = f.comment_kind \
+         WHERE f.task_id = $1 ORDER BY f.created_at",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+}
+
 // ── ADR-0037 pending review actions ────────────────────────────────────────────────────────────
 // The agent's mediated write tools (add_review_comment / add_comment / set_summary) accumulate here
 // during a run; the control plane flushes them as one grouped review on clean completion.
@@ -1799,6 +1950,85 @@ mod tests {
         );
 
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    /// ADR-0035: reconcile reactions on a comment — new ones are inserted, vanished ones (un-react)
+    /// are deleted, and an empty set clears all. `get_feedback` joins the finding's file/line.
+    #[sqlx::test]
+    async fn feedback_reconcile_inserts_and_removes(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        store_review_comments(
+            &pool,
+            task_id,
+            &[ReviewCommentRef {
+                github_comment_id: 555,
+                kind: "inline".to_string(),
+                file: Some("a.rs".to_string()),
+                line: Some(7),
+            }],
+        )
+        .await
+        .unwrap();
+
+        // The comment is pollable (joined to repo identity + installation).
+        let pollable = list_pollable_comments(&pool, 14, 300).await.unwrap();
+        assert_eq!(pollable.len(), 1);
+        assert_eq!(pollable[0].github_comment_id, 555);
+        assert_eq!(pollable[0].owner, "octo");
+
+        // First cycle: two reactions.
+        reconcile_comment_feedback(
+            &pool,
+            task_id,
+            555,
+            "inline",
+            &[
+                ("alice".to_string(), "+1".to_string()),
+                ("bob".to_string(), "-1".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        let fb = get_feedback(&pool, task_id).await.unwrap();
+        assert_eq!(fb.len(), 2);
+        assert!(fb
+            .iter()
+            .any(|r| r.reactor == "alice" && r.reaction == "+1"));
+        assert_eq!(
+            fb[0].file.as_deref(),
+            Some("a.rs"),
+            "joined from review_comments"
+        );
+
+        // Second cycle: alice un-reacted, carol added → reconcile removes alice, keeps bob, adds carol.
+        reconcile_comment_feedback(
+            &pool,
+            task_id,
+            555,
+            "inline",
+            &[
+                ("bob".to_string(), "-1".to_string()),
+                ("carol".to_string(), "heart".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        let fb = get_feedback(&pool, task_id).await.unwrap();
+        assert_eq!(fb.len(), 2);
+        assert!(!fb.iter().any(|r| r.reactor == "alice"), "un-react removed");
+        assert!(fb
+            .iter()
+            .any(|r| r.reactor == "carol" && r.reaction == "heart"));
+
+        // Empty cycle (all reactions gone) clears the comment's feedback.
+        reconcile_comment_feedback(&pool, task_id, 555, "inline", &[])
+            .await
+            .unwrap();
+        assert!(get_feedback(&pool, task_id).await.unwrap().is_empty());
     }
 
     /// ADR-0034: a transcript stores in order and a re-submit replaces it (a task retry re-sends the
