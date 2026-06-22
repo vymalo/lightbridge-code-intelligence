@@ -213,9 +213,10 @@ impl Tools<'_> {
                 Ok(review) => ToolOutcome::Submit(review),
                 // Don't end the run on a bad payload — tell the model the expected shape so it retries.
                 Err(e) => ToolOutcome::Continue(format!(
-                    "{e} Expected {{\"summary\": string, \"findings\": [{{\"file\", \"line\" (int), \
-                     \"priority\" (P0|P1|P2), \"category\" (security|correctness|quality|style|performance), \
-                     \"title\", \"body\", optional \"suggestion\", optional \"resources\"}}]}}."
+                    "{e} Expected JSON like {{\"summary\": \"…\", \"findings\": [{{\"file\": \"path\", \
+                     \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"…\", \
+                     \"body\": \"…\", \"suggestion\": \"optional\", \"resources\": [\"optional\"]}}]}}. \
+                     priority is P0|P1|P2; category is security|correctness|quality|style|performance."
                 )),
             },
             REPORT_PROGRESS => match parse::<NoteArgs>(args) {

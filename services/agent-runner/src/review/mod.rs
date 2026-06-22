@@ -68,7 +68,7 @@ Each finding also has a short `title`, a `body` that is the detailed explanation
 that one line in `suggestion` (no diff markers, no fences) so it applies as a GitHub suggestion. Put \
 any supporting links (docs, CWE, RFCs) in `resources` as full URLs.\n\n\
 Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
-{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"priority\": \"P0|P1|P2\", \"category\": \"security|correctness|quality|style|performance\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
+{\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
 
 /// Produce the structured review, dispatching on the configured agent (ADR-0026): the native
 /// in-process loop (`REVIEW_AGENT=native`) or the OpenCode subprocess (default). Both submit the same
