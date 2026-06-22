@@ -299,11 +299,16 @@ pub struct PollableComment {
     pub installation_id: i64,
 }
 
-/// Comments to poll: those from tasks created within `within_days` (older reactions rarely change, so
-/// we bound the work). Joined to the repo for owner/name/installation.
+/// Comments to poll this cycle (ADR-0035), within `within_days`, **tiered by age** so API usage stays
+/// flat regardless of repo activity instead of re-reading every comment every cycle: fresh comments
+/// (< 1 day) every cycle, 1–3 days old ~1-in-12 cycles, 3+ days old ~1-in-72 cycles. The tier filter
+/// is a deterministic `comment_id % N == current_cycle % N` (the cycle index is wall-clock /
+/// `interval_secs`), so it needs no per-comment state and spreads load evenly across cycles. Joined to
+/// the repo for owner/name/installation.
 pub async fn list_pollable_comments(
     pool: &PgPool,
     within_days: i32,
+    interval_secs: i64,
 ) -> Result<Vec<PollableComment>, sqlx::Error> {
     sqlx::query_as::<_, PollableComment>(
         "SELECT rc.task_id, rc.github_comment_id, rc.kind, r.owner, r.name, t.installation_id \
@@ -311,9 +316,17 @@ pub async fn list_pollable_comments(
          JOIN tasks t ON t.id = rc.task_id \
          JOIN repositories r ON r.id = t.repository_id \
          WHERE t.created_at > now() - ($1 * interval '1 day') \
+           AND ( \
+             rc.created_at > now() - interval '1 day' \
+             OR (rc.created_at BETWEEN now() - interval '3 days' AND now() - interval '1 day' \
+                 AND (rc.github_comment_id % 12) = (extract(epoch from now())::bigint / $2) % 12) \
+             OR (rc.created_at < now() - interval '3 days' \
+                 AND (rc.github_comment_id % 72) = (extract(epoch from now())::bigint / $2) % 72) \
+           ) \
          ORDER BY rc.created_at",
     )
     .bind(within_days)
+    .bind(interval_secs.max(1))
     .fetch_all(pool)
     .await
 }
@@ -1962,7 +1975,7 @@ mod tests {
         .unwrap();
 
         // The comment is pollable (joined to repo identity + installation).
-        let pollable = list_pollable_comments(&pool, 14).await.unwrap();
+        let pollable = list_pollable_comments(&pool, 14, 300).await.unwrap();
         assert_eq!(pollable.len(), 1);
         assert_eq!(pollable[0].github_comment_id, 555);
         assert_eq!(pollable[0].owner, "octo");

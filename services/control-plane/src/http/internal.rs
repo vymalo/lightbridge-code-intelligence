@@ -685,7 +685,7 @@ pub async fn finalize_review(
                 posted_reply = true;
                 // Record the reply's id so the feedback poller can read its reactions (ADR-0035).
                 if let Some(cid) = posted_comment.id {
-                    let _ = crate::db::store_review_comments(
+                    if let Err(error) = crate::db::store_review_comments(
                         pool,
                         id,
                         &[crate::db::ReviewCommentRef {
@@ -695,7 +695,10 @@ pub async fn finalize_review(
                             line: None,
                         }],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(%error, task_id = %id, "storing reply comment id failed (non-fatal)");
+                    }
                 }
                 let _ = crate::db::clear_pending_action(pool, id, "comment").await;
             }

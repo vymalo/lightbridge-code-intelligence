@@ -27,33 +27,42 @@ pub async fn run(
         within_days,
         "feedback poller started"
     );
+    let interval_secs = interval.as_secs() as i64;
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        match poll_once(&pool, &app, within_days).await {
+        match poll_once(&pool, &app, within_days, interval_secs).await {
             Ok(n) => tracing::debug!(comments = n, "feedback poll cycle complete"),
             Err(error) => tracing::warn!(%error, "feedback poll cycle failed (will retry)"),
         }
     }
 }
 
-/// One poll cycle: for each recent comment we own, read its reactions and reconcile. Returns the
-/// number of comments checked. Mints at most one installation token per installation per cycle.
-async fn poll_once(pool: &PgPool, app: &GithubApp, within_days: i32) -> anyhow::Result<usize> {
-    let comments = crate::db::list_pollable_comments(pool, within_days).await?;
-    let mut tokens: HashMap<i64, String> = HashMap::new();
+/// One poll cycle: for each comment due this cycle (age-tiered), read its reactions and reconcile.
+/// Returns the number of comments checked. Mints at most one installation token per installation per
+/// cycle — and caches a mint *failure* too, so one bad installation isn't retried for every comment.
+async fn poll_once(
+    pool: &PgPool,
+    app: &GithubApp,
+    within_days: i32,
+    interval_secs: i64,
+) -> anyhow::Result<usize> {
+    let comments = crate::db::list_pollable_comments(pool, within_days, interval_secs).await?;
+    // `None` caches a failed mint so subsequent comments for that installation skip immediately.
+    let mut tokens: HashMap<i64, Option<String>> = HashMap::new();
     let mut checked = 0;
     for c in &comments {
-        // Mint (and cache for this cycle) an installation token; skip the comment if it fails.
         let token = match tokens.get(&c.installation_id) {
-            Some(t) => t.clone(),
+            Some(Some(t)) => t.clone(),
+            Some(None) => continue, // mint already failed this cycle
             None => match app.installation_token(c.installation_id).await {
                 Ok(t) => {
-                    tokens.insert(c.installation_id, t.clone());
+                    tokens.insert(c.installation_id, Some(t.clone()));
                     t
                 }
                 Err(error) => {
                     tracing::warn!(%error, installation = c.installation_id, "mint token for poll failed");
+                    tokens.insert(c.installation_id, None);
                     continue;
                 }
             },
