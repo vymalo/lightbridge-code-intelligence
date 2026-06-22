@@ -1,0 +1,64 @@
+# Run the control-plane Rust test suite, including the `#[sqlx::test]` integration tests that
+# need a live Postgres. These were previously local-only (they require a reachable DATABASE_URL),
+# so schema regressions slipped through unnoticed — e.g. migration 0005 widening the embedding
+# column to vector(4096) left a test inserting a 1536-dim vector that only failed against a real DB
+# (#132 / #134). This job closes that gap.
+name: Control plane tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/control-plane/**"
+      - "services/config/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/control-plane-tests.yml"
+  pull_request:
+    paths:
+      - "services/control-plane/**"
+      - "services/config/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/control-plane-tests.yml"
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: control-plane-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      # pgvector/pgvector:pg17 mirrors compose.yaml: the migrations do `CREATE EXTENSION vector`
+      # and create `vector(4096)` columns, so a stock postgres image would fail. `#[sqlx::test]`
+      # provisions a throwaway database per test (the `lightbridge` superuser can CREATE DATABASE)
+      # and runs the migrations itself. Neo4j is not needed — the one graph test is `#[ignore]`d.
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: lightbridge
+          POSTGRES_PASSWORD: lightbridge
+          POSTGRES_DB: lightbridge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lightbridge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://lightbridge:lightbridge@localhost:5432/lightbridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Cache the registry, git deps, and target/ keyed on Cargo.lock for fast reruns.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: cargo test -p control-plane
+        run: cargo test -p control-plane --locked
