@@ -52,7 +52,8 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0030](0030-repo-review-config.md) | Repo-level review configuration (`.lightbridge-code-review.jsonc`) — extend understanding, not execution | Proposed |
 | [0031](0031-review-skills-commands.md) | Custom review skills/commands via the repo config (named prompts, `@mention`-invokable) | Proposed |
 | [0032](0032-review-finding-priority-and-category.md) | Review findings carry a priority (P0–P2) + category (security always red), reviewed across all dimensions | Proposed |
-| [0033](0033-inbound-command-parsing-and-run-kinds.md) | Parse the `@mention` comment body; run kinds (review / conversational `ask` / skill) + non-PR targets | Proposed |
+| [0033](0033-inbound-command-parsing-and-run-kinds.md) | Parse the `@mention` comment body; run kinds (review / conversational `ask` / skill) + non-PR targets | Proposed (run-kind mechanism revised by ADR-0037) |
 | [0034](0034-agent-run-transcript-and-observability.md) | Persist the agent run transcript (tool calls, reasoning, tokens) and surface it in the dashboard | Proposed |
 | [0035](0035-review-feedback-signal.md) | Capture 👍/👎 on posted reviews as a quality feedback signal (persist comment IDs, store + display) | Proposed |
 | [0036](0036-auto-read-agent-instruction-files.md) | Auto-read conventional agent instruction files (AGENTS.md → CLAUDE.md → …) as review context, ranked, untrusted | Proposed |
+| [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Proposed |
