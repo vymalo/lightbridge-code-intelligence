@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams};
 use super::tools::{tool_defs, ToolOutcome, Tools, ADD_REVIEW_COMMENT};
-use crate::bootstrap::client::ControlPlaneClient;
+use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
@@ -52,6 +52,9 @@ pub async fn run_native_agent(
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
     task_id: Uuid,
+    // Accumulates the run transcript (ADR-0034) as the loop progresses. The caller owns it and submits
+    // it afterwards (even on error), so a failed run's reasoning is still captured.
+    transcript: &mut Vec<TranscriptEntry>,
 ) -> anyhow::Result<()> {
     let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
         .with_attribution(attribution);
@@ -80,8 +83,19 @@ pub async fn run_native_agent(
             .complete(&messages, &defs, params)
             .await
             .with_context(|| format!("agent chat turn {turn}"))?;
+        let usage = completion.usage;
         let assistant = completion.message;
         let calls = assistant.tool_calls.clone();
+        // Record the assistant turn in the transcript (ADR-0034): its reasoning + tool calls + tokens.
+        transcript.push(TranscriptEntry {
+            role: "assistant".to_string(),
+            content: assistant.content.clone(),
+            tool_calls: (!calls.is_empty())
+                .then(|| serde_json::to_value(&calls).unwrap_or_default()),
+            tool_name: None,
+            prompt_tokens: usage.and_then(|u| u.prompt_tokens),
+            completion_tokens: usage.and_then(|u| u.completion_tokens),
+        });
         // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
         // requires before the matching tool-result messages.
         messages.push(assistant);
@@ -107,6 +121,15 @@ pub async fn run_native_agent(
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
+                    // Record the tool result in the transcript (bounded), then feed it back to the model.
+                    transcript.push(TranscriptEntry {
+                        role: "tool".to_string(),
+                        content: Some(truncate_on_boundary(&result, 2048).to_string()),
+                        tool_calls: None,
+                        tool_name: Some(call.function.name.clone()),
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                    });
                     messages.push(ChatMessage::tool(call.id.as_str(), result));
                 }
             }
@@ -330,6 +353,7 @@ mod tests {
             diff: "@@ -1,3 +1,4 @@\n fn validate() {}\n+// changed\n".to_string(),
             files: vec!["a.rs".to_string()],
         };
+        let mut transcript = Vec::new();
         run_native_agent(
             &review,
             "@lightbridge review",
@@ -339,9 +363,15 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            &mut transcript,
         )
         .await
         .expect("agent finishes cleanly");
+        // The transcript captured the assistant turns (search → add_review_comment → finish).
+        assert!(
+            transcript.iter().any(|e| e.role == "assistant"),
+            "transcript records assistant turns"
+        );
     }
 
     // No diff → `add_review_comment` is not offered (an inline finding can't anchor); the rest of the
@@ -373,9 +403,19 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(&review, "review", None, None, &[], &cpc, &embc, Uuid::nil())
-            .await
-            .expect_err("abort is an error");
+        let err = run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("abort is an error");
         assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
     }
 
@@ -387,9 +427,19 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(&review, "review", None, None, &[], &cpc, &embc, Uuid::nil())
-            .await
-            .expect_err("should give up");
+        let err = run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("should give up");
         assert!(
             format!("{err:#}").contains("did not finish"),
             "got: {err:#}"

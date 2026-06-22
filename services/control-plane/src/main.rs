@@ -222,6 +222,7 @@ fn app(state: AppState) -> Router {
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/tasks/{id}/review", get(tasks::get_review))
+        .route("/tasks/{id}/transcript", get(tasks::get_transcript))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
         // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
@@ -252,6 +253,11 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
+        )
+        // The agent run transcript (ADR-0034): the runner submits it at run end.
+        .route(
+            "/internal/tasks/{id}/transcript",
+            post(internal::ingest_transcript),
         )
         // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
         // flushes them as one grouped review on finalize.
