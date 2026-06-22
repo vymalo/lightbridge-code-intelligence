@@ -42,7 +42,84 @@ replacement source for that one line — no diff markers or fences), and optiona
 summary — silence is better than noise.\n\
 - If you genuinely cannot produce a useful review, call `abort` with a reason.";
 
-/// Run the native review loop and return the structured result the model submits.
+/// How a finished agent run ended: the model called one of the terminal tools. `review` and `ask`
+/// share the same loop and differ only in which terminal tool they advertise (so only one variant is
+/// reachable per run); the public wrappers map this to their own return type.
+enum Terminal {
+    Findings(ReviewResult),
+    Answer(String),
+}
+
+/// The one agent loop both run kinds share (ADR-0026): drive the [`ChatClient`] over a tool surface
+/// until the model calls a terminal tool, bounded by [`MAX_TURNS`]. The *only* things that vary
+/// between a `review` and an `ask` are the advertised tools (`defs`) and the seeded `messages`
+/// (persona + contract); everything else — retrieval, recovery from a bad tool call, cancellation,
+/// the turn budget — is identical, so it lives here once. A tool/argument error is fed back to the
+/// model as a recoverable turn; only `abort`, an exhausted budget, or a transport error fail the run.
+/// `label` names the run in errors/log context.
+#[allow(clippy::too_many_arguments)]
+async fn drive_agent(
+    review: &ReviewConfig,
+    defs: &[super::chat::ToolDef],
+    mut messages: Vec<ChatMessage>,
+    attribution: &[(String, String)],
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    task_id: Uuid,
+    label: &str,
+) -> anyhow::Result<Terminal> {
+    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
+        .with_attribution(attribution);
+    let tools = Tools {
+        client,
+        embedder,
+        task_id,
+    };
+    let params = ChatParams {
+        temperature: review.temperature,
+        top_p: review.top_p,
+        max_tokens: review.max_tokens,
+    };
+
+    for turn in 0..MAX_TURNS {
+        let completion = chat
+            .complete(&messages, defs, params)
+            .await
+            .with_context(|| format!("{label} chat turn {turn}"))?;
+        let assistant = completion.message;
+        let calls = assistant.tool_calls.clone();
+        // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
+        // requires before the matching tool-result messages.
+        messages.push(assistant);
+
+        if calls.is_empty() {
+            // The model answered in prose instead of using the tools — steer it back to the contract.
+            messages.push(ChatMessage::user(
+                "Use the provided tools to investigate, then call the submit tool for this run \
+                 (or `abort` with a reason). Do not reply in prose.",
+            ));
+            continue;
+        }
+
+        for call in &calls {
+            match tools.dispatch(call).await {
+                ToolOutcome::Submit(result) => return Ok(Terminal::Findings(result)),
+                ToolOutcome::Answer(answer) => return Ok(Terminal::Answer(answer)),
+                ToolOutcome::Abort(reason) => anyhow::bail!("{label} agent aborted: {reason}"),
+                ToolOutcome::Continue(result) => {
+                    messages.push(ChatMessage::tool(call.id.as_str(), result));
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("{label} agent did not finish within {MAX_TURNS} turns")
+}
+
+/// Run the native review loop and return the structured result the model submits. A thin adapter over
+/// [`drive_agent`] with the review tool surface ([`tool_defs`]); the only terminal it expects is
+/// `submit_findings` (the `ask`-only [`Terminal::Answer`] is unreachable since `submit_answer` isn't
+/// advertised here, but is mapped to an error defensively).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_review(
     review: &ReviewConfig,
@@ -53,61 +130,22 @@ pub async fn run_native_review(
     embedder: &EmbeddingsClient,
     task_id: Uuid,
 ) -> anyhow::Result<ReviewResult> {
-    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
-        .with_attribution(attribution);
-    let tools = Tools {
+    let messages = build_messages(review, command, diff);
+    match drive_agent(
+        review,
+        &tool_defs(),
+        messages,
+        attribution,
         client,
         embedder,
         task_id,
-    };
-    let defs = tool_defs();
-    let params = ChatParams {
-        temperature: review.temperature,
-        top_p: review.top_p,
-        max_tokens: review.max_tokens,
-    };
-
-    let mut messages = build_messages(review, command, diff);
-
-    for turn in 0..MAX_TURNS {
-        let completion = chat
-            .complete(&messages, &defs, params)
-            .await
-            .with_context(|| format!("review chat turn {turn}"))?;
-        let assistant = completion.message;
-        let calls = assistant.tool_calls.clone();
-        // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
-        // requires before the matching tool-result messages.
-        messages.push(assistant);
-
-        if calls.is_empty() {
-            // The model answered in prose instead of using the tools — steer it back to the contract.
-            messages.push(ChatMessage::user(
-                "Use the provided tools to investigate, then call `submit_findings` with your \
-                 review (or `abort` with a reason). Do not reply in prose.",
-            ));
-            continue;
-        }
-
-        for call in &calls {
-            match tools.dispatch(call).await {
-                ToolOutcome::Submit(result) => return Ok(result),
-                ToolOutcome::Abort(reason) => anyhow::bail!("review agent aborted: {reason}"),
-                ToolOutcome::Continue(result) => {
-                    messages.push(ChatMessage::tool(call.id.as_str(), result));
-                }
-                // `submit_answer` isn't advertised for a review, but guard the shared dispatch: steer
-                // the model back to the review contract rather than ending the run.
-                ToolOutcome::Answer(_) => messages.push(ChatMessage::tool(
-                    call.id.as_str(),
-                    "This is a review run — call `submit_findings`, not `submit_answer`."
-                        .to_string(),
-                )),
-            }
-        }
+        "review",
+    )
+    .await?
+    {
+        Terminal::Findings(result) => Ok(result),
+        Terminal::Answer(_) => anyhow::bail!("review run produced an answer instead of findings"),
     }
-
-    anyhow::bail!("review agent did not submit findings within {MAX_TURNS} turns")
 }
 
 /// The native **ask** contract (ADR-0033): the analogue of [`NATIVE_CONTRACT`] for a conversational
@@ -123,9 +161,9 @@ blocks where they help.\n\
 answer in prose outside the tool.\n\
 - If you genuinely cannot answer, call `abort` with a reason.";
 
-/// Run the native **ask** loop (ADR-0033) and return the Markdown answer the model submits. Mirrors
-/// [`run_native_review`] but over the `ask` tool surface ([`ask_tool_defs`]) — the run ends with a
-/// conversational answer instead of findings.
+/// Run the native **ask** loop (ADR-0033) and return the Markdown answer the model submits. The
+/// mirror of [`run_native_review`] over the `ask` tool surface ([`ask_tool_defs`]) — same loop, the
+/// run just ends with `submit_answer` instead of `submit_findings`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_ask(
     review: &ReviewConfig,
@@ -136,56 +174,22 @@ pub async fn run_native_ask(
     embedder: &EmbeddingsClient,
     task_id: Uuid,
 ) -> anyhow::Result<String> {
-    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
-        .with_attribution(attribution);
-    let tools = Tools {
+    let messages = build_ask_messages(review, question, diff);
+    match drive_agent(
+        review,
+        &ask_tool_defs(),
+        messages,
+        attribution,
         client,
         embedder,
         task_id,
-    };
-    let defs = ask_tool_defs();
-    let params = ChatParams {
-        temperature: review.temperature,
-        top_p: review.top_p,
-        max_tokens: review.max_tokens,
-    };
-
-    let mut messages = build_ask_messages(review, question, diff);
-
-    for turn in 0..MAX_TURNS {
-        let completion = chat
-            .complete(&messages, &defs, params)
-            .await
-            .with_context(|| format!("ask chat turn {turn}"))?;
-        let assistant = completion.message;
-        let calls = assistant.tool_calls.clone();
-        messages.push(assistant);
-
-        if calls.is_empty() {
-            messages.push(ChatMessage::user(
-                "Use the provided tools to investigate, then call `submit_answer` with your \
-                 Markdown answer (or `abort` with a reason). Do not reply in prose.",
-            ));
-            continue;
-        }
-
-        for call in &calls {
-            match tools.dispatch(call).await {
-                ToolOutcome::Answer(answer) => return Ok(answer),
-                ToolOutcome::Abort(reason) => anyhow::bail!("ask agent aborted: {reason}"),
-                ToolOutcome::Continue(result) => {
-                    messages.push(ChatMessage::tool(call.id.as_str(), result));
-                }
-                // `submit_findings` isn't advertised for an ask; steer back to `submit_answer`.
-                ToolOutcome::Submit(_) => messages.push(ChatMessage::tool(
-                    call.id.as_str(),
-                    "This is an ask run — call `submit_answer`, not `submit_findings`.".to_string(),
-                )),
-            }
-        }
+        "ask",
+    )
+    .await?
+    {
+        Terminal::Answer(answer) => Ok(answer),
+        Terminal::Findings(_) => anyhow::bail!("ask run produced findings instead of an answer"),
     }
-
-    anyhow::bail!("ask agent did not submit an answer within {MAX_TURNS} turns")
 }
 
 /// Assemble the system (ask guidance + contract) and user (question + diff as context) messages for
@@ -557,7 +561,7 @@ mod tests {
             .await
             .expect_err("should give up");
         assert!(
-            format!("{err:#}").contains("did not submit"),
+            format!("{err:#}").contains("did not finish"),
             "got: {err:#}"
         );
     }
