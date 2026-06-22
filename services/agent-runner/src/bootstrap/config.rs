@@ -46,9 +46,8 @@ pub struct ReviewFile {
     pub system_prompt_file: Option<String>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_diff_chars: Option<usize>,
-    /// Generation params for the review model, passed through to opencode.json (the OpenAI-compatible
-    /// provider). All optional — unset means the model/provider default. Numeric-string tolerant so
-    /// `{env:…}`-substituted values (always strings) still deserialize.
+    /// Generation params for the review model. All optional — unset means the model/provider default.
+    /// Numeric-string tolerant so `{env:…}`-substituted values (always strings) still deserialize.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
     pub temperature: Option<f64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
@@ -138,39 +137,17 @@ fn require_field(section: &str, name: &str, value: &str) -> anyhow::Result<Strin
     Ok(value.to_string())
 }
 
-/// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
-/// gateway in prod; ADR-0021). Like embeddings, **no default model** so a misconfigured Job fails
-/// loudly. Optional as a whole: absent `LLM_MODEL`, the runner skips the review step (indexing-only).
-/// Which review agent the runner drives (ADR-0026). The in-process native Rust loop is the **default**;
-/// set `REVIEW_AGENT=opencode` to fall back to the legacy OpenCode subprocess (kept until a
-/// real-gateway dogfood confirms native, then removed along with OpenCode/Bun from the image).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReviewAgent {
-    /// Legacy OpenCode subprocess — the rollback path (`REVIEW_AGENT=opencode`).
-    OpenCode,
-    /// In-process native Rust loop (ADR-0026).
-    #[default]
-    Native,
-}
-
-impl ReviewAgent {
-    fn from_env() -> Self {
-        match std::env::var("REVIEW_AGENT") {
-            Ok(v) if v.eq_ignore_ascii_case("opencode") => Self::OpenCode,
-            _ => Self::default(), // native
-        }
-    }
-}
-
+/// Configuration for the native review agent's LLM — an OpenAI-compatible Chat Completions endpoint
+/// (the eaig gateway in prod; ADR-0018/0026). Like embeddings, **no default model** so a misconfigured
+/// Job fails loudly. Optional as a whole: absent `LLM_MODEL`, the runner skips the review step
+/// (indexing-only).
 #[derive(Debug, Clone)]
 pub struct ReviewConfig {
-    /// Which agent produces the review (ADR-0026); from `REVIEW_AGENT`.
-    pub agent: ReviewAgent,
-    /// Base URL of the OpenAI-compatible chat endpoint (the `provider.options.baseURL` opencode uses).
+    /// Base URL of the OpenAI-compatible Chat Completions endpoint.
     pub base_url: String,
     /// API key for the gateway.
     pub api_key: String,
-    /// Chat model id, referenced by opencode as `eaig/<model>`.
+    /// Chat model id.
     pub model: String,
     /// The reviewer's *guidance* (persona + what to focus on), from the `review.system_prompt_file`
     /// template (file config) or `REVIEW_SYSTEM_PROMPT` (env). **Required — there is no built-in
@@ -180,7 +157,7 @@ pub struct ReviewConfig {
     pub system_prompt: String,
     /// Ceiling on the diff pasted into the prompt; from `review.max_diff_chars` or the default.
     pub max_diff_chars: usize,
-    /// Generation params for the review model (→ opencode.json). `None` = provider/model default.
+    /// Generation params for the review model. `None` = provider/model default.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
@@ -198,7 +175,6 @@ impl ReviewConfig {
             return Ok(None);
         }
         Ok(Some(Self {
-            agent: ReviewAgent::from_env(),
             base_url: require("LLM_BASE_URL")?,
             api_key: require("LLM_API_KEY")?,
             model: require("LLM_MODEL")?,
@@ -221,7 +197,6 @@ impl ReviewConfig {
             return Ok(None); // review explicitly disabled
         }
         Ok(Some(Self {
-            agent: ReviewAgent::from_env(),
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
             model: require_field("review", "model", &r.model)?,
@@ -275,8 +250,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_agent_defaults_to_native() {
-        // ADR-0026 cutover: native is the default; OpenCode is now opt-in (the rollback path).
-        assert_eq!(ReviewAgent::default(), ReviewAgent::Native);
+    fn review_config_requires_a_system_prompt() {
+        // ADR-0037: no built-in default. With no prompt source set, resolving review fails closed.
+        // (Guard against env bleed from a parallel test by asserting the error mentions the prompt.)
+        std::env::remove_var("REVIEW_SYSTEM_PROMPT");
+        let file = FileConfig {
+            embeddings: None,
+            review: Some(ReviewFile {
+                base_url: "https://gw/v1".to_string(),
+                api_key: "k".to_string(),
+                model: "m".to_string(),
+                system_prompt_file: None,
+                max_diff_chars: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+            }),
+        };
+        let err =
+            ReviewConfig::resolve(Some(&file)).expect_err("must fail closed without a prompt");
+        assert!(
+            format!("{err:#}").contains("system prompt"),
+            "error names the missing prompt: {err:#}"
+        );
     }
 }

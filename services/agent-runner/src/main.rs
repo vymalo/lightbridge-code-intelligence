@@ -13,7 +13,7 @@
 //! required; the structural graph and the review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
-use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewAgent, ReviewConfig, RunnerConfig};
+use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
 use agent_runner::clone;
 use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review};
@@ -227,60 +227,32 @@ async fn run(
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
-            match review.agent {
-                ReviewAgent::Native => {
-                    match review::run_native_agent(
-                        review,
-                        &context.command,
-                        diff.as_ref(),
-                        &attribution,
-                        client,
-                        &embedder,
-                        config.task_id,
-                    )
-                    .await
-                    {
-                        // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed
-                        // run is NOT finalized, so a mid-run death posts nothing (crash-safe).
-                        // Finalize failure is fatal (unlike the rest of review, which is best-effort):
-                        // the review is ready and the failure is almost always transient (GitHub /
-                        // network), so we want the task marked failed and retried rather than silently
-                        // succeeded with nothing posted. A retry re-runs the agent from a cleared
-                        // buffer; the single-artifact case re-posts cleanly (the failed attempt posted
-                        // nothing), the rare mixed reply+review case may duplicate the part that did
-                        // post — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
-                        Ok(()) => {
-                            client.finalize_review(config.task_id).await?;
-                            "review posted".to_string()
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "review run failed (non-fatal; nothing posted)");
-                            "review failed".to_string()
-                        }
-                    }
+            match review::run_native_agent(
+                review,
+                &context.command,
+                diff.as_ref(),
+                &attribution,
+                client,
+                &embedder,
+                config.task_id,
+            )
+            .await
+            {
+                // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed run is
+                // NOT finalized, so a mid-run death posts nothing (crash-safe). Finalize failure IS
+                // fatal (unlike the rest of review, which is best-effort): the review is ready and the
+                // failure is almost always transient (GitHub/network), so the task fails + retries
+                // rather than being silently marked succeeded with nothing posted. A retry re-runs the
+                // agent from a cleared buffer; the single-artifact case re-posts cleanly (the failed
+                // attempt posted nothing), the rare mixed reply+review case may duplicate the part that
+                // did post — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
+                Ok(()) => {
+                    client.finalize_review(config.task_id).await?;
+                    "review posted".to_string()
                 }
-                ReviewAgent::OpenCode => {
-                    match review::run_opencode(
-                        &checkout,
-                        review,
-                        &context.command,
-                        diff.as_ref(),
-                        &attribution,
-                    )
-                    .await
-                    {
-                        Ok(result) => match client.submit_review(config.task_id, &result).await {
-                            Ok(()) => format!("{} findings posted", result.findings.len()),
-                            Err(error) => {
-                                tracing::warn!(%error, "submitting review failed (non-fatal)");
-                                format!("{} findings (post failed)", result.findings.len())
-                            }
-                        },
-                        Err(error) => {
-                            tracing::warn!(%error, "review failed (non-fatal)");
-                            "review failed".to_string()
-                        }
-                    }
+                Err(error) => {
+                    tracing::warn!(%error, "review run failed (non-fatal; nothing posted)");
+                    "review failed".to_string()
                 }
             }
         }

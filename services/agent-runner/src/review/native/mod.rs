@@ -1,15 +1,14 @@
-//! Native Rust review agent (ADR-0026) — the in-process replacement for the OpenCode subprocess.
+//! Native Rust review agent (ADR-0026 + ADR-0037) — the only review path (#140 removed OpenCode).
 //!
-//! Instead of spawning OpenCode and scraping a ` ```json ` block from its stdout, the runner drives
-//! its own agent loop against the eaig OpenAI-compatible **Chat Completions** endpoint with function
-//! calling. The review is returned by the model **calling a tool** (`submit_findings`), so the result
-//! is validated at a tool boundary rather than parsed from free text.
-//!
-//! Built in phases behind `REVIEW_AGENT=native|opencode` (ADR-0026). This module currently holds:
+//! The runner drives its own agent loop against the eaig OpenAI-compatible **Chat Completions**
+//! endpoint with function calling. The agent investigates with retrieval tools and **acts via mediated
+//! write tools** (`add_review_comment` / `add_comment` / `finish`); the control plane buffers those and
+//! flushes one grouped review on finalize, so results come from validated tool calls rather than
+//! scraped free text. This module holds:
 //!
 //! - [`chat`] — the Chat Completions client (request/response types + tool-call protocol).
-//! - [`tools`] — the agent's tool surface (retrieval + control) and the in-process dispatcher.
-//! - [`agent`] — the loop ([`agent::run_native_review`]), selected by `REVIEW_AGENT=native`.
+//! - [`tools`] — the agent's tool surface (retrieval + mediated write actions) and the dispatcher.
+//! - [`agent`] — the loop ([`agent::run_native_agent`]).
 
 pub mod agent;
 pub mod chat;

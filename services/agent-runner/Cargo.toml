@@ -5,23 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Lightbridge agent runner: the per-task Kubernetes Job that clones, indexes, and reviews a repo."
-# With the extra MCP-server bins below, `cargo run -p agent-runner` is ambiguous; pin the runner as
-# the default target so the package.json `dev` script (and `turbo`) keep working.
-default-run = "agent-runner"
 
 [[bin]]
 name = "agent-runner"
 path = "src/main.rs"
-
-# MCP servers OpenCode spawns over stdio (slice 4b, ADR-0020). They wrap the control-plane retrieval
-# API; they hold only the runner bearer + (vector) the embeddings key — no datastore credentials.
-[[bin]]
-name = "lightbridge-vector-mcp"
-path = "src/bin/vector-mcp.rs"
-
-[[bin]]
-name = "lightbridge-graph-mcp"
-path = "src/bin/graph-mcp.rs"
 
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
@@ -34,13 +21,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
-# Tree-sitter syntax-aware chunking (ADR-0010); MCP stdio tool servers (ADR-0020).
+# Tree-sitter syntax-aware chunking (ADR-0010).
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
-rmcp.workspace = true
 
 [dev-dependencies]
 # HTTP mocking for the control-plane client contract tests (no live control plane).
