@@ -72,15 +72,27 @@ The agent is given the user's message and a **toolbox**, and it *acts*:
    **at call time** and returns a recoverable error to the agent when the line isn't in the diff
    ("pick a changed line, or use `add_comment`") — the agent corrects itself; nothing is silently
    dropped.
-4. **Buffer, then flush once:** the control plane **accumulates** the inline comments + summary for the
-   task and, on **clean loop completion**, flushes them as **one grouped PR review** (preserving the
-   current single-review UX). Plain `add_comment`s post as thread comments. A run that aborts or dies
-   mid-way flushes **nothing** (crash-safe); a retried task is idempotent (accumulation is keyed by
-   task + run epoch, deduped by file+line+content-hash).
-5. **The run kind is emergent:** it is *derived* from which tools fired (inline findings ⇒ "review";
-   only a reply ⇒ "ask"; both ⇒ both) and recorded for analytics/observability — it is **no longer an
-   input** and there is **no up-front classifier**. `classify_kind` and the `submit_findings` /
-   `submit_answer` terminal split are retired.
+4. **Buffer, then flush once:** the control plane **accumulates everything** for the task — inline
+   findings, the summary, *and* any `add_comment` bodies — and posts **nothing** until **clean loop
+   completion**. On completion it flushes the inline findings + summary as **one grouped PR review**,
+   and consolidates the buffered `add_comment` bodies into **a single thread reply** (so multiple
+   `add_comment` calls never fan out into a notification storm). A run that aborts or dies mid-way
+   flushes nothing (crash-safe).
+5. **Idempotency on retry:** the accumulation buffer is keyed by `(task, run_epoch)` and is **cleared
+   when the runner (re)starts** that task, so a retry begins from empty rather than appending to a
+   partial buffer. Within a run, accumulated inline findings are deduplicated by **`(file, line)` —
+   last write wins**, *not* a content hash: an LLM re-run is non-deterministic and will reword the same
+   finding, so a content hash would let near-duplicates through; keying on position keeps the latest,
+   most-refined finding per line.
+6. **Empty runs always produce feedback:** the agent is instructed to call `set_summary` exactly once
+   as its final verdict (the analogue of the old always-call-`submit_findings`). If a run nonetheless
+   completes cleanly having called **no** write tool, the control plane posts a **default "no issues
+   found" review** so an `@mention`-triggered run never looks like a silent hang. (An `ask` that
+   produced no answer is likewise summarized rather than silent.)
+7. **The run kind is emergent:** it is *derived* from which tools fired (inline findings ⇒ "review";
+   only a reply ⇒ "ask"; both ⇒ both; neither ⇒ "review" with the default clean summary) and recorded
+   for analytics/observability — it is **no longer an input** and there is **no up-front classifier**.
+   `classify_kind` and the `submit_findings` / `submit_answer` terminal split are retired.
 
 ### Consequences
 
@@ -91,9 +103,11 @@ The agent is given the user's message and a **toolbox**, and it *acts*:
   crash-safety are preserved. Feedback ([ADR-0035](0035-review-feedback-signal.md)) gains per-comment
   granularity for free.
 - **Bad / accepted trade-off:** more internal write endpoints and **server-side accumulation state**
-  per in-flight task (flushed or discarded at end), plus an explicit **idempotency** mechanism for
-  retries. The summary/verdict and outcome labels move from fixed payload fields to a `set_summary`
-  tool + derivation, so a run that never calls it has no summary (mitigated by a default).
+  per in-flight task (flushed or discarded at end), plus a **clear-on-restart + `(file, line)`
+  last-write-wins** dedup so non-deterministic retries don't double-post. The summary/verdict and
+  outcome labels move from fixed payload fields to a `set_summary` tool + derivation, so the agent must
+  be steered to always call it — and the control plane backstops with a default clean review when it
+  doesn't, so feedback is never silent.
 - **Neutral / to watch:** [ADR-0022](0022-review-writeback-control-plane.md)'s "validate the whole
   batch, then post" becomes "validate per call, buffer, flush once at completion" — same guarantees,
   different timing. The transcript ([ADR-0034](0034-agent-run-transcript-and-observability.md))
