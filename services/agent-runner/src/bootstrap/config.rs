@@ -172,11 +172,12 @@ pub struct ReviewConfig {
     pub api_key: String,
     /// Chat model id, referenced by opencode as `eaig/<model>`.
     pub model: String,
-    /// Operator override for the reviewer's *guidance* (persona + what to focus on). From the
-    /// `review.system_prompt_file` template (file config) or `REVIEW_SYSTEM_PROMPT` (env). `None` →
-    /// the runner's built-in default guidance. The non-negotiable output-format contract is always
-    /// appended regardless, so an override can't break parsing.
-    pub system_prompt: Option<String>,
+    /// The reviewer's *guidance* (persona + what to focus on), from the `review.system_prompt_file`
+    /// template (file config) or `REVIEW_SYSTEM_PROMPT` (env). **Required — there is no built-in
+    /// default** (ADR-0037): a prompt this central is operational config, owned in the ai-helm chart
+    /// (`config.reviewSystemPrompt`), not a stale code constant. If review is enabled but no prompt is
+    /// configured, [`resolve`]/[`from_env`] error (fail closed) rather than running a weak fallback.
+    pub system_prompt: String,
     /// Ceiling on the diff pasted into the prompt; from `review.max_diff_chars` or the default.
     pub max_diff_chars: usize,
     /// Generation params for the review model (→ opencode.json). `None` = provider/model default.
@@ -201,9 +202,7 @@ impl ReviewConfig {
             base_url: require("LLM_BASE_URL")?,
             api_key: require("LLM_API_KEY")?,
             model: require("LLM_MODEL")?,
-            system_prompt: std::env::var("REVIEW_SYSTEM_PROMPT")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            system_prompt: require_system_prompt(None)?,
             max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
             temperature: None,
             top_p: None,
@@ -221,29 +220,42 @@ impl ReviewConfig {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
-        // Prompt source: the mounted template file when set, else the dispatcher-injected
-        // `REVIEW_SYSTEM_PROMPT` env (legacy passthrough), else None (built-in default guidance).
-        let system_prompt = match &r.system_prompt_file {
-            Some(path) if !path.trim().is_empty() => Some(
-                lightbridge_config::load_template(Path::new(path))
-                    .with_context(|| format!("loading review.system_prompt_file {path}"))?,
-            ),
-            _ => std::env::var("REVIEW_SYSTEM_PROMPT")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-        };
         Ok(Some(Self {
             agent: ReviewAgent::from_env(),
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
             model: require_field("review", "model", &r.model)?,
-            system_prompt,
+            system_prompt: require_system_prompt(r.system_prompt_file.as_deref())?,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
         }))
     }
+}
+
+/// Load the **required** reviewer system prompt (ADR-0037): the `system_prompt_file` template when a
+/// path is given, else the `REVIEW_SYSTEM_PROMPT` env. Errors if neither yields a non-empty prompt —
+/// there is deliberately no built-in default, so a misconfigured deploy fails the review closed
+/// instead of silently running a weak fallback. The prompt is owned in ai-helm
+/// (`config.reviewSystemPrompt`) and mounted into the Job.
+fn require_system_prompt(system_prompt_file: Option<&str>) -> anyhow::Result<String> {
+    let from_file = match system_prompt_file {
+        Some(path) if !path.trim().is_empty() => Some(
+            lightbridge_config::load_template(Path::new(path))
+                .with_context(|| format!("loading review.system_prompt_file {path}"))?,
+        ),
+        _ => None,
+    };
+    let prompt = from_file
+        .or_else(|| std::env::var("REVIEW_SYSTEM_PROMPT").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    prompt.context(
+        "no review system prompt configured: set review.system_prompt_file (mounted from the \
+         ai-helm `config.reviewSystemPrompt` ConfigMap) or REVIEW_SYSTEM_PROMPT. There is no \
+         built-in default (ADR-0037) — review fails closed without one.",
+    )
 }
 
 fn require(name: &str) -> anyhow::Result<String> {

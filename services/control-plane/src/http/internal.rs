@@ -625,71 +625,6 @@ pub async fn post_review(
     }
 }
 
-/// Body for `POST /internal/tasks/{id}/answer` — the agent's conversational answer (ADR-0033 `ask`).
-#[derive(Debug, Deserialize)]
-pub struct AnswerSubmission {
-    pub answer: String,
-}
-
-/// `POST /internal/tasks/{id}/answer` — post the agent's answer for an `ask` run (ADR-0033) as a
-/// single reply comment on the issue/PR thread. Unlike [`post_review`], the answer is **not**
-/// diff-validated and carries no inline comments: a question deserves a direct reply, not a review.
-/// Both PRs and issues use the `issues/{n}/comments` endpoint, so this works for either target.
-pub async fn post_answer(
-    _auth: RunnerAuth,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(submission): Json<AnswerSubmission>,
-) -> Response {
-    let Some(pool) = state.db.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
-    };
-    let Some(app) = state.github.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
-
-    let context = match crate::db::get_task_context(pool, id).await {
-        Ok(Some(context)) => context,
-        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "load task for answer failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
-        }
-    };
-
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
-        }
-    };
-
-    let issue = context.target_id;
-    let body = crate::review::render_answer_body(&submission.answer);
-    let target = ReviewTarget {
-        token: &token,
-        owner: &context.owner,
-        repo: &context.name,
-        pr: issue,
-    };
-    match app
-        .create_issue_comment(&token, &context.owner, &context.name, issue, &body)
-        .await
-    {
-        Ok(comment_url) => {
-            tracing::info!(task_id = %id, target = issue, url = comment_url.as_deref().unwrap_or(""), "answer posted");
-            react(app, &state.review, &target, "hooray").await;
-            Json(serde_json::json!({ "answered": true, "url": comment_url })).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "posting answer comment failed");
-            react(app, &state.review, &target, "confused").await;
-            (StatusCode::BAD_GATEWAY, "could not post answer").into_response()
-        }
-    }
-}
-
 // ── ADR-0037 mediated write actions ─────────────────────────────────────────────────────────────
 // The native agent calls these *during* its run; the control plane accumulates them and posts nothing
 // until `finalize_review` flushes the buffer as one grouped review (+ a single consolidated reply).
@@ -844,7 +779,13 @@ pub async fn finalize_review(
     if !pending.comments.is_empty() {
         let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
         match app
-            .create_issue_comment(&token, &context.owner, &context.name, context.target_id, &body)
+            .create_issue_comment(
+                &token,
+                &context.owner,
+                &context.name,
+                context.target_id,
+                &body,
+            )
             .await
         {
             Ok(_) => posted_reply = true,
@@ -883,7 +824,10 @@ pub async fn finalize_review(
             .unwrap_or_else(|| DEFAULT_CLEAN_SUMMARY.to_string());
 
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
-            match app.list_pr_files(&token, &context.owner, &context.name, pr).await {
+            match app
+                .list_pr_files(&token, &context.owner, &context.name, pr)
+                .await
+            {
                 Ok(files) => files
                     .into_iter()
                     .filter_map(|f| {
@@ -907,7 +851,8 @@ pub async fn finalize_review(
         let findings_json = serde_json::to_value(&findings).unwrap_or_default();
 
         let validated = crate::review::validate(findings, &commentable);
-        let body = crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope);
+        let body =
+            crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope);
         let comments: Vec<crate::integrations::github::ReviewComment> = validated
             .inline
             .iter()

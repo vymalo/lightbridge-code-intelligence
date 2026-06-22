@@ -103,7 +103,7 @@ mod tests {
             base_url: "https://gw.example/v1".to_string(),
             api_key: "secret".to_string(),
             model: "qwen-coder".to_string(),
-            system_prompt: None,
+            system_prompt: "You are a reviewer.".to_string(),
             max_diff_chars: 60_000,
             temperature: Some(0.2),
             top_p: None,

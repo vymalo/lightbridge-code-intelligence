@@ -20,56 +20,21 @@ pub use parse::{parse_review, ReviewFinding, ReviewResult};
 use std::path::Path;
 
 use anyhow::Context;
-use uuid::Uuid;
 
-use crate::bootstrap::client::ControlPlaneClient;
-use crate::bootstrap::config::{ReviewAgent, ReviewConfig};
+use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
-use crate::indexer::embeddings::EmbeddingsClient;
 
 /// The provider id we register the eaig gateway under in opencode.json; the model is referenced as
 /// `eaig/<model>`.
 pub const PROVIDER_ID: &str = "eaig";
 
-/// The default reviewer **guidance** — persona + what to optimise for. Operators can replace this
-/// via `REVIEW_SYSTEM_PROMPT` (see [`ReviewConfig`]); the fixed [`OUTPUT_CONTRACT`] is always appended
-/// afterwards, so an override changes *behaviour* without ever breaking the machine-readable result.
-///
-/// It is tuned for the human on the other end: high-signal, terse, skimmable. The goal is the most
-/// useful review a person can act on in seconds — not the longest one.
-pub const DEFAULT_REVIEW_GUIDANCE: &str = "\
-You are Lightbridge, an expert pull-request reviewer. Review ONLY the change in the unified diff \
-below; use the rest of the repository and the tools as CONTEXT to judge its impact, never as review \
-targets.\n\n\
-Optimise for the reviewer's time — a human should grasp each finding in seconds:\n\
-- Review ALL dimensions — security, correctness, quality, style, performance — but triage ruthlessly \
-by priority: P0/P1 only for real harm (bugs, security, data loss, intent mismatches); file style and \
-quality observations as P2 so they never crowd out blockers.\n\
-- Be brief and concrete. Title ≤ ~8 words. Body 1–2 sentences: what's wrong and why it matters — no \
-restating the code, no hedging, no praise.\n\
-- Favour a few high-confidence findings over many shallow ones. If the change is sound, say so in \
-one line and return no findings — silence is better than noise.\n\
-- Ground every claim with the tools; do not speculate about code you have not looked up:\n\
-  - `lightbridge_vector_semantic_search` — find related code by meaning,\n\
-  - `lightbridge_graph_find_symbol` / `lightbridge_graph_get_callers` — trace structure and impact.\n\
-- Reason old-vs-new per hunk. When a fix is clear, give the exact replacement so the author applies \
-it in one click. You may not edit files or run commands.\n\n\
-Keep `summary` to 1–3 sentences: does the change do what it intends, and is it correct and safe?";
+/// The native agent's entry point (ADR-0037): the unified loop that acts via mediated write tools.
+/// Re-exported here so callers use `review::run_native_agent`.
+pub use native::agent::run_native_agent;
 
-/// The default **ask** guidance (ADR-0033) — persona for a conversational answer rather than a
-/// diff-scoped review. Used by the native agent's `ask` run; the fixed ask contract is appended
-/// after it (in `native::agent`).
-pub const DEFAULT_ASK_GUIDANCE: &str = "\
-You are Lightbridge, an expert engineer answering a maintainer's question about a pull request and \
-its codebase. Use the repository and the retrieval tools as your source of truth — investigate \
-before you answer, and never speculate about code you have not looked up.\n\n\
-Optimise for the reader's time: lead with a direct answer, then a brief, concrete justification. \
-Cite specific files/symbols you found. When you recommend a change, show the exact code. Be honest \
-about uncertainty and say what you could not determine.";
-
-/// The fixed output contract appended after the guidance and the diff. The parser ([`parse_review`])
-/// and the control plane's scope-and-suggestion handling depend on this exact shape, so it is NOT
-/// operator-overridable.
+/// The fixed output contract for the **OpenCode** path (the JSON-block shape its parser
+/// [`parse_review`] depends on). The native agent does not use this — it acts via tools (ADR-0037);
+/// this constant retires with OpenCode (#140). It is a machine contract, not operator-tunable.
 pub const OUTPUT_CONTRACT: &str = "\
 Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; never \
 comment on untouched code. Give each finding a `priority` — `P0` (must fix), `P1` (should fix), or \
@@ -81,78 +46,13 @@ any supporting links (docs, CWE, RFCs) in `resources` as full URLs.\n\n\
 Output ONLY a single fenced ```json block with this exact shape and nothing after it:\n\
 {\n  \"summary\": \"1–3 sentences\",\n  \"findings\": [\n    {\"file\": \"path/from/repo/root\", \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"short\", \"body\": \"detailed explanation of why it matters\", \"suggestion\": \"optional exact replacement for line 42\", \"resources\": [\"https://...\"]}\n  ]\n}";
 
-/// Produce the structured review, dispatching on the configured agent (ADR-0026): the native
-/// in-process loop (`REVIEW_AGENT=native`) or the OpenCode subprocess (default). Both submit the same
-/// [`ReviewResult`]; the control plane validates + writes it back (ADR-0022), unchanged.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_review(
-    checkout: &Path,
-    review: &ReviewConfig,
-    command: &str,
-    diff: Option<&PrDiff>,
-    attribution: &[(String, String)],
-    client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
-    task_id: Uuid,
-) -> anyhow::Result<ReviewResult> {
-    match review.agent {
-        ReviewAgent::Native => {
-            native::agent::run_native_review(
-                review,
-                command,
-                diff,
-                attribution,
-                client,
-                embedder,
-                task_id,
-            )
-            .await
-        }
-        ReviewAgent::OpenCode => {
-            run_opencode_review(checkout, review, command, diff, attribution).await
-        }
-    }
-}
-
-/// Produce a conversational answer for an `ask` run (ADR-0033). Only the native agent supports `ask`
-/// (it's the default, ADR-0026); the legacy OpenCode subprocess — kept solely as a review fallback
-/// pending removal (#140) — has no answer path, so an `ask` under it is a clear error rather than a
-/// silent generic review.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_ask(
-    review: &ReviewConfig,
-    question: &str,
-    diff: Option<&PrDiff>,
-    attribution: &[(String, String)],
-    client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
-    task_id: Uuid,
-) -> anyhow::Result<String> {
-    match review.agent {
-        ReviewAgent::Native => {
-            native::agent::run_native_ask(
-                review,
-                question,
-                diff,
-                attribution,
-                client,
-                embedder,
-                task_id,
-            )
-            .await
-        }
-        ReviewAgent::OpenCode => anyhow::bail!(
-            "ask runs require the native agent (REVIEW_AGENT=native, the default); the OpenCode \
-             fallback has no answer path"
-        ),
-    }
-}
-
-/// Run the OpenCode review over `checkout` and return the parsed structured result.
+/// Run the OpenCode review over `checkout` and return the parsed structured result (the
+/// `REVIEW_AGENT=opencode` fallback). The native agent (default) acts via [`run_native_agent`]
+/// instead. OpenCode retires in #140.
 ///
 /// Writes `opencode.json` into `checkout` (ephemeral Job disk), then spawns
 /// `opencode run --model eaig/<model> --dir <checkout> --print-logs <prompt>` and parses its output.
-async fn run_opencode_review(
+pub async fn run_opencode(
     checkout: &Path,
     review: &ReviewConfig,
     command: &str,
@@ -169,11 +69,9 @@ async fn run_opencode_review(
         .with_context(|| format!("writing {}", cfg_path.display()))?;
 
     let model = format!("{PROVIDER_ID}/{}", review.model);
-    let guidance = review
-        .system_prompt
-        .as_deref()
-        .unwrap_or(DEFAULT_REVIEW_GUIDANCE);
-    let prompt = build_prompt(guidance, command, diff, review.max_diff_chars);
+    // The operator-owned guidance (required, ADR-0037 — no built-in default); the fixed
+    // OUTPUT_CONTRACT is appended last by `build_prompt`.
+    let prompt = build_prompt(&review.system_prompt, command, diff, review.max_diff_chars);
 
     let output = tokio::process::Command::new("opencode")
         .arg("run")
@@ -269,11 +167,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_prompt_carries_guidance_and_the_fixed_contract() {
-        let prompt = build_prompt(DEFAULT_REVIEW_GUIDANCE, "review", None, 60_000);
+    fn opencode_prompt_carries_guidance_and_the_fixed_contract() {
+        // OpenCode path: the operator guidance (required, no default) + the fixed JSON contract last.
+        let prompt = build_prompt("CUSTOM REVIEWER PERSONA", "review", None, 60_000);
         assert!(
-            prompt.contains("expert pull-request reviewer"),
-            "uses default guidance"
+            prompt.contains("CUSTOM REVIEWER PERSONA"),
+            "uses the supplied guidance"
         );
         assert!(prompt.contains("Requested review command: review"));
         assert!(

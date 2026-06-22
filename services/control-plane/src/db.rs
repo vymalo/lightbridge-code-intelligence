@@ -248,12 +248,14 @@ pub async fn add_pending_comment(
     task_id: Uuid,
     body: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'comment', $2)")
-        .bind(task_id)
-        .bind(body)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    sqlx::query(
+        "INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'comment', $2)",
+    )
+    .bind(task_id)
+    .bind(body)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Set (or replace) the run's summary/verdict (the `set_summary` payload). One per task.
@@ -390,9 +392,6 @@ pub struct NewTask {
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
-    /// Run kind (ADR-0033): `review` or `ask`. Resolved from the inbound comment by the webhook;
-    /// an automatic PR-opened review is always `review`.
-    pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Re-run discriminator (RFC-0001). `0` for the automatic first review; an explicit re-review
@@ -453,8 +452,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, kind, base_sha, head_sha, run_epoch, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued') \
+         target_id, command_text, base_sha, head_sha, run_epoch, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued') \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id",
@@ -466,7 +465,6 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.target_type)
     .bind(task.target_id)
     .bind(&task.command_text)
-    .bind(&task.kind)
     .bind(&task.base_sha)
     .bind(&task.head_sha)
     .bind(task.run_epoch)
@@ -1232,7 +1230,6 @@ mod tests {
             target_type: "pull_request".to_string(),
             target_id: 7,
             command_text: "review".to_string(),
-            kind: "review".to_string(),
             base_sha: Some("base".to_string()),
             head_sha: Some(head.to_string()),
             run_epoch: 0,
@@ -1425,7 +1422,6 @@ mod tests {
                     target_type: "pull_request".to_string(),
                     target_id: n as i64,
                     command_text: "review".to_string(),
-                    kind: "review".to_string(),
                     base_sha: None,
                     head_sha: None,
                     run_epoch: 0,
@@ -1741,13 +1737,25 @@ mod tests {
         .await
         .unwrap();
         // Comments append; the summary is single-valued (last write wins).
-        add_pending_comment(&pool, task_id, "first comment").await.unwrap();
-        add_pending_comment(&pool, task_id, "second comment").await.unwrap();
-        upsert_pending_summary(&pool, task_id, "draft summary").await.unwrap();
-        upsert_pending_summary(&pool, task_id, "final summary").await.unwrap();
+        add_pending_comment(&pool, task_id, "first comment")
+            .await
+            .unwrap();
+        add_pending_comment(&pool, task_id, "second comment")
+            .await
+            .unwrap();
+        upsert_pending_summary(&pool, task_id, "draft summary")
+            .await
+            .unwrap();
+        upsert_pending_summary(&pool, task_id, "final summary")
+            .await
+            .unwrap();
 
         let pending = load_pending_review(&pool, task_id).await.unwrap();
-        assert_eq!(pending.inline.len(), 2, "deduped to one row per (file, line)");
+        assert_eq!(
+            pending.inline.len(),
+            2,
+            "deduped to one row per (file, line)"
+        );
         let line7 = pending.inline.iter().find(|f| f.line == 7).expect("line 7");
         assert_eq!(line7.body, "second, refined", "last write wins");
         assert_eq!(line7.priority.as_deref(), Some("P0"));

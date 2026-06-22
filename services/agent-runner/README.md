@@ -14,13 +14,18 @@ does the heavy repository work, and reports results back — holding no standing
    the control plane.
 4. **Structural graph**: Graphify → the control plane writes Neo4j (best-effort / non-fatal,
    [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
-5. **Review**: the agent reasons over the repo using the retrieval tools and returns findings by
-   **calling the `submit_findings` tool** (validated at the tool boundary — no stdout scraping). The
-   default is the **native Rust agent loop** ([ADR-0026](../../docs/adr/0026-native-review-agent.md));
-   `REVIEW_AGENT=opencode` falls back to the legacy OpenCode subprocess (kept until a real-gateway
-   dogfood confirms native, then removed with OpenCode/Bun from the image).
-6. **Report** terminal status; the control plane validates findings against the PR diff and posts the
-   review ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md)).
+5. **Review**: the **native Rust agent loop** ([ADR-0026](../../docs/adr/0026-native-review-agent.md))
+   reasons over the repo with the retrieval tools and **acts via mediated write tools as it goes**
+   ([ADR-0037](../../docs/adr/0037-agent-acts-via-mediated-tools.md)) — `add_review_comment` (an inline
+   finding), `add_comment` (a plain reply), `finish` (the verdict). The control plane buffers these and
+   posts nothing until finalize, so a mid-run failure posts nothing. The agent's system prompt is
+   **required operational config** (the ai-helm `config.reviewSystemPrompt`, mounted) — there is no
+   built-in default; review fails closed without one. `REVIEW_AGENT=opencode` falls back to the legacy
+   OpenCode subprocess (terminal JSON payload; retires with OpenCode/Bun, #140).
+6. **Report** terminal status; on a clean finish the control plane flushes the buffer as one grouped
+   review — validating findings against the PR diff
+   ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md)) and consolidating replies into a
+   single comment.
 
 The stage sequence lives in [`src/main.rs`](src/main.rs) (`run()`).
 

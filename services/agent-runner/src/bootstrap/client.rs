@@ -263,20 +263,82 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// `POST /internal/tasks/{id}/answer` — submit the agent's conversational answer for an `ask`
-    /// run (ADR-0033); the control plane posts it as a single reply comment on the thread.
-    pub async fn submit_answer(&self, task_id: Uuid, answer: &str) -> anyhow::Result<()> {
+    /// `POST /internal/tasks/{id}/review/inline` — buffer one inline finding (ADR-0037 mediated write
+    /// action). The control plane accumulates it and flushes on [`finalize_review`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_review_comment(
+        &self,
+        task_id: Uuid,
+        file: &str,
+        line: i32,
+        title: Option<&str>,
+        priority: Option<&str>,
+        category: Option<&str>,
+        suggestion: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
-        let url = format!("{}/internal/tasks/{task_id}/answer", self.base_url);
+        let url = format!("{}/internal/tasks/{task_id}/review/inline", self.base_url);
         self.http
             .post(&url)
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "answer": answer }))
+            .json(&serde_json::json!({
+                "file": file, "line": line, "title": title, "priority": priority,
+                "category": category, "suggestion": suggestion, "body": body,
+            }))
             .send()
             .await
-            .context("submitting answer")?
+            .context("buffering inline finding")?
             .error_for_status()
-            .context("control plane rejected the answer")?;
+            .context("control plane rejected the inline finding")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (ADR-0037).
+    pub async fn add_review_reply(&self, task_id: Uuid, body: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/review/comment", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("buffering comment")?
+            .error_for_status()
+            .context("control plane rejected the comment")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/review/summary` — set the run's summary/verdict (ADR-0037).
+    pub async fn set_review_summary(&self, task_id: Uuid, body: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/review/summary", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .context("setting summary")?
+            .error_for_status()
+            .context("control plane rejected the summary")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer as one grouped
+    /// review (ADR-0037). Called once after the agent finishes cleanly.
+    pub async fn finalize_review(&self, task_id: Uuid) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/review/finalize", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("finalizing review")?
+            .error_for_status()
+            .context("control plane rejected the finalize")?;
         Ok(())
     }
 
