@@ -234,7 +234,7 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/status",
             post(internal::set_status).get(internal::get_status),
         )
-        // Chunk batches can be large: 32 chunks × 1536-dim embeddings as JSON ~600 KB plus
+        // Chunk batches can be large: 32 chunks × 4096-dim embeddings as JSON ~1.6 MB plus
         // content. Raise the body limit to 16 MiB on this route only.
         .route(
             "/internal/tasks/{id}/chunks",

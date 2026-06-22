@@ -983,7 +983,8 @@ pub struct CodeChunkHit {
 }
 
 /// Semantic search: the `limit` nearest chunks to `query_embedding` within one repo snapshot,
-/// by cosine distance (the HNSW index's operator class). Scoped by `(repository_id, commit_sha)` so
+/// by cosine distance (an exact scan — the 4096-dim column exceeds pgvector's ANN limit, so
+/// migration 0005 carries no index). Scoped by `(repository_id, commit_sha)` so
 /// a task only ever sees its own repo's index — the caller never picks the scope (trust boundary).
 pub async fn search_code_chunks(
     pool: &PgPool,
@@ -1587,7 +1588,8 @@ mod tests {
     }
 
     /// Semantic search returns the nearest chunk first (cosine), scoped to the repo+commit, and
-    /// honours the limit. Exercises the real pgvector `<=>` path + HNSW index.
+    /// honours the limit. Exercises the real pgvector `<=>` path (an exact cosine scan — 4096-dim
+    /// vectors exceed pgvector's ANN limit, so migration 0005 carries no index).
     #[sqlx::test]
     async fn search_code_chunks_ranks_by_cosine_and_scopes(pool: PgPool) {
         let repo_id = seed(&pool).await;
