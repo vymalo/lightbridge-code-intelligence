@@ -1252,6 +1252,41 @@ mod tests {
         }
     }
 
+    /// ADR-0033 slice 3: an `issue` target (no SHAs) persists and reads back, and the idempotency key
+    /// includes `target_type` so an issue and a PR with the same number are distinct tasks.
+    #[sqlx::test]
+    async fn issue_target_task_round_trips_and_is_distinct_from_a_pr(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let issue = NewTask {
+            repository_id: repo_id,
+            installation_id: 99,
+            github_delivery_id: "d1".to_string(),
+            target_type: "issue".to_string(),
+            target_id: 42,
+            command_text: "explain the retry logic".to_string(),
+            base_sha: None,
+            head_sha: None,
+            run_epoch: 0,
+        };
+        let issue_id = create_task(&pool, &issue)
+            .await
+            .unwrap()
+            .expect("issue task");
+        let ctx = get_task_context(&pool, issue_id)
+            .await
+            .unwrap()
+            .expect("exists");
+        assert_eq!(ctx.target_type, "issue");
+        assert_eq!(ctx.target_id, 42);
+        assert!(ctx.base_sha.is_none() && ctx.head_sha.is_none());
+
+        // A PR #42 (same number) is a different task — target_type discriminates the idempotency key.
+        let mut pr = issue;
+        pr.target_type = "pull_request".to_string();
+        let pr_id = create_task(&pool, &pr).await.unwrap().expect("pr task");
+        assert_ne!(issue_id, pr_id);
+    }
+
     /// Task creation is idempotent on (repo, target, command, head SHA): a second `pull_request`
     /// event for the same head (e.g. `opened` then `synchronize`) does not create a duplicate task,
     /// but a new head SHA does.
