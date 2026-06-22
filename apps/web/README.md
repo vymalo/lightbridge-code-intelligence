@@ -1,0 +1,42 @@
+# @lightbridge/web
+
+The Next.js (App Router) **web console** for Lightbridge — an operator dashboard over the control plane.
+
+## Auth
+
+OIDC against Keycloak (Authorization Code + PKCE,
+[ADR-0014](../../docs/adr/0014-keycloak-oidc-resource-server.md)); the app stores no credentials.
+Authorization is **permission-based** ([ADR-0023](../../docs/adr/0023-db-backed-rbac.md)): the token
+carries a `permissions` list under a configurable claim, and both the control plane and the UI gate on
+capabilities (`task:read/cancel`, `repo:read/approve/deny`, `review:read`, …). `middleware.ts` guards
+`/dashboard/*`.
+
+## Surfaces
+
+- **Overview** — insights (KPIs, runs-over-time, breakdowns; client-aggregated).
+- **Runs** — timeline + sortable/paginated table with filters and a ⌘K command palette; URL-synced state
+  via `nuqs`.
+- **Run detail** — persisted review output, **live Job log stream** (read from Kubernetes via the web
+  pod's own ServiceAccount), and a Cancel action (gated on `task:cancel`).
+- **Repositories** — connected repos + approval/run activity.
+- **Approvals** (admin) — the repo approval gate (epic #75): a repo is indexed/reviewed only once
+  approved; decisions are reversible.
+- **Settings** — account, GitHub-App link, effective permissions.
+
+## Design system
+
+daisyUI v5 with the **dracula** theme, **dark-only**, on Tailwind v4
+([ADR-0027](../../docs/adr/0027-daisyui-design-system.md)). Variants are composed with
+`class-variance-authority` + `cn` (tailwind-merge + clsx); shared UI primitives live in
+`components/ui/`, shared client logic in `lib/hooks/`.
+
+## Develop
+
+```bash
+pnpm --filter @lightbridge/web dev     # http://localhost:3000
+pnpm --filter @lightbridge/web build
+pnpm exec biome check .                 # lint/format (run in apps/web)
+```
+
+Env: `.env` for the OIDC issuer/client + the control-plane URL + `AGENT_NAMESPACE`/the kube access the
+log-stream route needs. See [docs/local-setup.md](../../docs/local-setup.md).

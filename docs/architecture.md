@@ -1,11 +1,21 @@
 # Architecture Overview
 
+> **Current state (2026-06).** The diagrams below capture the original concept, including an
+> OpenCode-as-ACP-sidecar shape. Two things have since changed: (1) the review agent runs **headless**
+> and is moving to a **native Rust loop** ([ADR-0026](adr/0026-native-review-agent.md)) — there is no
+> separate ACP sidecar today; (2) the per-task Job is being restructured into a **control sidecar +
+> single configurable main container** ([ADR-0028](adr/0028-agent-job-control-sidecar.md)). For the
+> authoritative, current view of the job/task model see
+> [jobs-and-lifecycle.md](jobs-and-lifecycle.md); for authz see
+> [ADR-0023](adr/0023-db-backed-rbac.md). The trust boundary and dual-retrieval principles below remain
+> accurate.
+
 ## System context
 
 Lightbridge is a webhook-first GitHub App that turns mentions such as `@lightbridge` into review
 or Q&A tasks. The Rust control plane receives the event, verifies and normalizes it, persists task
-state in Postgres, and launches a task-specific Kubernetes Job. That Job runs OpenCode in a
-constrained environment with MCP access to graph, vector, and GitHub tooling.
+state in Postgres, and launches a task-specific Kubernetes Job. That Job clones the repo, builds the
+dual index (pgvector + Neo4j), and runs the review agent over control-plane-proxied retrieval tools.
 
 ## Provided concept diagram
 

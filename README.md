@@ -6,8 +6,9 @@
 Lightbridge is a GitHub App for **intelligent code review and repository Q&A**. It listens for
 GitHub webhook events, records work in a Rust control plane, and runs each task in an isolated,
 short-lived Kubernetes Job. The work is backed by **repository-aware retrieval** over two
-complementary indexes — a Neo4j knowledge graph (structure) and pgvector (semantics) — with
-reasoning performed by OpenCode agents over ACP/MCP.
+complementary indexes — a Neo4j knowledge graph (structure) and pgvector (semantics) — with reasoning
+performed by a review agent over those retrieval tools (OpenCode today; moving to a native Rust agent
+loop, [ADR-0026](docs/adr/0026-native-review-agent.md)).
 
 The Rust control plane is the **trust boundary**: it holds the GitHub App private key and mints
 short-lived, per-task installation tokens — the App key itself never reaches a Job. The agent only
@@ -47,7 +48,7 @@ flowchart TD
 
     VEC[("pgvector<br/>semantic")]
     NEO[("Neo4j<br/>structural")]
-    AGENT["OpenCode agent (planned)"]
+    AGENT["Review agent<br/>(OpenCode → native, ADR-0026)"]
 
     KC -. login .-> WEB
     WEB -->|"Bearer JWT (read)"| SERVE
@@ -67,11 +68,13 @@ flowchart TD
     SERVE -. writeback .-> GH
 ```
 
-> `(planned)` and the dotted edges mark parts that are designed and decided but not yet implemented
-> (epic #5, slices 3–6). Everything with a solid edge is on `main` today.
+> The full flow — clone → dual index → review → validated write-back — is **implemented and deployed**.
+> The review agent runs via OpenCode today and is moving to a native Rust loop
+> ([ADR-0026](docs/adr/0026-native-review-agent.md)). The per-task Job is also being restructured into a
+> control sidecar + main container ([ADR-0028](docs/adr/0028-agent-job-control-sidecar.md)).
 
-See [docs/architecture.md](docs/architecture.md) and [docs/INDEX.md](docs/INDEX.md) for the full
-picture.
+See [docs/architecture.md](docs/architecture.md), [docs/jobs-and-lifecycle.md](docs/jobs-and-lifecycle.md),
+and [docs/INDEX.md](docs/INDEX.md) for the full picture.
 
 ---
 
@@ -127,13 +130,13 @@ stateDiagram-v2
     state running {
         [*] --> cloning
         cloning --> indexing: checkout ready
-        indexing --> reasoning: vector done / graph planned
-        reasoning --> [*]: review built (planned)
+        indexing --> reasoning: indexes ready (or reused, ADR-0025)
+        reasoning --> [*]: review submitted
     }
 
-    running --> posting_result: write-back to GitHub (planned)
+    running --> posting_result: validated write-back to GitHub
     posting_result --> succeeded
-    running --> succeeded: indexing-only task (today)
+    running --> succeeded: index-only task
 
     running --> failed: error reported
     running --> timed_out: activeDeadline exceeded
@@ -145,8 +148,10 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-> Today a task runs through **clone → index (pgvector)** and reports `succeeded`. The `reasoning`,
-> `posting_result`, and graph steps are slices 3–6.
+> There are **two job kinds**: an `index` task (on repo approval) and a `review` task (on a PR or
+> `@mention`). A warm review **reuses the base index** ([ADR-0025](docs/adr/0025-review-reuses-base-index.md)).
+> The authoritative state machine, cancellation, and data-purge flows live in
+> [docs/jobs-and-lifecycle.md](docs/jobs-and-lifecycle.md).
 
 ---
 
@@ -178,10 +183,10 @@ sequenceDiagram
         R->>E: POST /v1/embeddings
         E-->>R: vectors
         R->>CP: POST /internal/tasks/{id}/chunks
-        CP->>DB: upsert code_chunks (vector 1536)
+        CP->>DB: upsert code_chunks (vector)
     end
     R->>CP: POST /internal/tasks/{id}/status = succeeded
-    Note over R,GH: Graphify→Neo4j, agent reasoning & write-back = slices 3–6
+    Note over R,GH: A review task also runs Graphify→Neo4j + the review agent → validated write-back
 ```
 
 ### Secrets a Job holds
@@ -195,7 +200,8 @@ is **not** credential-free, though. Today the dispatcher injects into every runn
 |---|---|---|---|
 | GitHub installation token | minted per task by `serve` | ~1h, auto-expires | the only GitHub credential a Job sees |
 | `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec | long-lived, **shared** across all Jobs | bearer for the internal API; a hardening target (move to a `secretKeyRef`, per-task scoping) |
-| `EMBEDDINGS_API_KEY` | `secretKeyRef` → `lightbridge-agent-secrets` | long-lived, shared | the embeddings gateway key |
+| `EMBEDDINGS_API_KEY` | `secretKeyRef` → `lightbridge-agent-secrets` | long-lived, shared | the embeddings gateway key ([ADR-0018](docs/adr/0018-openai-compatible-embeddings.md)) |
+| internal-CA cert | mounted from a Secret | n/a | trusts the internal HTTPS embeddings gateway |
 
 So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld.
 Narrowing the shared `AGENT_RUNNER_TOKEN`'s exposure (secret ref + per-task scoping) is tracked as a
@@ -213,20 +219,18 @@ A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust autom
 | `apps/web` | Next.js (App Router) web console; OIDC Auth Code + PKCE login against Keycloak ([ADR-0014](docs/adr/0014-keycloak-oidc-resource-server.md)) |
 | `packages/auth` | Shared OIDC/JWT helpers (token verification, claims, session cookie) |
 | `packages/tsconfig` | Shared TypeScript configs |
-| `services/control-plane` | Rust (Axum) control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. |
-| `services/agent-runner` | Rust per-task Job: bootstraps from the control plane, clones, indexes (tree-sitter → pgvector), reports back |
+| `services/control-plane` | Rust (Axum) control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. [README](services/control-plane/README.md) |
+| `services/agent-runner` | Rust per-task Job: bootstraps from the control plane, clones, indexes (pgvector + Neo4j), and runs the review agent. [README](services/agent-runner/README.md) |
 | `xtask` | Cargo `xtask` for Rust automation (`cargo xtask ci`, etc.) |
 | `docs/` | Documentation set, ADRs, RFCs, ways of working |
-| `deploy/` | Kubernetes / Helm / Kustomize manifests (planned, #6) |
+| `deploy/` | Per-environment Helm values (`deploy/envs/`) consumed by the `ai-helm` chart; image tags promoted by argocd-image-updater (GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
 
-### Kubernetes namespaces
+### Kubernetes layout
 
-| Namespace | Purpose |
-|-----------|---------|
-| `lightbridge-system` | Control plane (`serve` + `dispatcher`), webhook handlers |
-| `lightbridge-indexing` | Indexing jobs, Graphify runs |
-| `lightbridge-agents` | Agent-runner / OpenCode containers |
-| `lightbridge-data` | Neo4j, PostgreSQL/pgvector |
+The control plane (`serve` + `dispatcher`) and the web console run in the platform namespace; each task
+runs as a Job in a dedicated **agents** namespace (`AGENT_NAMESPACE`, default `lightbridge-agents`); the
+data stores (Postgres/pgvector, Neo4j) are managed services. See
+[docs/kubernetes-deployment.md](docs/kubernetes-deployment.md).
 
 ---
 
@@ -291,11 +295,16 @@ framework (Definition of Ready/Done, AI usage declarations). See
 
 ## Development status
 
-🚧 **Active early development.** Foundation, control plane (webhooks, Postgres work queue +
-dispatcher, OIDC), web console, and the pgvector indexer are on `main`. The structural graph
-(Graphify → Neo4j), MCP servers, OpenCode reasoning, and validated write-back are in progress under
-epic [#5](https://github.com/vymalo/lightbridge-code-intelligence/issues/5). See the
-[Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for the roadmap.
+**Core shipped and running in production.** The end-to-end path is live: webhooks → Postgres work
+queue + dispatcher → per-task Job → dual index (pgvector + Neo4j) → review agent → validated
+write-back, plus the admin/governance web console (repo approval gate, permission-based authz, runs +
+insights). Deployment is GitOps (per-env Helm values → the `ai-helm` chart → ArgoCD).
+
+In flight: the **native Rust review agent** (replacing OpenCode,
+[ADR-0026](docs/adr/0026-native-review-agent.md)) and the **agent-Job restructure** — a control sidecar
++ main container with repo-level review config
+([ADR-0028](docs/adr/0028-agent-job-control-sidecar.md)–[0031](docs/adr/0031-review-skills-commands.md)).
+See the [Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for the roadmap.
 
 ## License
 
