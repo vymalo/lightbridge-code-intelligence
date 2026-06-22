@@ -162,6 +162,159 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
         .await
 }
 
+// ── ADR-0037 pending review actions ────────────────────────────────────────────────────────────
+// The agent's mediated write tools (add_review_comment / add_comment / set_summary) accumulate here
+// during a run; the control plane flushes them as one grouped review on clean completion.
+
+/// One buffered inline finding (the `add_review_comment` payload), read back at flush time.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PendingInline {
+    pub file: String,
+    pub line: i32,
+    pub title: Option<String>,
+    pub priority: Option<String>,
+    pub category: Option<String>,
+    pub suggestion: Option<String>,
+    pub body: String,
+}
+
+/// The accumulated buffer for a task: inline findings (deduped by file+line), plain comment bodies
+/// (in call order), and the latest summary. Drives the single flush (ADR-0037).
+#[derive(Debug, Default)]
+pub struct PendingReview {
+    pub inline: Vec<PendingInline>,
+    pub comments: Vec<String>,
+    pub summary: Option<String>,
+}
+
+impl PendingReview {
+    /// True when the agent called no write tool at all — the empty-run case that still gets a default
+    /// "no issues found" review so an `@mention` is never a silent hang (ADR-0037).
+    pub fn is_empty(&self) -> bool {
+        self.inline.is_empty() && self.comments.is_empty() && self.summary.is_none()
+    }
+}
+
+/// Clear a task's accumulation buffer. Called when a runner (re)starts the task so a retry begins from
+/// empty rather than appending to a partial buffer (ADR-0037 idempotency), and after a flush.
+pub async fn clear_pending_review(pool: &PgPool, task_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM pending_review_actions WHERE task_id = $1")
+        .bind(task_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Buffer (or overwrite) one inline finding. Last write wins per `(task, file, line)` — a
+/// re-emitted finding refines rather than duplicates (ADR-0037; content hashes would let a reworded
+/// re-run slip through).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_pending_inline(
+    pool: &PgPool,
+    task_id: Uuid,
+    file: &str,
+    line: i32,
+    title: Option<&str>,
+    priority: Option<&str>,
+    category: Option<&str>,
+    suggestion: Option<&str>,
+    body: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pending_review_actions \
+         (task_id, action, file, line, title, priority, category, suggestion, body) \
+         VALUES ($1, 'inline', $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (task_id, file, line) WHERE action = 'inline' DO UPDATE SET \
+           title = EXCLUDED.title, priority = EXCLUDED.priority, category = EXCLUDED.category, \
+           suggestion = EXCLUDED.suggestion, body = EXCLUDED.body",
+    )
+    .bind(task_id)
+    .bind(file)
+    .bind(line)
+    .bind(title)
+    .bind(priority)
+    .bind(category)
+    .bind(suggestion)
+    .bind(body)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Buffer one plain thread comment (the `add_comment` payload). Append-only; the bodies are
+/// consolidated into a single reply at flush so multiple calls don't fan out into notifications.
+pub async fn add_pending_comment(
+    pool: &PgPool,
+    task_id: Uuid,
+    body: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'comment', $2)")
+        .bind(task_id)
+        .bind(body)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Set (or replace) the run's summary/verdict (the `set_summary` payload). One per task.
+pub async fn upsert_pending_summary(
+    pool: &PgPool,
+    task_id: Uuid,
+    body: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'summary', $2) \
+         ON CONFLICT (task_id) WHERE action = 'summary' DO UPDATE SET body = EXCLUDED.body",
+    )
+    .bind(task_id)
+    .bind(body)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Record the task's **emergent** run kind (ADR-0037), derived at flush from which write tools fired
+/// (`review` / `ask` / `mixed`). Best-effort observability — it doesn't gate behaviour.
+pub async fn set_task_kind(pool: &PgPool, task_id: Uuid, kind: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tasks SET kind = $2 WHERE id = $1")
+        .bind(task_id)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Load a task's accumulated buffer for the flush: inline findings (call order), comment bodies (call
+/// order), and the summary if set.
+pub async fn load_pending_review(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<PendingReview, sqlx::Error> {
+    let inline = sqlx::query_as::<_, PendingInline>(
+        "SELECT file, line, title, priority, category, suggestion, body \
+         FROM pending_review_actions WHERE task_id = $1 AND action = 'inline' ORDER BY id",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    let comments =
+        sqlx::query_scalar::<_, String>("SELECT body FROM pending_review_actions WHERE task_id = $1 AND action = 'comment' ORDER BY id")
+            .bind(task_id)
+            .fetch_all(pool)
+            .await?;
+    let summary = sqlx::query_scalar::<_, String>(
+        "SELECT body FROM pending_review_actions WHERE task_id = $1 AND action = 'summary'",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(PendingReview {
+        inline,
+        comments,
+        summary,
+    })
+}
+
 /// Persist a GitHub delivery, using its `delivery_id` PRIMARY KEY for exactly-once handling.
 /// Returns `true` if the delivery is new (inserted), `false` if it was already seen (duplicate).
 pub async fn record_delivery(
@@ -1534,6 +1687,78 @@ mod tests {
                 .is_none(),
             "unknown id yields None"
         );
+    }
+
+    /// ADR-0037 accumulation: inline findings dedup by (file, line) last-write-wins, comments append
+    /// in order, the summary is single-valued, and `clear_pending_review` empties the buffer.
+    #[sqlx::test]
+    async fn pending_review_actions_accumulate_dedup_and_clear(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Two inline findings on the same (file, line) → the second overwrites the first.
+        upsert_pending_inline(
+            &pool,
+            task_id,
+            "a.rs",
+            7,
+            Some("t1"),
+            Some("P2"),
+            Some("style"),
+            None,
+            "first",
+        )
+        .await
+        .unwrap();
+        upsert_pending_inline(
+            &pool,
+            task_id,
+            "a.rs",
+            7,
+            Some("t1-refined"),
+            Some("P0"),
+            Some("security"),
+            Some("let x = 1;"),
+            "second, refined",
+        )
+        .await
+        .unwrap();
+        // A finding on a different line is kept separately.
+        upsert_pending_inline(
+            &pool,
+            task_id,
+            "a.rs",
+            9,
+            Some("t2"),
+            Some("P1"),
+            Some("correctness"),
+            None,
+            "other",
+        )
+        .await
+        .unwrap();
+        // Comments append; the summary is single-valued (last write wins).
+        add_pending_comment(&pool, task_id, "first comment").await.unwrap();
+        add_pending_comment(&pool, task_id, "second comment").await.unwrap();
+        upsert_pending_summary(&pool, task_id, "draft summary").await.unwrap();
+        upsert_pending_summary(&pool, task_id, "final summary").await.unwrap();
+
+        let pending = load_pending_review(&pool, task_id).await.unwrap();
+        assert_eq!(pending.inline.len(), 2, "deduped to one row per (file, line)");
+        let line7 = pending.inline.iter().find(|f| f.line == 7).expect("line 7");
+        assert_eq!(line7.body, "second, refined", "last write wins");
+        assert_eq!(line7.priority.as_deref(), Some("P0"));
+        assert_eq!(line7.suggestion.as_deref(), Some("let x = 1;"));
+        assert_eq!(pending.comments, vec!["first comment", "second comment"]);
+        assert_eq!(pending.summary.as_deref(), Some("final summary"));
+        assert!(!pending.is_empty());
+
+        clear_pending_review(&pool, task_id).await.unwrap();
+        let after = load_pending_review(&pool, task_id).await.unwrap();
+        assert!(after.is_empty(), "buffer cleared on restart/flush");
     }
 
     /// A terminal status stamps `completed_at` and clears the lease; `running` stamps `started_at`.
