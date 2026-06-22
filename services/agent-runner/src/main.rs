@@ -13,7 +13,7 @@
 //! required; the structural graph and the review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
-use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
+use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewAgent, ReviewConfig, RunnerConfig};
 use agent_runner::clone;
 use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review};
@@ -217,80 +217,70 @@ async fn run(
         (0, "reused base index".to_string())
     };
 
-    // ── Review: native agent loop (default, ADR-0026) over the retrieval tools → validated GitHub
-    // write-back ──────────────────────────────────────────────────────────────────────────────
-    // (the agent produces the review, the control plane validates it against the PR diff and posts).
-    // `REVIEW_AGENT=opencode` falls back to the legacy subprocess. Runs only when the LLM is
-    // configured; non-fatal (indexing already landed).
-    // A standalone `index` task (target_type `repository`, Epic #75) indexes the default branch only —
-    // there's no PR to review, so skip the review step regardless of LLM config.
+    // ── Review: the native agent acts via mediated write tools (default, ADR-0026/0037), then the
+    // control plane flushes the buffered findings/replies as one grouped review on finalize.
+    // `REVIEW_AGENT=opencode` falls back to the legacy terminal-payload subprocess (retires in #140).
+    // Runs only when the LLM is configured; non-fatal (indexing already landed). A standalone `index`
+    // task (target_type `repository`, Epic #75) has no PR, so skip review regardless of LLM config.
     let review_summary = match review_config.filter(|_| context.command != "index") {
-        // ADR-0033 `ask`: answer the question and post a single reply comment (not diff-scoped).
-        Some(review) if context.kind == "ask" => {
-            let diff = clone::pr_diff(&checkout, &context).await;
-            match review::run_ask(
-                review,
-                &context.command,
-                diff.as_ref(),
-                &attribution,
-                client,
-                &embedder,
-                config.task_id,
-            )
-            .await
-            {
-                Ok(answer) => {
-                    tracing::info!(chars = answer.len(), "ask complete");
-                    // Non-fatal: a post failure shouldn't fail a task whose work already succeeded.
-                    match client.submit_answer(config.task_id, &answer).await {
-                        Ok(()) => "answer posted".to_string(),
-                        Err(error) => {
-                            tracing::warn!(%error, "submitting answer failed (non-fatal)");
-                            "answer (post failed)".to_string()
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "ask failed (non-fatal)");
-                    "ask failed".to_string()
-                }
-            }
-        }
         Some(review) => {
-            // Scope the review to the PR's change set when we can compute it (best-effort; an
-            // unavailable base commit just yields an unscoped review).
+            // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
+            // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
-            match review::run_review(
-                &checkout,
-                review,
-                &context.command,
-                diff.as_ref(),
-                &attribution,
-                client,
-                &embedder,
-                config.task_id,
-            )
-            .await
-            {
-                Ok(result) => {
-                    tracing::info!(
-                        findings = result.findings.len(),
-                        summary = result.summary,
-                        "review complete"
-                    );
-                    // Submit for validation + write-back (slice 6). Non-fatal: a post failure (e.g.
-                    // GitHub hiccup) shouldn't fail a task whose indexing + review already succeeded.
-                    match client.submit_review(config.task_id, &result).await {
-                        Ok(()) => format!("{} findings posted", result.findings.len()),
+            match review.agent {
+                ReviewAgent::Native => {
+                    match review::run_native_agent(
+                        review,
+                        &context.command,
+                        diff.as_ref(),
+                        &attribution,
+                        client,
+                        &embedder,
+                        config.task_id,
+                    )
+                    .await
+                    {
+                        // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed
+                        // run is NOT finalized, so a mid-run death posts nothing (crash-safe).
+                        // Finalize failure is fatal (unlike the rest of review, which is best-effort):
+                        // the review is ready and the failure is almost always transient (GitHub /
+                        // network), so we want the task marked failed and retried rather than silently
+                        // succeeded with nothing posted. A retry re-runs the agent from a cleared
+                        // buffer; the single-artifact case re-posts cleanly (the failed attempt posted
+                        // nothing), the rare mixed reply+review case may duplicate the part that did
+                        // post — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
+                        Ok(()) => {
+                            client.finalize_review(config.task_id).await?;
+                            "review posted".to_string()
+                        }
                         Err(error) => {
-                            tracing::warn!(%error, "submitting review failed (non-fatal)");
-                            format!("{} findings (post failed)", result.findings.len())
+                            tracing::warn!(%error, "review run failed (non-fatal; nothing posted)");
+                            "review failed".to_string()
                         }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "review failed (non-fatal)");
-                    "review failed".to_string()
+                ReviewAgent::OpenCode => {
+                    match review::run_opencode(
+                        &checkout,
+                        review,
+                        &context.command,
+                        diff.as_ref(),
+                        &attribution,
+                    )
+                    .await
+                    {
+                        Ok(result) => match client.submit_review(config.task_id, &result).await {
+                            Ok(()) => format!("{} findings posted", result.findings.len()),
+                            Err(error) => {
+                                tracing::warn!(%error, "submitting review failed (non-fatal)");
+                                format!("{} findings (post failed)", result.findings.len())
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "review failed (non-fatal)");
+                            "review failed".to_string()
+                        }
+                    }
                 }
             }
         }

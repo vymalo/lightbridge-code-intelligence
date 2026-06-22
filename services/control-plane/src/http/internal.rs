@@ -625,21 +625,119 @@ pub async fn post_review(
     }
 }
 
-/// Body for `POST /internal/tasks/{id}/answer` — the agent's conversational answer (ADR-0033 `ask`).
+// ── ADR-0037 mediated write actions ─────────────────────────────────────────────────────────────
+// The native agent calls these *during* its run; the control plane accumulates them and posts nothing
+// until `finalize_review` flushes the buffer as one grouped review (+ a single consolidated reply).
+// Per-call diff validation is done runner-side (it holds the diff); the flush re-validates here
+// authoritatively via `crate::review::validate`. The legacy `post_review` path stays for OpenCode.
+
+/// Default summary for a run that produced no findings (and the empty-run backstop), so an
+/// `@mention`-triggered review is never a silent hang (ADR-0037).
+const DEFAULT_CLEAN_SUMMARY: &str = "No issues found — the change looks good.";
+
+/// Body for `POST /internal/tasks/{id}/review/inline` (`add_review_comment`).
 #[derive(Debug, Deserialize)]
-pub struct AnswerSubmission {
-    pub answer: String,
+pub struct InlineActionBody {
+    pub file: String,
+    pub line: i32,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub suggestion: Option<String>,
+    pub body: String,
 }
 
-/// `POST /internal/tasks/{id}/answer` — post the agent's answer for an `ask` run (ADR-0033) as a
-/// single reply comment on the issue/PR thread. Unlike [`post_review`], the answer is **not**
-/// diff-validated and carries no inline comments: a question deserves a direct reply, not a review.
-/// Both PRs and issues use the `issues/{n}/comments` endpoint, so this works for either target.
-pub async fn post_answer(
+/// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`) and
+/// `POST /internal/tasks/{id}/review/summary` (`set_summary`).
+#[derive(Debug, Deserialize)]
+pub struct TextActionBody {
+    pub body: String,
+}
+
+/// `POST /internal/tasks/{id}/review/inline` — buffer one inline finding (ADR-0037). Last write wins
+/// per `(file, line)`; nothing is posted until [`finalize_review`].
+pub async fn add_review_comment(
     _auth: RunnerAuth,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(submission): Json<AnswerSubmission>,
+    Json(a): Json<InlineActionBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::upsert_pending_inline(
+        pool,
+        id,
+        &a.file,
+        a.line,
+        a.title.as_deref(),
+        a.priority.as_deref(),
+        a.category.as_deref(),
+        a.suggestion.as_deref(),
+        &a.body,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "buffering inline finding failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "buffer error").into_response()
+        }
+    }
+}
+
+/// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (`add_comment`, ADR-0037).
+pub async fn add_review_reply(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(a): Json<TextActionBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::add_pending_comment(pool, id, &a.body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "buffering comment failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "buffer error").into_response()
+        }
+    }
+}
+
+/// `POST /internal/tasks/{id}/review/summary` — set the run's summary/verdict (`set_summary`).
+pub async fn set_review_summary(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(a): Json<TextActionBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::upsert_pending_summary(pool, id, &a.body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "buffering summary failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "buffer error").into_response()
+        }
+    }
+}
+
+/// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer (ADR-0037). Posts the
+/// inline findings + summary as **one grouped PR review** (re-validated against the diff here, the
+/// authority), consolidates buffered replies into **one** thread comment, records the emergent run
+/// kind, and clears the buffer. An empty run still posts a default "no issues found" review so an
+/// `@mention` is never silent. The buffer is cleared at the end regardless, so a finished run can't
+/// re-post on a stray retry.
+pub async fn finalize_review(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Response {
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
@@ -647,47 +745,201 @@ pub async fn post_answer(
     let Some(app) = state.github.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
     };
-
     let context = match crate::db::get_task_context(pool, id).await {
-        Ok(Some(context)) => context,
+        Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
         Err(error) => {
-            tracing::error!(%error, task_id = %id, "load task for answer failed");
+            tracing::error!(%error, task_id = %id, "load task for finalize failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-
+    let pending = match crate::db::load_pending_review(pool, id).await {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load pending buffer failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
     let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
+        Ok(t) => t,
         Err(error) => {
             tracing::error!(%error, task_id = %id, "mint installation token failed");
             return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
         }
     };
-
-    let issue = context.target_id;
-    let body = crate::review::render_answer_body(&submission.answer);
     let target = ReviewTarget {
         token: &token,
         owner: &context.owner,
         repo: &context.name,
-        pr: issue,
+        pr: context.target_id,
     };
-    match app
-        .create_issue_comment(&token, &context.owner, &context.name, issue, &body)
-        .await
-    {
-        Ok(comment_url) => {
-            tracing::info!(task_id = %id, target = issue, url = comment_url.as_deref().unwrap_or(""), "answer posted");
-            react(app, &state.review, &target, "hooray").await;
-            Json(serde_json::json!({ "answered": true, "url": comment_url })).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "posting answer comment failed");
-            react(app, &state.review, &target, "confused").await;
-            (StatusCode::BAD_GATEWAY, "could not post answer").into_response()
+
+    // 1) Buffered replies → a single consolidated thread comment (works on a PR or an issue). On a
+    // successful post we drop the comment rows immediately, so a re-finalize (e.g. a retried delivery
+    // after a later step failed) never double-posts this reply.
+    let mut posted_reply = false;
+    if !pending.comments.is_empty() {
+        let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
+        match app
+            .create_issue_comment(
+                &token,
+                &context.owner,
+                &context.name,
+                context.target_id,
+                &body,
+            )
+            .await
+        {
+            Ok(_) => {
+                posted_reply = true;
+                let _ = crate::db::clear_pending_action(pool, id, "comment").await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_id = %id, "posting consolidated reply failed (non-fatal)")
+            }
         }
     }
+
+    // 2) Inline findings + summary → one grouped PR review (PR targets only). Also covers the
+    // empty-run backstop (post a default clean review) and a summary-only verdict.
+    let has_inline = !pending.inline.is_empty();
+    let post_pr_review = context.target_type == "pull_request"
+        && (has_inline || pending.summary.is_some() || pending.is_empty());
+    let mut posted_review = false;
+    let mut review_failed = false;
+    if post_pr_review {
+        let pr = context.target_id;
+        let findings: Vec<crate::review::Finding> = pending
+            .inline
+            .iter()
+            .map(|pi| crate::review::Finding {
+                file: pi.file.clone(),
+                line: pi.line.max(0) as u32,
+                priority: pi.priority.clone(),
+                category: pi.category.clone(),
+                severity: None,
+                title: pi.title.clone().unwrap_or_default(),
+                body: pi.body.clone(),
+                suggestion: pi.suggestion.clone(),
+                resources: Vec::new(),
+            })
+            .collect();
+        // A present-but-blank summary falls back to the default, so the verdict is never empty.
+        let summary = pending
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CLEAN_SUMMARY)
+            .to_string();
+
+        let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
+            match app
+                .list_pr_files(&token, &context.owner, &context.name, pr)
+                .await
+            {
+                Ok(files) => files
+                    .into_iter()
+                    .filter_map(|f| {
+                        f.patch
+                            .map(|p| (f.filename, crate::review::commentable_lines(&p)))
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "fetching PR files failed");
+                    return (StatusCode::BAD_GATEWAY, "could not fetch PR files").into_response();
+                }
+            };
+
+        let in_scope = |f: &crate::review::Finding| {
+            let normalized = f.file.replace('\\', "/");
+            let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
+            commentable.contains_key(trimmed) || commentable.contains_key(&f.file)
+        };
+        let label_has_findings = findings.iter().any(in_scope);
+        let label_has_error = findings.iter().any(|f| f.priority() == "P0" && in_scope(f));
+        let findings_json = serde_json::to_value(&findings).unwrap_or_default();
+
+        let validated = crate::review::validate(findings, &commentable);
+        let body =
+            crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope);
+        let comments: Vec<crate::integrations::github::ReviewComment> = validated
+            .inline
+            .iter()
+            .map(|c| crate::integrations::github::ReviewComment {
+                path: c.path.clone(),
+                line: c.line,
+                side: "RIGHT",
+                body: c.body.clone(),
+            })
+            .collect();
+        let (inline_n, deferred_n, out_of_scope_n) = (
+            comments.len(),
+            validated.deferred.len(),
+            validated.out_of_scope.len(),
+        );
+
+        match app
+            .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
+            .await
+        {
+            Ok(review_url) => {
+                posted_review = true;
+                tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review flushed");
+                if let Err(error) = crate::db::upsert_review(
+                    pool,
+                    id,
+                    &summary,
+                    &body,
+                    inline_n as i32,
+                    deferred_n as i32,
+                    out_of_scope_n as i32,
+                    &findings_json,
+                    review_url.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(%error, task_id = %id, "persisting review copy failed (non-fatal)");
+                }
+                react(app, &state.review, &target, "hooray").await;
+                add_review_labels(
+                    app,
+                    &state.review,
+                    &target,
+                    label_has_findings,
+                    label_has_error,
+                )
+                .await;
+                // Drop the inline + summary rows now that the review is on GitHub, so a re-finalize
+                // doesn't post a duplicate review.
+                let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+                let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+            }
+            Err(error) => {
+                tracing::error!(%error, task_id = %id, "flushing PR review failed");
+                react(app, &state.review, &target, "confused").await;
+                // Leave the inline/summary rows intact so a re-finalize can post the review; don't
+                // bail early, so the kind is still recorded and any posted reply isn't lost.
+                review_failed = true;
+            }
+        }
+    }
+
+    // 3) Record the emergent run kind (ADR-0037). The buffer was cleared per-part as each post
+    // succeeded; any rows left belong to a part that failed and a re-finalize will retry.
+    let kind = match (has_inline, posted_reply) {
+        (true, true) => "mixed",
+        (true, false) => "review",
+        (false, true) => "ask",
+        (false, false) => "review", // summary-only or empty → a (clean) review
+    };
+    let _ = crate::db::set_task_kind(pool, id, kind).await;
+
+    if review_failed {
+        return (StatusCode::BAD_GATEWAY, "could not post review").into_response();
+    }
+    Json(serde_json::json!({ "kind": kind, "review": posted_review, "reply": posted_reply }))
+        .into_response()
 }
 
 /// Where a review reaction/label is applied: the minted token + the PR coordinates.
@@ -776,6 +1028,13 @@ pub async fn set_status(
     }
     match crate::db::set_task_status(pool, id, &update.status).await {
         Ok(true) => {
+            // ADR-0037 idempotency: a runner (re)starting its task clears any buffer left by a prior
+            // attempt, so a retry accumulates from empty rather than appending to a partial review.
+            if update.status == "running" {
+                if let Err(error) = crate::db::clear_pending_review(pool, id).await {
+                    tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
+                }
+            }
             // A terminal failure gets 😕 on the PR (best-effort). Success is acknowledged by the
             // review post (🎉) in `post_review`, so we don't double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {

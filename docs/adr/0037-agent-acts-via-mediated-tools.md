@@ -109,11 +109,26 @@ The agent is given the user's message and a **toolbox**, and it *acts*:
   be steered to always call it — and the control plane backstops with a default clean review when it
   doesn't, so feedback is never silent.
 - **Neutral / to watch:** [ADR-0022](0022-review-writeback-control-plane.md)'s "validate the whole
-  batch, then post" becomes "validate per call, buffer, flush once at completion" — same guarantees,
-  different timing. The transcript ([ADR-0034](0034-agent-run-transcript-and-observability.md))
-  becomes a natural log of the tool actions taken. A single combined system prompt must still keep the
-  **review discipline sharp** (scope rule, priority/category) even though the same agent can also
-  answer — prompt quality is the thing to monitor, given review quality is the live concern.
+  batch, then post" becomes "validate at finalize, buffer, flush once at completion" — same guarantees
+  (off-diff findings still surface in the collapsible section, no silent drops), different timing. The
+  per-call recoverable-error refinement (immediate agent self-correction) is a fast-follow; the
+  silent-drop guarantee does not depend on it. The transcript
+  ([ADR-0034](0034-agent-run-transcript-and-observability.md)) becomes a natural log of the tool
+  actions taken.
+
+### The system prompt is required operational config — no code default
+
+The agent's persona/guidance is **not** a code constant. There is no `DEFAULT_REVIEW_GUIDANCE`
+fallback: the system prompt is **required**, owned in the ai-helm chart
+(`config.reviewSystemPrompt` → a mounted `review-system.md`), and the runner **fails the review
+closed** if it is unset rather than running a weak baked-in prompt. A prompt this central is the main
+lever on review quality, so it must live where it can be reviewed and iterated (edit → ConfigMap →
+ArgoCD sync, no rebuild), not buried in the binary. Only the factual machine **tool-protocol** (how to
+call `add_review_comment` / `add_comment` / `finish`) stays in code — it is API-coupled, not persona.
+A single combined prompt must still keep the **review discipline sharp** (scope, priority/category)
+even though the same agent also answers questions — prompt quality is the thing to monitor, given
+review quality is the live concern. **Deploy ordering:** the chart prompt must be live before the
+no-default runner image, or reviews fail closed.
 
 ## Pros and Cons of the Options
 

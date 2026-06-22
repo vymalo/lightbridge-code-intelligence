@@ -253,10 +253,26 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
         )
-        // The structured review → validated GitHub PR review (slice 6).
+        // The structured review → validated GitHub PR review (slice 6; OpenCode fallback path).
         .route("/internal/tasks/{id}/review", post(internal::post_review))
-        // An `ask` run's conversational answer → a single reply comment (ADR-0033).
-        .route("/internal/tasks/{id}/answer", post(internal::post_answer))
+        // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
+        // flushes them as one grouped review on finalize.
+        .route(
+            "/internal/tasks/{id}/review/inline",
+            post(internal::add_review_comment),
+        )
+        .route(
+            "/internal/tasks/{id}/review/comment",
+            post(internal::add_review_reply),
+        )
+        .route(
+            "/internal/tasks/{id}/review/summary",
+            post(internal::set_review_summary),
+        )
+        .route(
+            "/internal/tasks/{id}/review/finalize",
+            post(internal::finalize_review),
+        )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }

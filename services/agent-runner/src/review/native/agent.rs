@@ -1,127 +1,49 @@
-//! The native review agent loop (ADR-0026).
+//! The native agent loop (ADR-0026 + ADR-0037).
 //!
-//! Drives the [`ChatClient`] over the eaig gateway with the [`tool_defs`] surface: system+diff prompt
-//! → model → (retrieval tool calls) → … → `submit_findings`. The review is returned by the model
-//! **calling `submit_findings`**, validated at the tool boundary — no stdout scraping. The loop is
-//! bounded ([`MAX_TURNS`]) and treats a tool/argument error as a recoverable turn (the model gets the
-//! error text back and retries), only failing on `abort`, an exhausted turn budget, or a transport
-//! error. Cooperative cancellation comes for free: `run()` races the whole task (this loop included)
+//! Drives the [`ChatClient`] over the eaig gateway with the [`tool_defs`] surface: the system prompt
+//! (the operator-owned persona + the machine tool-protocol) and the request → model → (retrieval +
+//! mediated write actions) → … → `finish`. The agent **acts as it goes** — each `add_review_comment`
+//! / `add_comment` is buffered control-plane-side; `finish` ends the run and the caller flushes the
+//! buffer as one grouped review. The loop is bounded ([`MAX_TURNS`]) and treats a tool/argument error
+//! as a recoverable turn (the model gets the error text back and retries), only failing on `abort`, an
+//! exhausted turn budget, or a transport error. A run that fails this way is **never finalized**, so a
+//! mid-run death posts nothing (crash-safe). Cancellation comes for free: `run()` races the whole task
 //! against the self-cancel poll, so a cancelled task drops the in-flight future.
 
 use anyhow::Context;
 use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams};
-use super::tools::{ask_tool_defs, tool_defs, ToolOutcome, Tools};
+use super::tools::{tool_defs, ToolOutcome, Tools, ADD_REVIEW_COMMENT};
 use crate::bootstrap::client::ControlPlaneClient;
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
-use crate::review::{ReviewResult, DEFAULT_ASK_GUIDANCE, DEFAULT_REVIEW_GUIDANCE};
 
-/// Hard ceiling on model turns, so a model that never submits can't loop forever (each turn is one
+/// Hard ceiling on model turns, so a model that never finishes can't loop forever (each turn is one
 /// chat round-trip; tool calls within a turn don't count separately).
 const MAX_TURNS: usize = 16;
 
-/// The native output contract — the analogue of the OpenCode `OUTPUT_CONTRACT`, but the review is
-/// returned by **calling `submit_findings`** rather than emitting a JSON block. Appended after the
-/// (operator-overridable) guidance, so it's always the final instruction.
-const NATIVE_CONTRACT: &str = "\
-Return your review by calling the `submit_findings` tool exactly once — never as prose or a code \
-block. Ground every claim with the search/graph tools before reporting it; you may not edit files or \
-run commands.\n\
-- Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; \
-never comment on untouched code.\n\
-- Review ALL dimensions — security, correctness, quality, style, performance. Give each finding a \
-`category` (one of those) and a `priority`: `P0` (must fix — bugs, security, data loss), `P1` (should \
-fix), or `P2` (minor / nit). Reserve P0/P1 for real harm and file style/quality observations as P2, so \
-low-value notes never crowd out blockers.\n\
-- Each finding: a short `title`, a `body` (why it matters), an optional `suggestion` (the EXACT \
-replacement source for that one line — no diff markers or fences), and optional `resources` (URLs).\n\
-- If the change is sound, call `submit_findings` with an empty `findings` array and a one-line \
-summary — silence is better than noise.\n\
-- If you genuinely cannot produce a useful review, call `abort` with a reason.";
+/// The machine **tool-protocol** appended after the operator's system prompt (ADR-0037). This is the
+/// only behaviour-shaping text that lives in code — it is factual and coupled to the tool API (names,
+/// when to call them), NOT persona/guidance, which is operator-owned config (`review.system_prompt`,
+/// from the ai-helm `config.reviewSystemPrompt`). It goes last so it's the final instruction.
+const TOOL_PROTOCOL: &str = "\
+# How to act\n\
+Investigate with the search/graph tools before making any claim — never speculate about code you \
+have not looked up. As you find issues, record each one with `add_review_comment` (one call per \
+finding, on a line this diff adds or changes). Use `add_comment` for a plain reply that isn't pinned \
+to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with \
+your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you \
+genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run \
+commands.";
 
-/// How a finished agent run ended: the model called one of the terminal tools. `review` and `ask`
-/// share the same loop and differ only in which terminal tool they advertise (so only one variant is
-/// reachable per run); the public wrappers map this to their own return type.
-enum Terminal {
-    Findings(ReviewResult),
-    Answer(String),
-}
-
-/// The one agent loop both run kinds share (ADR-0026): drive the [`ChatClient`] over a tool surface
-/// until the model calls a terminal tool, bounded by [`MAX_TURNS`]. The *only* things that vary
-/// between a `review` and an `ask` are the advertised tools (`defs`) and the seeded `messages`
-/// (persona + contract); everything else — retrieval, recovery from a bad tool call, cancellation,
-/// the turn budget — is identical, so it lives here once. A tool/argument error is fed back to the
-/// model as a recoverable turn; only `abort`, an exhausted budget, or a transport error fail the run.
-/// `label` names the run in errors/log context.
+/// Run the native agent loop. The agent acts via the mediated write tools during the run; on a clean
+/// `finish` this returns `Ok(())` and the caller flushes the buffer (`finalize_review`). Any error
+/// (abort, exhausted budget, transport) returns `Err` and the caller does **not** finalize — so a
+/// failed/partial run posts nothing.
 #[allow(clippy::too_many_arguments)]
-async fn drive_agent(
-    review: &ReviewConfig,
-    defs: &[super::chat::ToolDef],
-    mut messages: Vec<ChatMessage>,
-    attribution: &[(String, String)],
-    client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
-    task_id: Uuid,
-    label: &str,
-) -> anyhow::Result<Terminal> {
-    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
-        .with_attribution(attribution);
-    let tools = Tools {
-        client,
-        embedder,
-        task_id,
-    };
-    let params = ChatParams {
-        temperature: review.temperature,
-        top_p: review.top_p,
-        max_tokens: review.max_tokens,
-    };
-
-    for turn in 0..MAX_TURNS {
-        let completion = chat
-            .complete(&messages, defs, params)
-            .await
-            .with_context(|| format!("{label} chat turn {turn}"))?;
-        let assistant = completion.message;
-        let calls = assistant.tool_calls.clone();
-        // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
-        // requires before the matching tool-result messages.
-        messages.push(assistant);
-
-        if calls.is_empty() {
-            // The model answered in prose instead of using the tools — steer it back to the contract.
-            messages.push(ChatMessage::user(
-                "Use the provided tools to investigate, then call the submit tool for this run \
-                 (or `abort` with a reason). Do not reply in prose.",
-            ));
-            continue;
-        }
-
-        for call in &calls {
-            match tools.dispatch(call).await {
-                ToolOutcome::Submit(result) => return Ok(Terminal::Findings(result)),
-                ToolOutcome::Answer(answer) => return Ok(Terminal::Answer(answer)),
-                ToolOutcome::Abort(reason) => anyhow::bail!("{label} agent aborted: {reason}"),
-                ToolOutcome::Continue(result) => {
-                    messages.push(ChatMessage::tool(call.id.as_str(), result));
-                }
-            }
-        }
-    }
-
-    anyhow::bail!("{label} agent did not finish within {MAX_TURNS} turns")
-}
-
-/// Run the native review loop and return the structured result the model submits. A thin adapter over
-/// [`drive_agent`] with the review tool surface ([`tool_defs`]); the only terminal it expects is
-/// `submit_findings` (the `ask`-only [`Terminal::Answer`] is unreachable since `submit_answer` isn't
-/// advertised here, but is mapped to an error defensively).
-#[allow(clippy::too_many_arguments)]
-pub async fn run_native_review(
+pub async fn run_native_agent(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
@@ -129,115 +51,89 @@ pub async fn run_native_review(
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
     task_id: Uuid,
-) -> anyhow::Result<ReviewResult> {
-    let messages = build_messages(review, command, diff);
-    match drive_agent(
-        review,
-        &tool_defs(),
-        messages,
-        attribution,
+) -> anyhow::Result<()> {
+    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
+        .with_attribution(attribution);
+    let tools = Tools {
         client,
         embedder,
         task_id,
-        "review",
-    )
-    .await?
-    {
-        Terminal::Findings(result) => Ok(result),
-        Terminal::Answer(_) => anyhow::bail!("review run produced an answer instead of findings"),
+    };
+    // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
+    // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
+    // replies via `add_comment` instead of hallucinating inline comments that go nowhere.
+    let mut defs = tool_defs();
+    if diff.is_none() {
+        defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
     }
-}
+    let params = ChatParams {
+        temperature: review.temperature,
+        top_p: review.top_p,
+        max_tokens: review.max_tokens,
+    };
 
-/// The native **ask** contract (ADR-0033): the analogue of [`NATIVE_CONTRACT`] for a conversational
-/// answer. The run ends when the model calls `submit_answer`. Appended after the ask guidance.
-const ASK_CONTRACT: &str = "\
-Answer the user's question about this pull request and the codebase. Investigate with the \
-search/graph tools before answering — ground every claim in what you find; you may not edit files \
-or run commands.\n\
-- Lead with the answer, then the why. Be direct and concrete; GitHub-flavored Markdown, short code \
-blocks where they help.\n\
-- When you propose a change, show the concrete code — you are advising, not committing it.\n\
-- When you have the answer, call `submit_answer` exactly once with your full Markdown reply. Do not \
-answer in prose outside the tool.\n\
-- If you genuinely cannot answer, call `abort` with a reason.";
+    let mut messages = build_messages(review, command, diff);
 
-/// Run the native **ask** loop (ADR-0033) and return the Markdown answer the model submits. The
-/// mirror of [`run_native_review`] over the `ask` tool surface ([`ask_tool_defs`]) — same loop, the
-/// run just ends with `submit_answer` instead of `submit_findings`.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_native_ask(
-    review: &ReviewConfig,
-    question: &str,
-    diff: Option<&PrDiff>,
-    attribution: &[(String, String)],
-    client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
-    task_id: Uuid,
-) -> anyhow::Result<String> {
-    let messages = build_ask_messages(review, question, diff);
-    match drive_agent(
-        review,
-        &ask_tool_defs(),
-        messages,
-        attribution,
-        client,
-        embedder,
-        task_id,
-        "ask",
-    )
-    .await?
-    {
-        Terminal::Answer(answer) => Ok(answer),
-        Terminal::Findings(_) => anyhow::bail!("ask run produced findings instead of an answer"),
-    }
-}
+    for turn in 0..MAX_TURNS {
+        let completion = chat
+            .complete(&messages, &defs, params)
+            .await
+            .with_context(|| format!("agent chat turn {turn}"))?;
+        let assistant = completion.message;
+        let calls = assistant.tool_calls.clone();
+        // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
+        // requires before the matching tool-result messages.
+        messages.push(assistant);
 
-/// Assemble the system (ask guidance + contract) and user (question + diff as context) messages for
-/// an ask run. The diff, when present, is supplied as context to ground the answer — there is no
-/// scope rule (an answer isn't pinned to diff lines).
-fn build_ask_messages(
-    review: &ReviewConfig,
-    question: &str,
-    diff: Option<&PrDiff>,
-) -> Vec<ChatMessage> {
-    let system = format!("{DEFAULT_ASK_GUIDANCE}\n\n{ASK_CONTRACT}");
-
-    let mut user = format!("The user asked: {question}");
-    if let Some(pr) = diff {
-        user.push_str(&format!(
-            "\n\nFor context, this pull request changes {} file(s):\n{}",
-            pr.files.len(),
-            pr.files
-                .iter()
-                .map(|f| format!("- {f}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
-        user.push_str("\n\nUnified diff (context for your answer):\n```diff\n");
-        user.push_str(truncate_on_boundary(&pr.diff, review.max_diff_chars));
-        if pr.diff.len() > review.max_diff_chars {
-            user.push_str("\n… [diff truncated] …");
+        if calls.is_empty() {
+            // The model replied in prose instead of acting — steer it back to the tools.
+            messages.push(ChatMessage::user(
+                "Use the tools to investigate and record findings with `add_review_comment` (or a \
+                 reply with `add_comment`), then call `finish` with your verdict (or `abort`). Do \
+                 not reply in prose.",
+            ));
+            continue;
         }
-        user.push_str("\n```");
+
+        // Dispatch every call in the turn before acting on a terminal outcome: a model may emit
+        // parallel tool calls (e.g. a last `add_review_comment` alongside `finish`), and we must not
+        // drop the others just because `finish` appeared first. Each dispatch still runs its side
+        // effect (the write tools buffer immediately); we only defer the loop-control decision.
+        let mut should_finish = false;
+        let mut abort_reason = None;
+        for call in &calls {
+            match tools.dispatch(call).await {
+                ToolOutcome::Finish => should_finish = true,
+                ToolOutcome::Abort(reason) => abort_reason = Some(reason),
+                ToolOutcome::Continue(result) => {
+                    messages.push(ChatMessage::tool(call.id.as_str(), result));
+                }
+            }
+        }
+        // Abort wins over finish if the model somehow asked for both — it's the safer outcome (a
+        // failed run posts nothing).
+        if let Some(reason) = abort_reason {
+            anyhow::bail!("review agent aborted: {reason}");
+        }
+        if should_finish {
+            return Ok(());
+        }
     }
 
-    vec![ChatMessage::system(system), ChatMessage::user(user)]
+    anyhow::bail!("review agent did not finish within {MAX_TURNS} turns")
 }
 
-/// Assemble the system (guidance + contract) and user (command + diff) messages. Mirrors the OpenCode
-/// prompt assembly, minus the JSON-block contract (the native agent submits via a tool).
+/// Assemble the system (operator prompt + tool-protocol) and user (request + diff) messages. The
+/// system prompt is the **required** operator-owned guidance (ADR-0037 — no built-in default); the
+/// tool-protocol is appended last so it's the final instruction the model sees.
 fn build_messages(review: &ReviewConfig, command: &str, diff: Option<&PrDiff>) -> Vec<ChatMessage> {
-    let guidance = review
-        .system_prompt
-        .as_deref()
-        .unwrap_or(DEFAULT_REVIEW_GUIDANCE);
-    let system = format!("{guidance}\n\n{NATIVE_CONTRACT}");
+    let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
 
-    let mut user = format!("Requested review command: {command}");
+    let mut user = format!("The maintainer's request: {command}");
     match diff {
         Some(pr) => {
             user.push_str(&format!(
-                "\n\nThis PR changes {} file(s):\n{}",
+                "\n\nThis pull request changes {} file(s):\n{}",
                 pr.files.len(),
                 pr.files
                     .iter()
@@ -253,8 +149,8 @@ fn build_messages(review: &ReviewConfig, command: &str, diff: Option<&PrDiff>) -
             user.push_str("\n```");
         }
         None => user.push_str(
-            "\n\nNo diff is available for this run; review the working tree for the requested \
-             change and keep findings grounded in the tools.",
+            "\n\nNo diff is available for this run; answer or review against the working tree and \
+             keep every claim grounded in the tools.",
         ),
     }
 
@@ -284,7 +180,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     /// A scripted chat endpoint: returns `responses[i]` on the i-th call, repeating the last forever
-    /// (so a loop that never submits keeps getting the same reply).
+    /// (so a loop that never finishes keeps getting the same reply).
     struct Script {
         calls: Arc<AtomicUsize>,
         responses: Vec<serde_json::Value>,
@@ -332,7 +228,7 @@ mod tests {
             base_url: chat_base_with_v1,
             api_key: "k".to_string(),
             model: "m".to_string(),
-            system_prompt: None,
+            system_prompt: "You are a reviewer.".to_string(),
             max_diff_chars: 60_000,
             temperature: None,
             top_p: None,
@@ -340,23 +236,29 @@ mod tests {
         }
     }
 
-    // The user's free-text instruction (carried from the @mention comment, #138) reaches the prompt.
+    // The maintainer's request reaches the user prompt; the operator system prompt is used verbatim.
     #[test]
-    fn build_messages_carries_the_instruction_into_the_user_prompt() {
+    fn build_messages_carries_request_and_uses_operator_prompt() {
         let review = review_config("http://unused/v1".to_string());
         let msgs = build_messages(&review, "propose a better implementation", None);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
+        let system = msgs[0].content.as_deref().expect("system content");
+        assert!(
+            system.starts_with("You are a reviewer."),
+            "operator prompt first"
+        );
+        assert!(system.contains("How to act"), "tool-protocol appended");
         let user = msgs[1].content.as_deref().expect("user content");
         assert!(
             user.contains("propose a better implementation"),
-            "instruction must reach the prompt; got: {user}"
+            "request reaches prompt: {user}"
         );
     }
 
-    // ── Positive e2e: search → results → submit_findings → validated ReviewResult ───────────────
+    // ── Positive e2e: search → add_review_comment → finish → Ok(()) ─────────────────────────────
     #[tokio::test]
-    async fn native_loop_searches_then_submits() {
+    async fn native_loop_searches_records_and_finishes() {
         let chat = MockServer::start().await;
         mount_chat(
             &chat,
@@ -366,16 +268,14 @@ mod tests {
                     r#"{"query":"session expiry"}"#,
                 ),
                 tool_call_reply(
-                    "submit_findings",
-                    r#"{"summary":"Missing expiry check.","findings":[
-                        {"file":"a.rs","line":7,"priority":"P0","category":"security","title":"No expiry","body":"accepts expired tokens"}
-                    ]}"#,
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":7,"title":"No expiry","priority":"P0","category":"security","body":"accepts expired tokens"}"#,
                 ),
+                tool_call_reply("finish", r#"{"summary":"Missing expiry check."}"#),
             ],
         )
         .await;
 
-        // The search tool needs the embeddings + control-plane search endpoints.
         let emb = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/embeddings"))
@@ -394,53 +294,62 @@ mod tests {
             }])))
             .mount(&cp)
             .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
 
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new(cp.uri(), "tok");
         let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
-        let result = run_native_review(
+        // A diff is present, so `add_review_comment` is offered.
+        let diff = PrDiff {
+            diff: "@@ -1,3 +1,4 @@\n fn validate() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        run_native_agent(
             &review,
             "@lightbridge review",
-            None,
+            Some(&diff),
             &[],
             &cpc,
             &embc,
             Uuid::nil(),
         )
         .await
-        .expect("review");
-        assert_eq!(result.summary, "Missing expiry check.");
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].file, "a.rs");
-        assert_eq!(result.findings[0].line, 7);
+        .expect("agent finishes cleanly");
     }
 
-    // ── Positive e2e: a bad submit payload is recoverable — the model retries and succeeds ──────
-    #[tokio::test]
-    async fn native_loop_recovers_from_a_bad_submit() {
-        let chat = MockServer::start().await;
-        mount_chat(
-            &chat,
-            vec![
-                tool_call_reply("submit_findings", r#"{"findings":[]}"#), // missing summary
-                tool_call_reply(
-                    "submit_findings",
-                    r#"{"summary":"All good.","findings":[]}"#,
-                ),
-            ],
-        )
-        .await;
-        let review = review_config(format!("{}/v1", chat.uri()));
-        let cpc = ControlPlaneClient::new("http://unused", "tok");
-        let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let result = run_native_review(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
-            .await
-            .expect("review");
-        assert_eq!(result.summary, "All good.");
-        assert!(result.findings.is_empty());
+    // No diff → `add_review_comment` is not offered (an inline finding can't anchor); the rest of the
+    // tool surface remains.
+    #[test]
+    fn no_diff_omits_add_review_comment_from_offered_tools() {
+        let offered: Vec<String> = {
+            let mut defs = tool_defs();
+            defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
+            defs.iter().map(|t| t.function.name.clone()).collect()
+        };
+        assert!(!offered.iter().any(|n| n == ADD_REVIEW_COMMENT));
+        assert!(
+            offered.iter().any(|n| n == "add_comment"),
+            "add_comment still offered"
+        );
+        assert!(offered.iter().any(|n| n == "finish"));
     }
 
-    // ── Negative e2e: abort surfaces as an error (recorded upstream, non-fatal to the task) ─────
+    // ── Negative e2e: abort surfaces as an error (caller does not finalize) ─────────────────────
     #[tokio::test]
     async fn native_loop_abort_is_an_error() {
         let chat = MockServer::start().await;
@@ -452,112 +361,21 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_review(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
+        let err = run_native_agent(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
             .await
             .expect_err("abort is an error");
         assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
     }
 
-    // The ask prompt carries the question and (when present) the diff as context.
-    #[test]
-    fn build_ask_messages_carries_the_question() {
-        let review = review_config("http://unused/v1".to_string());
-        let msgs = build_ask_messages(&review, "why a mutex here?", None);
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].role, "system");
-        let user = msgs[1].content.as_deref().expect("user content");
-        assert!(
-            user.contains("why a mutex here?"),
-            "question reaches prompt: {user}"
-        );
-    }
-
-    // ── Positive e2e (ask): search → results → submit_answer → Markdown answer ──────────────────
-    #[tokio::test]
-    async fn native_ask_searches_then_answers() {
-        let chat = MockServer::start().await;
-        mount_chat(
-            &chat,
-            vec![
-                tool_call_reply(
-                    "lightbridge_vector_semantic_search",
-                    r#"{"query":"locking strategy"}"#,
-                ),
-                tool_call_reply(
-                    "submit_answer",
-                    r#"{"answer":"The mutex guards the shared cache; prefer an RwLock for read-heavy access."}"#,
-                ),
-            ],
-        )
-        .await;
-
-        let emb = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
-            })))
-            .mount(&emb)
-            .await;
-        let cp = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-                "file_path": "cache.rs", "language": "rust", "chunk_type": "function",
-                "symbol_name": "get", "start_line": 1, "end_line": 9,
-                "content": "fn get() {}", "score": 0.9
-            }])))
-            .mount(&cp)
-            .await;
-
-        let review = review_config(format!("{}/v1", chat.uri()));
-        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
-        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
-        let answer = run_native_ask(
-            &review,
-            "why a mutex here?",
-            None,
-            &[],
-            &cpc,
-            &embc,
-            Uuid::nil(),
-        )
-        .await
-        .expect("answer");
-        assert!(answer.contains("RwLock"), "got: {answer}");
-    }
-
-    // ── Negative e2e (ask): abort surfaces as an error ──────────────────────────────────────────
-    #[tokio::test]
-    async fn native_ask_abort_is_an_error() {
-        let chat = MockServer::start().await;
-        mount_chat(
-            &chat,
-            vec![tool_call_reply("abort", r#"{"reason":"question unclear"}"#)],
-        )
-        .await;
-        let review = review_config(format!("{}/v1", chat.uri()));
-        let cpc = ControlPlaneClient::new("http://unused", "tok");
-        let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_ask(&review, "huh?", None, &[], &cpc, &embc, Uuid::nil())
-            .await
-            .expect_err("abort is an error");
-        assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
-    }
-
-    // ── Negative e2e: a model that never submits is cut off by the turn budget ──────────────────
+    // ── Negative e2e: a model that never finishes is cut off by the turn budget ─────────────────
     #[tokio::test]
     async fn native_loop_gives_up_after_max_turns() {
         let chat = MockServer::start().await;
-        mount_chat(
-            &chat,
-            vec![text_reply("Hmm, let me think out loud forever.")],
-        )
-        .await;
+        mount_chat(&chat, vec![text_reply("Thinking out loud forever.")]).await;
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_review(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
+        let err = run_native_agent(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
             .await
             .expect_err("should give up");
         assert!(

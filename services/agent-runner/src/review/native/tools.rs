@@ -1,4 +1,4 @@
-//! The agent's tool surface (ADR-0026) and the in-process dispatcher that runs each call.
+//! The agent's tool surface (ADR-0026 + ADR-0037) and the in-process dispatcher that runs each call.
 //!
 //! These are the same capabilities the standalone MCP servers expose, but invoked directly against
 //! the control-plane client instead of over stdio MCP — the MCP servers were already thin proxies to
@@ -6,11 +6,13 @@
 //!
 //! - **Retrieval** (read-only, the model investigates with these): `vector_semantic_search`,
 //!   `graph_find_symbol`, `graph_get_callers`.
-//! - **Control** (how the loop ends / reports): `submit_findings` (returns the review — validated
-//!   here at the tool boundary, replacing the old stdout scrape), `report_progress`, `abort`.
+//! - **Write actions** (ADR-0037 — the agent *acts* as it goes; the control plane mediates every
+//!   write and posts nothing until finalize): `add_review_comment` (an inline finding),
+//!   `add_comment` (a plain reply), `finish` (set the verdict + end the run).
+//! - **Control**: `report_progress`, `abort`.
 //!
-//! A tool error is returned to the model as text (so it can retry/rephrase), never as a loop-killing
-//! error — the same recovery property the MCP servers had.
+//! A tool/argument error is returned to the model as text (so it can retry/rephrase), never as a
+//! loop-killing error — the same recovery property the MCP servers had.
 
 use serde::Deserialize;
 use uuid::Uuid;
@@ -18,15 +20,15 @@ use uuid::Uuid;
 use super::chat::{ToolCall, ToolDef};
 use crate::bootstrap::client::ControlPlaneClient;
 use crate::indexer::embeddings::EmbeddingsClient;
-use crate::review::ReviewResult;
 
-// The retrieval tools keep the `lightbridge_`-prefixed names the MCP servers used, so the shared
-// reviewer guidance (which references them by name) stays accurate for the native agent too.
+// The retrieval tools keep the `lightbridge_`-prefixed names the MCP servers used, so a reviewer
+// prompt that references them by name stays accurate for the native agent too.
 pub const VECTOR_SEMANTIC_SEARCH: &str = "lightbridge_vector_semantic_search";
 pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
 pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
-pub const SUBMIT_FINDINGS: &str = "submit_findings";
-pub const SUBMIT_ANSWER: &str = "submit_answer";
+pub const ADD_REVIEW_COMMENT: &str = "add_review_comment";
+pub const ADD_COMMENT: &str = "add_comment";
+pub const FINISH: &str = "finish";
 pub const REPORT_PROGRESS: &str = "report_progress";
 pub const ABORT: &str = "abort";
 
@@ -38,10 +40,8 @@ const MAX_LIMIT: i64 = 100;
 pub enum ToolOutcome {
     /// A result string to feed back to the model as a `tool` message; the loop continues.
     Continue(String),
-    /// The model called `submit_findings` with a valid payload — this is the review.
-    Submit(ReviewResult),
-    /// The model called `submit_answer` (ADR-0033 `ask`) — this is the conversational answer.
-    Answer(String),
+    /// The model called `finish` — the run is done; the control plane flushes the buffered actions.
+    Finish,
     /// The model called `abort` — it can't produce a useful result. Recorded, not a crash.
     Abort(String),
 }
@@ -68,8 +68,25 @@ struct GetCallersArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct AnswerArgs {
-    answer: String,
+struct AddReviewCommentArgs {
+    file: String,
+    line: i32,
+    title: String,
+    priority: String,
+    category: String,
+    body: String,
+    #[serde(default)]
+    suggestion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextArgs {
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinishArgs {
+    summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,8 +99,7 @@ struct AbortArgs {
     reason: String,
 }
 
-/// The read-only retrieval tools the model investigates with — shared by the `review` and `ask`
-/// surfaces (both ground their output in the same repo context).
+/// The read-only retrieval tools the model investigates with.
 fn retrieval_tool_defs() -> Vec<ToolDef> {
     let limit_schema = serde_json::json!({
         "type": "integer",
@@ -132,7 +148,7 @@ fn retrieval_tool_defs() -> Vec<ToolDef> {
     ]
 }
 
-/// The `report_progress` + `abort` control tools, shared by both surfaces.
+/// The `report_progress` + `abort` control tools.
 fn aux_control_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef::function(
@@ -147,7 +163,7 @@ fn aux_control_tool_defs() -> Vec<ToolDef> {
         ToolDef::function(
             ABORT,
             "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded \
-             as a clean abort, not a crash.",
+             as a clean abort, not a crash. Nothing you buffered is posted.",
             serde_json::json!({
                 "type": "object",
                 "properties": { "reason": { "type": "string" } },
@@ -157,65 +173,52 @@ fn aux_control_tool_defs() -> Vec<ToolDef> {
     ]
 }
 
-/// The tools advertised for a **review** run, in a stable order: retrieval + `submit_findings` + aux.
+/// The full tool surface (ADR-0037), in a stable order: retrieval + write actions + control.
 pub fn tool_defs() -> Vec<ToolDef> {
     let mut defs = retrieval_tool_defs();
-    defs.push(
-        ToolDef::function(
-            SUBMIT_FINDINGS,
-            "Submit the final review. Call this exactly once when done. Every finding's `line` MUST \
-             be a line the diff adds or changes.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string", "description": "1–3 sentences: does the change do what it intends, and is it correct and safe?" },
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file": { "type": "string", "description": "Path from repo root." },
-                                "line": { "type": "integer", "description": "A line this diff adds or changes." },
-                                "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
-                                "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
-                                "title": { "type": "string", "description": "Short (≤ ~8 words)." },
-                                "body": { "type": "string", "description": "Why it matters." },
-                                "suggestion": { "type": "string", "description": "Optional exact replacement source for `line` (no diff markers)." },
-                                "resources": { "type": "array", "items": { "type": "string" }, "description": "Optional supporting URLs." },
-                            },
-                            "required": ["file", "line", "priority", "category", "title", "body"],
-                        },
-                    },
-                },
-                "required": ["summary", "findings"],
-            }),
-        ),
-    );
-    defs.extend(aux_control_tool_defs());
-    defs
-}
-
-/// The tools advertised for an **ask** run (ADR-0033): retrieval + `submit_answer` + aux. Same
-/// investigation surface as a review, but the run ends with a conversational answer, not findings.
-pub fn ask_tool_defs() -> Vec<ToolDef> {
-    let mut defs = retrieval_tool_defs();
     defs.push(ToolDef::function(
-        SUBMIT_ANSWER,
-        "Submit your final answer to the user's question, as GitHub-flavored Markdown. Call this \
-         exactly once when done — do not answer in prose outside the tool.",
+        ADD_REVIEW_COMMENT,
+        "Record one inline review finding on a line the diff adds or changes. Call once per finding \
+         as you go; nothing posts until `finish`. Re-recording the same (file, line) refines it.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "answer": { "type": "string", "description": "The full Markdown answer to the user's question, grounded in what the tools found." },
+                "file": { "type": "string", "description": "Path from repo root." },
+                "line": { "type": "integer", "description": "A line this diff adds or changes." },
+                "title": { "type": "string", "description": "Short (≤ ~8 words)." },
+                "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
+                "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
+                "body": { "type": "string", "description": "Why it matters." },
+                "suggestion": { "type": "string", "description": "Optional exact replacement source for `line` (no diff markers)." },
             },
-            "required": ["answer"],
+            "required": ["file", "line", "title", "priority", "category", "body"],
+        }),
+    ));
+    defs.push(ToolDef::function(
+        ADD_COMMENT,
+        "Post a plain reply on the thread (GitHub-flavored Markdown) — for answering a question or a \
+         general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "string", "description": "Markdown reply body." } },
+            "required": ["body"],
+        }),
+    ));
+    defs.push(ToolDef::function(
+        FINISH,
+        "Finish the run: record your overall verdict/summary and post everything you buffered. Call \
+         exactly once when done — investigate and record findings/replies first.",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string", "description": "1–3 sentence overall verdict: does the change do what it intends, and is it correct and safe?" } },
+            "required": ["summary"],
         }),
     ));
     defs.extend(aux_control_tool_defs());
     defs
 }
 
-/// Runs tool calls against the control-plane retrieval API. Holds only borrowed clients + the task id.
+/// Runs tool calls against the control-plane API. Holds only borrowed clients + the task id.
 pub struct Tools<'a> {
     pub client: &'a ControlPlaneClient,
     pub embedder: &'a EmbeddingsClient,
@@ -253,20 +256,57 @@ impl Tools<'_> {
                 }
                 Err(e) => ToolOutcome::Continue(e),
             },
-            SUBMIT_FINDINGS => match parse::<ReviewResult>(args) {
-                Ok(review) => ToolOutcome::Submit(review),
-                // Don't end the run on a bad payload — tell the model the expected shape so it retries.
+            ADD_REVIEW_COMMENT => match parse::<AddReviewCommentArgs>(args) {
+                Ok(a) => match self
+                    .client
+                    .add_review_comment(
+                        self.task_id,
+                        &a.file,
+                        a.line,
+                        Some(&a.title),
+                        Some(&a.priority),
+                        Some(&a.category),
+                        a.suggestion.as_deref(),
+                        &a.body,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        ToolOutcome::Continue(format!("recorded finding at {}:{}", a.file, a.line))
+                    }
+                    Err(e) => {
+                        ToolOutcome::Continue(format!("error: could not record finding: {e:#}"))
+                    }
+                },
                 Err(e) => ToolOutcome::Continue(format!(
-                    "{e} Expected JSON like {{\"summary\": \"…\", \"findings\": [{{\"file\": \"path\", \
-                     \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"…\", \
-                     \"body\": \"…\", \"suggestion\": \"optional\", \"resources\": [\"optional\"]}}]}}. \
-                     priority is P0|P1|P2; category is security|correctness|quality|style|performance."
+                    "{e} Expected JSON like {{\"file\": \"path\", \"line\": 42, \"title\": \"…\", \
+                     \"priority\": \"P0\", \"category\": \"security\", \"body\": \"…\", \
+                     \"suggestion\": \"optional\"}}. priority is P0|P1|P2; category is \
+                     security|correctness|quality|style|performance."
                 )),
             },
-            SUBMIT_ANSWER => match parse::<AnswerArgs>(args) {
-                Ok(a) => ToolOutcome::Answer(a.answer),
+            ADD_COMMENT => match parse::<TextArgs>(args) {
+                Ok(a) => match self.client.add_review_reply(self.task_id, &a.body).await {
+                    Ok(()) => ToolOutcome::Continue("comment recorded".to_string()),
+                    Err(e) => {
+                        ToolOutcome::Continue(format!("error: could not record comment: {e:#}"))
+                    }
+                },
+                Err(e) => ToolOutcome::Continue(e),
+            },
+            FINISH => match parse::<FinishArgs>(args) {
+                Ok(a) => match self
+                    .client
+                    .set_review_summary(self.task_id, &a.summary)
+                    .await
+                {
+                    Ok(()) => ToolOutcome::Finish,
+                    Err(e) => ToolOutcome::Continue(format!(
+                        "error: could not record the summary: {e:#}. Call `finish` again."
+                    )),
+                },
                 Err(e) => ToolOutcome::Continue(format!(
-                    "{e} Expected JSON like {{\"answer\": \"…your Markdown answer…\"}}."
+                    "{e} Expected JSON like {{\"summary\": \"…your overall verdict…\"}}."
                 )),
             },
             REPORT_PROGRESS => match parse::<NoteArgs>(args) {
@@ -282,7 +322,8 @@ impl Tools<'_> {
             },
             other => ToolOutcome::Continue(format!(
                 "error: unknown tool {other:?}. Available tools: {VECTOR_SEMANTIC_SEARCH}, \
-                 {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {SUBMIT_FINDINGS}, {REPORT_PROGRESS}, {ABORT}."
+                 {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {ADD_REVIEW_COMMENT}, {ADD_COMMENT}, \
+                 {FINISH}, {REPORT_PROGRESS}, {ABORT}."
             )),
         }
     }
@@ -349,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_defs_expose_the_six_tools() {
+    fn tool_defs_expose_the_eight_tools_in_order() {
         let names: Vec<_> = tool_defs()
             .iter()
             .map(|t| t.function.name.clone())
@@ -360,62 +401,13 @@ mod tests {
                 VECTOR_SEMANTIC_SEARCH,
                 GRAPH_FIND_SYMBOL,
                 GRAPH_GET_CALLERS,
-                SUBMIT_FINDINGS,
+                ADD_REVIEW_COMMENT,
+                ADD_COMMENT,
+                FINISH,
                 REPORT_PROGRESS,
                 ABORT,
             ]
         );
-    }
-
-    #[test]
-    fn ask_tool_defs_swap_submit_findings_for_submit_answer() {
-        let names: Vec<_> = ask_tool_defs()
-            .iter()
-            .map(|t| t.function.name.clone())
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                VECTOR_SEMANTIC_SEARCH,
-                GRAPH_FIND_SYMBOL,
-                GRAPH_GET_CALLERS,
-                SUBMIT_ANSWER,
-                REPORT_PROGRESS,
-                ABORT,
-            ],
-            "ask offers submit_answer, not submit_findings"
-        );
-    }
-
-    // ── Positive: a valid submit_answer payload becomes an Answer ───────────────────────────────
-    #[tokio::test]
-    async fn dispatch_submit_answer_valid_yields_answer() {
-        let cp = ControlPlaneClient::new("http://unused", "tok");
-        let emb = EmbeddingsClient::new("http://unused", "key", "model");
-        match tools(&cp, &emb)
-            .dispatch(&call(
-                SUBMIT_ANSWER,
-                r#"{"answer":"Use an `Arc<Mutex<_>>` here."}"#,
-            ))
-            .await
-        {
-            ToolOutcome::Answer(a) => assert_eq!(a, "Use an `Arc<Mutex<_>>` here."),
-            other => panic!("expected Answer, got {other:?}"),
-        }
-    }
-
-    // ── Negative: a malformed submit_answer payload is a recoverable Continue, not Answer ───────
-    #[tokio::test]
-    async fn dispatch_submit_answer_invalid_is_recoverable() {
-        let cp = ControlPlaneClient::new("http://unused", "tok");
-        let emb = EmbeddingsClient::new("http://unused", "key", "model");
-        match tools(&cp, &emb)
-            .dispatch(&call(SUBMIT_ANSWER, r#"{"reply":"wrong field"}"#))
-            .await
-        {
-            ToolOutcome::Continue(s) => assert!(s.to_lowercase().contains("expected"), "hint: {s}"),
-            other => panic!("expected Continue (recoverable), got {other:?}"),
-        }
     }
 
     // ── Positive: a search call embeds the query, hits the control plane, returns the hits ──────
@@ -457,30 +449,52 @@ mod tests {
         }
     }
 
-    // ── Positive: a valid submit_findings payload becomes a ReviewResult ────────────────────────
+    // ── Positive: add_review_comment buffers the finding via the control plane ──────────────────
     #[tokio::test]
-    async fn dispatch_submit_findings_valid_yields_review() {
-        let cp = ControlPlaneClient::new("http://unused", "tok");
+    async fn dispatch_add_review_comment_buffers() {
+        let cp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp_server)
+            .await;
+        let cp = ControlPlaneClient::new(cp_server.uri(), "tok");
         let emb = EmbeddingsClient::new("http://unused", "key", "model");
-        let args = r#"{"summary":"Looks risky.","findings":[
-            {"file":"a.rs","line":7,"priority":"P0","category":"security","title":"No expiry check","body":"accepts expired tokens","suggestion":"if expired { return Err }"}
-        ]}"#;
+        let args = r#"{"file":"a.rs","line":7,"title":"No expiry","priority":"P0","category":"security","body":"accepts expired tokens","suggestion":"if expired { return Err }"}"#;
         match tools(&cp, &emb)
-            .dispatch(&call(SUBMIT_FINDINGS, args))
+            .dispatch(&call(ADD_REVIEW_COMMENT, args))
             .await
         {
-            ToolOutcome::Submit(review) => {
-                assert_eq!(review.summary, "Looks risky.");
-                assert_eq!(review.findings.len(), 1);
-                assert_eq!(review.findings[0].file, "a.rs");
-                assert_eq!(review.findings[0].priority.as_deref(), Some("P0"));
-                assert_eq!(review.findings[0].category.as_deref(), Some("security"));
-                assert_eq!(
-                    review.findings[0].suggestion.as_deref(),
-                    Some("if expired { return Err }")
-                );
+            ToolOutcome::Continue(s) => {
+                assert!(s.contains("recorded finding at a.rs:7"), "got: {s}")
             }
-            other => panic!("expected Submit, got {other:?}"),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    // ── Positive: finish records the summary and ends the run ───────────────────────────────────
+    #[tokio::test]
+    async fn dispatch_finish_sets_summary_and_finishes() {
+        let cp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp_server)
+            .await;
+        let cp = ControlPlaneClient::new(cp_server.uri(), "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        match tools(&cp, &emb)
+            .dispatch(&call(FINISH, r#"{"summary":"All good."}"#))
+            .await
+        {
+            ToolOutcome::Finish => {}
+            other => panic!("expected Finish, got {other:?}"),
         }
     }
 
@@ -498,23 +512,17 @@ mod tests {
         }
     }
 
-    // ── Negative: a malformed submit_findings payload is a recoverable Continue, not Submit ─────
+    // ── Negative: a malformed add_review_comment payload is a recoverable Continue ──────────────
     #[tokio::test]
-    async fn dispatch_submit_findings_invalid_is_recoverable() {
+    async fn dispatch_add_review_comment_invalid_is_recoverable() {
         let cp = ControlPlaneClient::new("http://unused", "tok");
         let emb = EmbeddingsClient::new("http://unused", "key", "model");
-        // missing the required `summary` (findings alone defaults to empty, so this is the real
-        // "invalid payload" case the model must recover from).
+        // missing required fields (priority/category/title/body)
         match tools(&cp, &emb)
-            .dispatch(&call(SUBMIT_FINDINGS, r#"{"findings":[]}"#))
+            .dispatch(&call(ADD_REVIEW_COMMENT, r#"{"file":"a.rs","line":7}"#))
             .await
         {
-            ToolOutcome::Continue(s) => {
-                assert!(
-                    s.to_lowercase().contains("expected"),
-                    "should hint the shape: {s}"
-                );
-            }
+            ToolOutcome::Continue(s) => assert!(s.to_lowercase().contains("expected"), "hint: {s}"),
             other => panic!("expected Continue (recoverable), got {other:?}"),
         }
     }
