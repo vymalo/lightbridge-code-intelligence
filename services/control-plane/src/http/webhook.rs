@@ -76,7 +76,7 @@ pub async fn github_webhook(
     //   pull_request               opened                  → review task (the automatic FIRST review)
     //   pull_request               closed                  → cancel the PR's active tasks
     //   pull_request               synchronize | reopened  → nothing (re-review via @mention)
-    //   issue_comment              created, body @<handle> → review task (a manual re-review)
+    //   issue_comment              created, body @<handle> → task: PR re-review, or an issue answer
     //   installation               created                 → register the installed repos as pending
     //   installation               deleted                 → disable the installation's repos
     //   installation_repositories  added | removed         → register pending / disable those repos
@@ -222,9 +222,11 @@ async fn handle_pull_request(
     }
 }
 
-/// `issue_comment` on a PR whose body starts with `@<handle>` → a manual re-review. The comment
-/// payload has no SHAs, so we fetch the PR's base/head via the API; the next `run_epoch` lets a fresh
-/// task through the idempotency index even when the head SHA is unchanged.
+/// `issue_comment` whose body starts with `@<handle>` → a manual run. Works on a **PR thread** (a
+/// diff-scoped re-review — we fetch the PR's base/head SHAs, which the comment payload omits) and on a
+/// **plain issue** (ADR-0033 slice 3: no diff, so the agent answers and finalize posts a single reply
+/// comment). The next `run_epoch` lets a fresh task through the idempotency index even when nothing
+/// changed.
 async fn handle_issue_comment(
     state: &crate::AppState,
     payload: &serde_json::Value,
@@ -236,14 +238,13 @@ async fn handle_issue_comment(
     if payload["action"].as_str() != Some("created") {
         return;
     }
-    // An issue is a PR only when it carries a `pull_request` object.
-    if payload["issue"]["pull_request"].is_null() {
-        return;
-    }
     let body = payload["comment"]["body"].as_str().unwrap_or_default();
     if !mentions_handle(body, &state.app_handle) {
         return; // not addressed to us
     }
+    // A PR thread carries a `pull_request` object on the issue; a plain issue does not.
+    let is_pr = !payload["issue"]["pull_request"].is_null();
+    let target_type = if is_pr { "pull_request" } else { "issue" };
 
     let repo = &payload["repository"];
     let (
@@ -252,7 +253,7 @@ async fn handle_issue_comment(
         Some(name),
         Some(default_branch),
         Some(installation_id),
-        Some(pr_number),
+        Some(number),
     ) = (
         repo["id"].as_i64(),
         repo["owner"]["login"].as_str(),
@@ -269,27 +270,6 @@ async fn handle_issue_comment(
         return;
     };
 
-    let Some(app) = state.github.as_ref() else {
-        tracing::warn!(
-            delivery_id,
-            "github app not configured; cannot fetch PR for re-review"
-        );
-        return;
-    };
-    let token = match app.installation_token(installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, delivery_id, "mint token for re-review failed");
-            return;
-        }
-    };
-    let (base_sha, head_sha) = match app.pull_request_shas(&token, owner, name, pr_number).await {
-        Ok(shas) => shas,
-        Err(error) => {
-            tracing::error!(%error, delivery_id, pr = pr_number, "fetch PR SHAs failed");
-            return;
-        }
-    };
     let repository_id = match crate::db::upsert_repository(
         pool,
         github_repo_id,
@@ -307,14 +287,43 @@ async fn handle_issue_comment(
         }
     };
     // Approval gate (Epic #75): even an explicit @mention can't run on an unapproved repo.
-    if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
+    if !approved_or_skip(pool, repository_id, delivery_id, number).await {
         return;
     }
+
+    // A PR re-review needs the base/head SHAs to scope the diff (the comment payload omits them); a
+    // plain issue has no diff, so the agent answers against the default branch.
+    let (base_sha, head_sha) = if is_pr {
+        let Some(app) = state.github.as_ref() else {
+            tracing::warn!(
+                delivery_id,
+                "github app not configured; cannot fetch PR SHAs"
+            );
+            return;
+        };
+        let token = match app.installation_token(installation_id).await {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::error!(%error, delivery_id, "mint token for re-review failed");
+                return;
+            }
+        };
+        match app.pull_request_shas(&token, owner, name, number).await {
+            Ok(shas) => shas,
+            Err(error) => {
+                tracing::error!(%error, delivery_id, pr = number, "fetch PR SHAs failed");
+                return;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let run_epoch = crate::db::next_run_epoch(
         pool,
         repository_id,
-        "pull_request",
-        pr_number,
+        target_type,
+        number,
         "review",
         head_sha.as_deref(),
     )
@@ -328,15 +337,20 @@ async fn handle_issue_comment(
         repository_id,
         installation_id,
         github_delivery_id: delivery_id.to_string(),
-        target_type: "pull_request".to_string(),
-        target_id: pr_number,
+        target_type: target_type.to_string(),
+        target_id: number,
         command_text: parse_instruction(body, &state.app_handle)
             .unwrap_or_else(|| "review".to_string()),
         base_sha,
         head_sha,
         run_epoch,
     };
-    tracing::info!(delivery_id, pr = pr_number, "@mention requested");
+    tracing::info!(
+        delivery_id,
+        target = number,
+        kind = target_type,
+        "@mention requested"
+    );
     create_review_task(state, pool, task, owner, name, delivery_id).await;
 }
 
