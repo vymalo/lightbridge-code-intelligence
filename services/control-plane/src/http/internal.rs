@@ -194,6 +194,20 @@ pub async fn ingest_transcript(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
+    // Resolve the task first so an unknown id is a clean 404 rather than a foreign-key 500 on insert
+    // (mirrors `ingest_chunks`/`ingest_graph`).
+    match sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for transcript failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    }
     match crate::db::replace_transcript(pool, id, &submission.entries).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => {
