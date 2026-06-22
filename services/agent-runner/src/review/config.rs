@@ -99,6 +99,7 @@ mod tests {
 
     fn review() -> ReviewConfig {
         ReviewConfig {
+            agent: crate::bootstrap::config::ReviewAgent::OpenCode,
             base_url: "https://gw.example/v1".to_string(),
             api_key: "secret".to_string(),
             model: "qwen-coder".to_string(),

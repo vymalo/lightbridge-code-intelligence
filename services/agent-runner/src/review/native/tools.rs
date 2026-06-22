@@ -20,9 +20,11 @@ use crate::bootstrap::client::ControlPlaneClient;
 use crate::indexer::embeddings::EmbeddingsClient;
 use crate::review::ReviewResult;
 
-pub const VECTOR_SEMANTIC_SEARCH: &str = "vector_semantic_search";
-pub const GRAPH_FIND_SYMBOL: &str = "graph_find_symbol";
-pub const GRAPH_GET_CALLERS: &str = "graph_get_callers";
+// The retrieval tools keep the `lightbridge_`-prefixed names the MCP servers used, so the shared
+// reviewer guidance (which references them by name) stays accurate for the native agent too.
+pub const VECTOR_SEMANTIC_SEARCH: &str = "lightbridge_vector_semantic_search";
+pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
+pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
 pub const SUBMIT_FINDINGS: &str = "submit_findings";
 pub const REPORT_PROGRESS: &str = "report_progress";
 pub const ABORT: &str = "abort";
