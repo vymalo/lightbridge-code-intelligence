@@ -538,10 +538,12 @@ pub async fn post_review(
         commentable.contains_key(trimmed) || commentable.contains_key(&f.file)
     };
     let label_has_findings = submission.findings.iter().any(in_scope);
+    // A P0 (the highest priority; ADR-0032) is the "must fix" / blocker level — the back-compat shim
+    // maps a legacy `error` severity to P0, so old rows still trigger the error label.
     let label_has_error = submission
         .findings
         .iter()
-        .any(|f| f.severity.eq_ignore_ascii_case("error") && in_scope(f));
+        .any(|f| f.priority() == "P0" && in_scope(f));
 
     // Capture the agent's raw findings before `validate` consumes them — persisted with the posted
     // review for the admin console + audit (Epic #75, Milestone C).

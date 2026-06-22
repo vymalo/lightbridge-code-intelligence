@@ -32,7 +32,12 @@ export interface Task {
 export interface ReviewFinding {
   file: string;
   line: number;
-  severity: string;
+  /** Triage priority `P0`|`P1`|`P2` (ADR-0032). Optional for rows that predate the priority model. */
+  priority?: string;
+  /** Dimension: `security`|`correctness`|`quality`|`style`|`performance` (ADR-0032). */
+  category?: string;
+  /** Legacy `error`|`warning`|`info` level (pre-ADR-0032). Read-only fallback for old rows. */
+  severity?: string;
   title: string;
   body: string;
   suggestion?: string | null;
