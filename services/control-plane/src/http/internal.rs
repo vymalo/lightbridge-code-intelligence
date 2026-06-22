@@ -553,7 +553,7 @@ pub async fn post_review(
     let body = crate::review::render_body(
         &submission.summary,
         &validated.deferred,
-        validated.out_of_scope,
+        &validated.out_of_scope,
     );
     let comments: Vec<crate::integrations::github::ReviewComment> = validated
         .inline
@@ -569,7 +569,7 @@ pub async fn post_review(
     let (inline_n, deferred_n, out_of_scope_n) = (
         comments.len(),
         validated.deferred.len(),
-        validated.out_of_scope,
+        validated.out_of_scope.len(),
     );
     let target = ReviewTarget {
         token: &token,
