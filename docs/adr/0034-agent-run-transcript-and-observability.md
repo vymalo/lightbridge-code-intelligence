@@ -43,7 +43,10 @@ records each step and posts it to the control plane:
 - **Token usage** on the run record: `input_tokens`, `output_tokens` (and cost if the provider returns
   it).
 
-A new endpoint `GET /tasks/{id}/transcript` serves the turn-by-turn breakdown; the dashboard run page
+A new endpoint `GET /tasks/{id}/transcript` serves the turn-by-turn breakdown, **enforcing the same
+repository-level access control as the rest of the dashboard** — the caller must have read access to the
+task's repository before any transcript is served, since it contains repo code, file paths, and tool
+results. The dashboard run page
 ([ADR-0016](0016-dashboard-information-architecture.md)) gains an **expandable "Agent reasoning"
 timeline** (turns + tool calls with latency) and a token/cost summary. Wrap loop steps in `#[instrument]`
 spans so live operations are traceable even before a row is written.

@@ -31,9 +31,11 @@ Two parts; the first is a prerequisite and lands first regardless of the rest:
    `reviews`/findings rows or add a `review_comments` table). Cheap, independently useful, and unblocks
    everything below — **do this now even before the feature ships.**
 2. **Capture inbound reactions.** Subscribe the webhook to reaction events
-   (`pull_request_review_comment` / `issue_comment` reactions). On a reaction to a comment id we own,
-   record a row in **`review_feedback`** `(finding ref, github_comment_id, reactor, reaction, created_at)`.
-   Aggregate per finding and per run; **expose in the dashboard run page** ([ADR-0016](0016-dashboard-information-architecture.md))
+   (`pull_request_review_comment` / `issue_comment` reactions). GitHub sends both `created` and
+   `deleted` actions (a user can un-react), so handle both: on **created** for a comment id we own,
+   upsert a row in **`review_feedback`** `(finding ref, github_comment_id, reactor, reaction,
+   created_at)`; on **deleted**, remove (or tombstone) the matching row so aggregated counts stay in
+   sync with GitHub. Aggregate per finding and per run; **expose in the dashboard run page** ([ADR-0016](0016-dashboard-information-architecture.md))
    as 👍/👎 counts on each finding and a run-level summary. The dataset (finding text + transcript
    [ADR-0034](0034-agent-run-transcript-and-observability.md) + verdict) becomes the seed for offline
    evaluation/tuning.

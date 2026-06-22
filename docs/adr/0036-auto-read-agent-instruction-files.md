@@ -50,8 +50,10 @@ precedence**. On conflict the agent is told to favour the higher-ranked source. 
 mission, the output contract ([ADR-0026](0026-native-review-agent.md)/[ADR-0032](0032-review-finding-priority-and-category.md)),
 the tool set, and the diff validation/write-back ([ADR-0022](0022-review-writeback-control-plane.md))
 remain authoritative and cannot be overridden** by any ingested file. Total ingested size is **capped
-and truncated**. The behaviour is **on by default**; the explicit config can disable it, reorder the
-ranking, or add/remove paths.
+and truncated** — default **~32 KiB total** across all files (per-file truncation, highest-ranked
+first), **configurable** via the explicit config — so an oversized or hostile file can't exhaust the
+context window or inflate cost. The behaviour is **on by default**; the explicit config can disable it,
+reorder the ranking, or add/remove paths.
 
 > Refinement (not v1): `AGENTS.md` supports **per-directory nesting** (closest file wins). A later
 > increment can also read the `AGENTS.md` nearest each changed directory, not just the repo root.

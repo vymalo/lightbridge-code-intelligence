@@ -36,7 +36,11 @@ Introduce an explicit **run kind** resolved from the inbound comment, and stop d
 
 1. **Parse the comment.** Strip the `@handle`, then resolve the remainder:
    - A leading **known skill/command name** ([ADR-0031](0031-review-skills-commands.md)) → that skill.
-   - Otherwise **free text** → carried verbatim as the instruction.
+   - Otherwise **free text** → **classify intent**: text that explicitly asks for a review (matches
+     `review` / `re-review` / `check` / `audit` …) → **`review`** with the text as extra instruction;
+     anything else (a question — "propose…", "explain…", "why…") → **`ask`**. The text is carried
+     verbatim either way; the classifier is a cheap keyword/heuristic pass and the model is the
+     tie-breaker when ambiguous.
    - Empty → default `review`.
 2. **Run kinds:**
    - **`review`** (default / PR opened): diff-scoped, inline findings, validated + written back per
