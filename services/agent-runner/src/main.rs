@@ -242,13 +242,17 @@ async fn run(
                     {
                         // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed
                         // run is NOT finalized, so a mid-run death posts nothing (crash-safe).
-                        Ok(()) => match client.finalize_review(config.task_id).await {
-                            Ok(()) => "review posted".to_string(),
-                            Err(error) => {
-                                tracing::warn!(%error, "finalizing review failed (non-fatal)");
-                                "review (finalize failed)".to_string()
-                            }
-                        },
+                        // Finalize failure is fatal (unlike the rest of review, which is best-effort):
+                        // the review is ready and the failure is almost always transient (GitHub /
+                        // network), so we want the task marked failed and retried rather than silently
+                        // succeeded with nothing posted. A retry re-runs the agent from a cleared
+                        // buffer; the single-artifact case re-posts cleanly (the failed attempt posted
+                        // nothing), the rare mixed reply+review case may duplicate the part that did
+                        // post — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
+                        Ok(()) => {
+                            client.finalize_review(config.task_id).await?;
+                            "review posted".to_string()
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "review run failed (non-fatal; nothing posted)");
                             "review failed".to_string()

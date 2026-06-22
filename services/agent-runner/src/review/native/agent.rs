@@ -14,7 +14,7 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams};
-use super::tools::{tool_defs, ToolOutcome, Tools};
+use super::tools::{tool_defs, ToolOutcome, Tools, ADD_REVIEW_COMMENT};
 use crate::bootstrap::client::ControlPlaneClient;
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
@@ -59,7 +59,13 @@ pub async fn run_native_agent(
         embedder,
         task_id,
     };
-    let defs = tool_defs();
+    // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
+    // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
+    // replies via `add_comment` instead of hallucinating inline comments that go nowhere.
+    let mut defs = tool_defs();
+    if diff.is_none() {
+        defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
+    }
     let params = ChatParams {
         temperature: review.temperature,
         top_p: review.top_p,
@@ -308,10 +314,15 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new(cp.uri(), "tok");
         let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        // A diff is present, so `add_review_comment` is offered.
+        let diff = PrDiff {
+            diff: "@@ -1,3 +1,4 @@\n fn validate() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
         run_native_agent(
             &review,
             "@lightbridge review",
-            None,
+            Some(&diff),
             &[],
             &cpc,
             &embc,
@@ -319,6 +330,23 @@ mod tests {
         )
         .await
         .expect("agent finishes cleanly");
+    }
+
+    // No diff → `add_review_comment` is not offered (an inline finding can't anchor); the rest of the
+    // tool surface remains.
+    #[test]
+    fn no_diff_omits_add_review_comment_from_offered_tools() {
+        let offered: Vec<String> = {
+            let mut defs = tool_defs();
+            defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
+            defs.iter().map(|t| t.function.name.clone()).collect()
+        };
+        assert!(!offered.iter().any(|n| n == ADD_REVIEW_COMMENT));
+        assert!(
+            offered.iter().any(|n| n == "add_comment"),
+            "add_comment still offered"
+        );
+        assert!(offered.iter().any(|n| n == "finish"));
     }
 
     // ── Negative e2e: abort surfaces as an error (caller does not finalize) ─────────────────────
