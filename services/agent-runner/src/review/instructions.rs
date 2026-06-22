@@ -11,6 +11,8 @@
 
 use std::path::Path;
 
+use tokio::io::AsyncReadExt;
+
 /// Total ingest budget across all instruction files (highest-precedence first; per-file truncated to
 /// fit). ADR-0036 default ~32 KiB. Not yet operator-configurable (that layers under ADR-0030).
 const TOTAL_CAP: usize = 32 * 1024;
@@ -46,8 +48,12 @@ pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
     if let Ok(mut entries) = tokio::fs::read_dir(&rules_dir).await {
         let mut rule_files = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().is_file() {
-                rule_files.push(entry.path());
+            // `file_type().await` is the async metadata query; `path().is_file()` would block the
+            // executor thread.
+            if let Ok(ft) = entry.file_type().await {
+                if ft.is_file() {
+                    rule_files.push(entry.path());
+                }
             }
         }
         rule_files.sort();
@@ -64,19 +70,41 @@ pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
     let mut used = 0usize;
     let mut rank = 0usize;
     for (label, path) in paths {
-        let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+        let remaining = TOTAL_CAP.saturating_sub(used);
+        if remaining == 0 {
+            blocks.push("_(further instruction files omitted — size cap reached)_".to_string());
+            break;
+        }
+        // Read at most `remaining + 1` bytes — never the whole file — so a huge or hostile instruction
+        // file (a build artifact, or a deliberate OOM bomb) can't exhaust the runner's memory. The +1
+        // lets us tell that the file was longer than the budget (→ "(truncated)").
+        let Ok(file) = tokio::fs::File::open(&path).await else {
             continue; // absent or unreadable — skip
+        };
+        let mut buf = Vec::new();
+        if file
+            .take((remaining + 1) as u64)
+            .read_to_end(&mut buf)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        // Capping by bytes may split a multi-byte char at the end; keep the valid UTF-8 prefix.
+        let raw = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).unwrap_or_default()
+            }
         };
         let content = raw.trim();
         if content.is_empty() {
             continue;
         }
         rank += 1;
-        let remaining = TOTAL_CAP.saturating_sub(used);
-        if remaining == 0 {
-            blocks.push("_(further instruction files omitted — size cap reached)_".to_string());
-            break;
-        }
         let (text, truncated) = truncate_on_boundary(content, remaining);
         used += text.len();
         blocks.push(format!(
