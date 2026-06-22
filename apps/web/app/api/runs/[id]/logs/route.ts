@@ -1,8 +1,8 @@
 import { PassThrough, Readable } from "node:stream";
 import { CoreV1Api, KubeConfig, Log } from "@kubernetes/client-node";
-import { hasPermission } from "@/lib/admin";
-import { getTask } from "@/lib/api";
-import { currentClaims } from "@/lib/session";
+import { currentClaims } from "@/lib/auth/session";
+import { hasPermission } from "@/lib/server/admin";
+import { getTask } from "@/lib/server/api";
 
 /**
  * Streams a run's agent-Job logs to the console (Epic #75, Milestone C).

@@ -1,7 +1,7 @@
 import { SESSION_COOKIE, type SessionClaims } from "@lightbridge/auth";
 import { cookies } from "next/headers";
-import type { ApiResult } from "@/lib/api";
-import type { Repository } from "@/lib/repos";
+import type { Repository } from "@/lib/domain/repos";
+import type { ApiResult } from "@/lib/server/api";
 
 /**
  * Server-only client for the control plane's **admin** API (the approval gate, Epic #75). Like

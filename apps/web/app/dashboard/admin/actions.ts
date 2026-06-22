@@ -1,8 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { hasPermission, setRepoStatus } from "@/lib/admin";
-import { currentClaims } from "@/lib/session";
+import { currentClaims } from "@/lib/auth/session";
+import { hasPermission, setRepoStatus } from "@/lib/server/admin";
 
 /**
  * Shared body for the approve/deny actions. Server Actions are public POST endpoints, so this

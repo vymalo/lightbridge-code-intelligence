@@ -1,7 +1,7 @@
 import { cookieOptions, PKCE_COOKIE, SESSION_COOKIE, STATE_COOKIE } from "@lightbridge/auth";
 import { type NextRequest, NextResponse } from "next/server";
 import * as client from "openid-client";
-import { getOidc } from "@/lib/oidc";
+import { getOidc } from "@/lib/auth/oidc";
 
 export const runtime = "nodejs";
 

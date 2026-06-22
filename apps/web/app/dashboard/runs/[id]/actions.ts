@@ -1,9 +1,9 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { hasPermission } from "@/lib/admin";
-import { cancelTask } from "@/lib/api";
-import { currentClaims } from "@/lib/session";
+import { currentClaims } from "@/lib/auth/session";
+import { hasPermission } from "@/lib/server/admin";
+import { cancelTask } from "@/lib/server/api";
 
 // Task ids are UUIDs; reject anything else before calling the control plane.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

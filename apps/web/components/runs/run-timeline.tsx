@@ -1,5 +1,5 @@
-import { RunRow } from "@/components/run-row";
-import { dayBucketKey, dayBucketLabel, type Task } from "@/lib/tasks";
+import { RunRow } from "@/components/runs/run-row";
+import { dayBucketKey, dayBucketLabel, type Task } from "@/lib/domain/tasks";
 
 /** Runs grouped by calendar day on a thin rail (ADR-0024, Doppler activity-log pattern). Tasks arrive
  * already filtered and most-recent-first; we keep that order and split on the day boundary. */

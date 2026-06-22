@@ -1,6 +1,6 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import type { ButtonHTMLAttributes } from "react";
-import { cn } from "@/lib/cn";
+import { cn } from "@/lib/utils/cn";
 
 /** daisyUI `btn` variants (ADR-0027). `primary` = the dracula accent; `neutral` = a plain surface
  * button; `ghost` = borderless, for low-emphasis inline actions; `outline` = hairline. */

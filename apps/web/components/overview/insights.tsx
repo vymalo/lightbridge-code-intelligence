@@ -7,8 +7,8 @@ import {
   formatSeconds,
   runsPerDay,
   type Slice,
-} from "@/lib/insights";
-import type { Task } from "@/lib/tasks";
+} from "@/lib/domain/insights";
+import type { Task } from "@/lib/domain/tasks";
 
 /** Operator-glance insights over the fetched run list (ADR-0024, Dub pattern): KPI cards that drill
  * into the filtered runs list, a hand-rolled runs-over-time series (single accent, no chart lib), and

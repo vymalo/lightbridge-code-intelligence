@@ -1,7 +1,7 @@
 import { cookieOptions, PKCE_COOKIE, STATE_COOKIE } from "@lightbridge/auth";
 import { NextResponse } from "next/server";
 import * as client from "openid-client";
-import { getOidc } from "@/lib/oidc";
+import { getOidc } from "@/lib/auth/oidc";
 
 // openid-client is not Edge-safe.
 export const runtime = "nodejs";

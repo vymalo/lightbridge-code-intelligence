@@ -1,7 +1,14 @@
 import { GitBranch, GitCommitHorizontal } from "lucide-react";
 import Link from "next/link";
 import { StatusPill } from "@/components/ui/status-pill";
-import { duration, relativeTime, repoLabel, shortSha, type Task, triggerLabel } from "@/lib/tasks";
+import {
+  duration,
+  relativeTime,
+  repoLabel,
+  shortSha,
+  type Task,
+  triggerLabel,
+} from "@/lib/domain/tasks";
 
 /** One row in the run list — status · trigger · repo · branch · sha · relative time · duration. */
 export function RunRow({ task, now }: { task: Task; now: number }) {

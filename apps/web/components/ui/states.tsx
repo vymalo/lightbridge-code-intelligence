@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { ApiResult } from "@/lib/api";
+import type { ApiResult } from "@/lib/server/api";
 
 /**
  * Honest states (ADR-0016). The first-run *empty* is the one place a centered placard is right

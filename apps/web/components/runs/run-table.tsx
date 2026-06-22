@@ -5,8 +5,6 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { Pagination } from "@/components/ui/pagination";
 import { StatusPill } from "@/components/ui/status-pill";
-import { cn } from "@/lib/cn";
-import { usePagination } from "@/lib/hooks/use-pagination";
 import {
   duration,
   durationSeconds,
@@ -16,7 +14,9 @@ import {
   statusVisual,
   type Task,
   triggerLabel,
-} from "@/lib/tasks";
+} from "@/lib/domain/tasks";
+import { usePagination } from "@/lib/hooks/use-pagination";
+import { cn } from "@/lib/utils/cn";
 
 type SortKey = "created" | "duration" | "status" | "repo" | "trigger";
 type SortDir = "asc" | "desc";

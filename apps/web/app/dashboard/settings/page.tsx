@@ -2,9 +2,9 @@ import { ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { buttonClass } from "@/components/ui/button";
 import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
-import { permissions } from "@/lib/admin";
-import { githubAppInstallUrl } from "@/lib/config";
-import { currentClaims, displayName } from "@/lib/session";
+import { currentClaims, displayName } from "@/lib/auth/session";
+import { permissions } from "@/lib/server/admin";
+import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
 

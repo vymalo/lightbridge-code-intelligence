@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { cn } from "@/lib/cn";
+import { cn } from "@/lib/utils/cn";
 
 /** A grouped settings section (ADR-0024, Cursor pattern): an uppercase section label above a card of
  * label/description/control rows separated by hairline dividers. */

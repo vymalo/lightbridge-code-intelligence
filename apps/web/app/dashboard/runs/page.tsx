@@ -1,7 +1,7 @@
-import { RunList } from "@/components/run-list";
-import { ApiErrorLine, EmptyState } from "@/components/states";
+import { RunList } from "@/components/runs/run-list";
 import { Card } from "@/components/ui/card";
-import { listTasks } from "@/lib/api";
+import { ApiErrorLine, EmptyState } from "@/components/ui/states";
+import { listTasks } from "@/lib/server/api";
 
 export const dynamic = "force-dynamic";
 

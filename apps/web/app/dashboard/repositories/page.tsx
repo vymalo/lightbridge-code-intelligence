@@ -1,9 +1,9 @@
-import { RepoList } from "@/components/repo-list";
-import { ApiErrorLine, EmptyState } from "@/components/states";
+import { RepoList } from "@/components/repos/repo-list";
 import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { listRepositories } from "@/lib/api";
-import { githubAppInstallUrl } from "@/lib/config";
+import { ApiErrorLine, EmptyState } from "@/components/ui/states";
+import { listRepositories } from "@/lib/server/api";
+import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
 

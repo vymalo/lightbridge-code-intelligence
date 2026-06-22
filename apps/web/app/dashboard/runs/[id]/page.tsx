@@ -1,16 +1,14 @@
 import { ArrowLeft, Ban, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { CommandSnippet } from "@/components/command-snippet";
-import { ReviewOutput } from "@/components/review-output";
-import { RunLogs } from "@/components/run-logs";
-import { ApiErrorLine, StatusLine } from "@/components/states";
+import { ReviewOutput } from "@/components/runs/review-output";
+import { RunLogs } from "@/components/runs/run-logs";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { CommandSnippet } from "@/components/ui/command-snippet";
+import { ApiErrorLine, StatusLine } from "@/components/ui/states";
 import { StatusPill } from "@/components/ui/status-pill";
-import { hasPermission } from "@/lib/admin";
-import { getReview, getTask } from "@/lib/api";
-import { currentClaims } from "@/lib/session";
+import { currentClaims } from "@/lib/auth/session";
 import {
   absoluteTime,
   duration,
@@ -20,7 +18,9 @@ import {
   statusVisual,
   targetUrl,
   triggerLabel,
-} from "@/lib/tasks";
+} from "@/lib/domain/tasks";
+import { hasPermission } from "@/lib/server/admin";
+import { getReview, getTask } from "@/lib/server/api";
 import { cancelRunAction } from "./actions";
 
 export const dynamic = "force-dynamic";
