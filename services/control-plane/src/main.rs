@@ -253,8 +253,6 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
         )
-        // The structured review → validated GitHub PR review (slice 6; OpenCode fallback path).
-        .route("/internal/tasks/{id}/review", post(internal::post_review))
         // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
         // flushes them as one grouped review on finalize.
         .route(

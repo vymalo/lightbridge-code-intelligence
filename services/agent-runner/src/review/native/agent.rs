@@ -172,7 +172,6 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::config::ReviewAgent;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -224,7 +223,6 @@ mod tests {
 
     fn review_config(chat_base_with_v1: String) -> ReviewConfig {
         ReviewConfig {
-            agent: ReviewAgent::Native,
             base_url: chat_base_with_v1,
             api_key: "k".to_string(),
             model: "m".to_string(),

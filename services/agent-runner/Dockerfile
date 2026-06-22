@@ -14,16 +14,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY services services
 COPY xtask xtask
-# Builds all three bins: the runner + the two stdio MCP servers (slice 4b). Copy them out before
-# the cached target dir vanishes.
+# Copy the runner out before the cached target dir vanishes.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p agent-runner \
-    && cp target/release/agent-runner \
-          target/release/lightbridge-vector-mcp \
-          target/release/lightbridge-graph-mcp \
-          /usr/local/bin/
+    && cp target/release/agent-runner /usr/local/bin/
 
 # ── Stage 2: install Graphify into a self-contained venv ────────────────────────────────────────
 # Built with compilers present (some tree-sitter grammars may ship sdists) but the toolchain is
@@ -41,23 +37,15 @@ RUN pip install --no-cache-dir "graphifyy==0.8.44" \
 # ── Stage 3: runtime ────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim-bookworm AS runtime
 # git: clone the target repo (src/clone.rs). ca-certificates: TLS to control plane + GitHub.
-# OpenCode (slice 5, ADR-0021): the review agent the runner spawns — a standalone binary from the
-# official installer (curl/bash/unzip are build-only). Pinned for reproducibility.
-ARG OPENCODE_VERSION=1.17.3
+# The native review agent (ADR-0026/0037) runs in-process in the Rust runner — no subprocess to install.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates git curl bash unzip \
-  && HOME=/opt/opencode bash -c "curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION}" \
-  && ln -s /opt/opencode/.opencode/bin/opencode /usr/local/bin/opencode \
-  && opencode --version \
-  && apt-get purge -y --auto-remove curl unzip \
+  && apt-get install -y --no-install-recommends ca-certificates git \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 1000 --create-home --user-group app \
   && mkdir -p /workspace && chown 1000:1000 /workspace
-# Graphify (venv) + the Rust runner + the stdio MCP servers (OpenCode spawns the latter, slice 4b).
+# Graphify (venv) + the Rust runner.
 COPY --from=pybuild /opt/venv /opt/venv
 COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
-COPY --from=builder /usr/local/bin/lightbridge-vector-mcp /usr/local/bin/lightbridge-vector-mcp
-COPY --from=builder /usr/local/bin/lightbridge-graph-mcp /usr/local/bin/lightbridge-graph-mcp
 USER 1000
 ENV PATH="/opt/venv/bin:$PATH" \
     WORKDIR=/workspace \

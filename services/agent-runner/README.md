@@ -20,8 +20,8 @@ does the heavy repository work, and reports results back — holding no standing
    finding), `add_comment` (a plain reply), `finish` (the verdict). The control plane buffers these and
    posts nothing until finalize, so a mid-run failure posts nothing. The agent's system prompt is
    **required operational config** (the ai-helm `config.reviewSystemPrompt`, mounted) — there is no
-   built-in default; review fails closed without one. `REVIEW_AGENT=opencode` falls back to the legacy
-   OpenCode subprocess (terminal JSON payload; retires with OpenCode/Bun, #140).
+   built-in default; review fails closed without one. This in-process loop is the only review path
+   (the OpenCode subprocess + its stdio MCP servers were removed in #140).
 6. **Report** terminal status; on a clean finish the control plane flushes the buffer as one grouped
    review — validating findings against the PR diff
    ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md)) and consolidating replies into a
@@ -39,9 +39,10 @@ See [docs/jobs-and-lifecycle.md](../../docs/jobs-and-lifecycle.md).
 
 ## Security posture
 
-No GitHub App key, no datastore credentials: retrieval tools are thin clients of the control-plane API
-([ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md)). It holds only the short-lived install
-token, the shared `AGENT_RUNNER_TOKEN`, the embeddings key, and a mounted internal-CA cert.
+No GitHub App key, no datastore credentials: the agent's retrieval tools go through the control-plane
+API (the trust property from [ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md), now
+in-process rather than via stdio MCP servers). It holds only the short-lived install token, the shared
+`AGENT_RUNNER_TOKEN`, the embeddings key, and a mounted internal-CA cert.
 
 ## Cancellation
 

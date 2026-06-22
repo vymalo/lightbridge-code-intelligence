@@ -127,14 +127,6 @@ fn badge_label(label: &str) -> String {
     }
 }
 
-/// Body for `POST /internal/tasks/{id}/review`.
-#[derive(Debug, Deserialize)]
-pub struct ReviewSubmission {
-    pub summary: String,
-    #[serde(default)]
-    pub findings: Vec<Finding>,
-}
-
 /// An inline PR review comment, shaped for the GitHub API.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineComment {

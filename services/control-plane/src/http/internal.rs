@@ -476,160 +476,11 @@ pub async fn graph_query(
     }
 }
 
-/// `POST /internal/tasks/{id}/review` — validate the runner's structured review and post it to the
-/// PR (epic #5, slice 6). The control plane owns GitHub write access (ADR-0002): it resolves the PR
-/// from the task, mints the installation token, fetches the diff to validate which finding lines are
-/// commentable, and posts a single PR review (inline comments + a body for the rest).
-pub async fn post_review(
-    _auth: RunnerAuth,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(submission): Json<crate::review::ReviewSubmission>,
-) -> Response {
-    let Some(pool) = state.db.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
-    };
-    let Some(app) = state.github.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
-
-    let context = match crate::db::get_task_context(pool, id).await {
-        Ok(Some(context)) => context,
-        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "load task for review failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
-        }
-    };
-
-    // Reviews only apply to pull requests; anything else is a no-op (not an error).
-    if context.target_type != "pull_request" {
-        return (StatusCode::NO_CONTENT, "not a pull request").into_response();
-    }
-    let pr = context.target_id;
-
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
-        }
-    };
-
-    // Validate finding lines against the PR diff: only diff lines are commentable inline.
-    let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> = match app
-        .list_pr_files(&token, &context.owner, &context.name, pr)
-        .await
-    {
-        Ok(files) => files
-            .into_iter()
-            .filter_map(|f| {
-                f.patch
-                    .map(|p| (f.filename, crate::review::commentable_lines(&p)))
-            })
-            .collect(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "fetching PR files failed");
-            return (StatusCode::BAD_GATEWAY, "could not fetch PR files").into_response();
-        }
-    };
-
-    // Outcome-label flags from the **in-scope** findings (those on changed files), computed before
-    // `validate` consumes the submission. A leading `./` or `/` is stripped to match the diff paths.
-    let in_scope = |f: &crate::review::Finding| {
-        let normalized = f.file.replace('\\', "/");
-        let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
-        commentable.contains_key(trimmed) || commentable.contains_key(&f.file)
-    };
-    let label_has_findings = submission.findings.iter().any(in_scope);
-    // A P0 (the highest priority; ADR-0032) is the "must fix" / blocker level — the back-compat shim
-    // maps a legacy `error` severity to P0, so old rows still trigger the error label.
-    let label_has_error = submission
-        .findings
-        .iter()
-        .any(|f| f.priority() == "P0" && in_scope(f));
-
-    // Capture the agent's raw findings before `validate` consumes them — persisted with the posted
-    // review for the admin console + audit (Epic #75, Milestone C).
-    let findings_json = serde_json::to_value(&submission.findings).unwrap_or_default();
-
-    let validated = crate::review::validate(submission.findings, &commentable);
-    let body = crate::review::render_body(
-        &submission.summary,
-        &validated.deferred,
-        &validated.out_of_scope,
-    );
-    let comments: Vec<crate::integrations::github::ReviewComment> = validated
-        .inline
-        .iter()
-        .map(|c| crate::integrations::github::ReviewComment {
-            path: c.path.clone(),
-            line: c.line,
-            side: "RIGHT",
-            body: c.body.clone(),
-        })
-        .collect();
-
-    let (inline_n, deferred_n, out_of_scope_n) = (
-        comments.len(),
-        validated.deferred.len(),
-        validated.out_of_scope.len(),
-    );
-    let target = ReviewTarget {
-        token: &token,
-        owner: &context.owner,
-        repo: &context.name,
-        pr,
-    };
-    match app
-        .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
-        .await
-    {
-        Ok(review_url) => {
-            tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review posted");
-            // Persist a copy for the admin console + audit (best-effort — the review is already on
-            // GitHub, so a DB hiccup here must not fail the response). `review_url` is the permalink.
-            if let Err(error) = crate::db::upsert_review(
-                pool,
-                id,
-                &submission.summary,
-                &body,
-                inline_n as i32,
-                deferred_n as i32,
-                out_of_scope_n as i32,
-                &findings_json,
-                review_url.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!(%error, task_id = %id, "persisting review copy failed (non-fatal)");
-            }
-            // Review delivered: 🎉 + outcome labels (best-effort).
-            react(app, &state.review, &target, "hooray").await;
-            add_review_labels(
-                app,
-                &state.review,
-                &target,
-                label_has_findings,
-                label_has_error,
-            )
-            .await;
-            Json(serde_json::json!({ "inline": inline_n, "deferred": deferred_n, "out_of_scope": out_of_scope_n })).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "posting PR review failed");
-            // Review couldn't be posted: 😕 (best-effort).
-            react(app, &state.review, &target, "confused").await;
-            (StatusCode::BAD_GATEWAY, "could not post review").into_response()
-        }
-    }
-}
-
 // ── ADR-0037 mediated write actions ─────────────────────────────────────────────────────────────
 // The native agent calls these *during* its run; the control plane accumulates them and posts nothing
 // until `finalize_review` flushes the buffer as one grouped review (+ a single consolidated reply).
 // Per-call diff validation is done runner-side (it holds the diff); the flush re-validates here
-// authoritatively via `crate::review::validate`. The legacy `post_review` path stays for OpenCode.
+// authoritatively via `crate::review::validate`.
 
 /// Default summary for a run that produced no findings (and the empty-run backstop), so an
 /// `@mention`-triggered review is never a silent hang (ADR-0037).
@@ -1036,7 +887,7 @@ pub async fn set_status(
                 }
             }
             // A terminal failure gets 😕 on the PR (best-effort). Success is acknowledged by the
-            // review post (🎉) in `post_review`, so we don't double-react here.
+            // review post (🎉) in `finalize_review`, so we don't double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {
                 let state = state.clone();
                 let pool = pool.clone();

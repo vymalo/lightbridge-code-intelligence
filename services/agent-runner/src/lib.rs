@@ -11,10 +11,8 @@
 //! - [`indexer`] — tree-sitter chunking + structural-graph extraction, with
 //!   [`embeddings`](indexer::embeddings) (OpenAI-compatible vectors → control plane) feeding the
 //!   semantic index.
-//! - [`review`] — drive the review agent and parse its findings.
-//!
-//! The two `bin/` targets (`vector-mcp`, `graph-mcp`) are stdio MCP servers that wrap the
-//! control-plane retrieval API for the review agent; they reuse [`bootstrap::client`].
+//! - [`review`] — the native review agent loop (ADR-0026/0037): it investigates with retrieval tools
+//!   and acts via mediated write tools the control plane flushes as one grouped review.
 
 pub mod bootstrap;
 pub mod clone;
