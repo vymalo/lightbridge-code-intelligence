@@ -8,12 +8,22 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// One review finding tied to a source location.
+/// One review finding tied to a source location. Mirrors `control-plane::review::Finding`; the runner
+/// only round-trips it (the control plane resolves + renders), so the level fields are pass-through.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ReviewFinding {
     pub file: String,
     pub line: u32,
-    pub severity: String,
+    /// Triage priority `P0`|`P1`|`P2` (ADR-0032). The native `submit_findings` schema asks for this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Finding dimension — `security`|`correctness`|`quality`|`style`|`performance` (ADR-0032).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Legacy `error`|`warning`|`info` level — accepted if a model still emits it (back-compat); the
+    /// control plane shims it to a priority. New contracts ask for `priority`+`category` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
     pub title: String,
     pub body: String,
     /// Optional concrete fix: the exact replacement source for `line` (no diff markers). When present
@@ -75,7 +85,7 @@ Let me investigate. I'll search for the auth code.\n\
 ```json\n{\"summary\": \"draft, ignore\", \"findings\": []}\n```\n\
 After more investigation, here is my final review:\n\
 ```json\n\
-{\n  \"summary\": \"Session validation is missing an expiry check.\",\n  \"findings\": [\n    {\"file\": \"src/auth/session.rs\", \"line\": 44, \"severity\": \"error\", \"title\": \"No expiry check\", \"body\": \"validate_session accepts expired tokens.\"}\n  ]\n}\n\
+{\n  \"summary\": \"Session validation is missing an expiry check.\",\n  \"findings\": [\n    {\"file\": \"src/auth/session.rs\", \"line\": 44, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"No expiry check\", \"body\": \"validate_session accepts expired tokens.\"}\n  ]\n}\n\
 ```\n";
         let result = parse_review(output).expect("parse");
         // The LAST block wins (the final answer, not the draft).
@@ -86,14 +96,15 @@ After more investigation, here is my final review:\n\
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].file, "src/auth/session.rs");
         assert_eq!(result.findings[0].line, 44);
-        assert_eq!(result.findings[0].severity, "error");
+        assert_eq!(result.findings[0].priority.as_deref(), Some("P0"));
+        assert_eq!(result.findings[0].category.as_deref(), Some("security"));
     }
 
     #[test]
     fn parses_an_optional_suggestion() {
         let output = "```json\n{\"summary\": \"s\", \"findings\": [\
-            {\"file\": \"a.rs\", \"line\": 7, \"severity\": \"warning\", \"title\": \"t\", \"body\": \"b\", \"suggestion\": \"let x = 1;\"},\
-            {\"file\": \"a.rs\", \"line\": 8, \"severity\": \"info\", \"title\": \"t2\", \"body\": \"b2\"}\
+            {\"file\": \"a.rs\", \"line\": 7, \"priority\": \"P1\", \"category\": \"quality\", \"title\": \"t\", \"body\": \"b\", \"suggestion\": \"let x = 1;\"},\
+            {\"file\": \"a.rs\", \"line\": 8, \"priority\": \"P2\", \"category\": \"style\", \"title\": \"t2\", \"body\": \"b2\"}\
         ]}\n```";
         let result = parse_review(output).expect("parse");
         assert_eq!(result.findings[0].suggestion.as_deref(), Some("let x = 1;"));

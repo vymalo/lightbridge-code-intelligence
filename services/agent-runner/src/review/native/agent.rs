@@ -32,7 +32,10 @@ block. Ground every claim with the search/graph tools before reporting it; you m
 run commands.\n\
 - Scope rule (non-negotiable): every finding's `line` MUST be a line this diff adds or changes; \
 never comment on untouched code.\n\
-- `severity` is `error` (must fix), `warning` (should fix), or `info` (minor/FYI).\n\
+- Review ALL dimensions — security, correctness, quality, style, performance. Give each finding a \
+`category` (one of those) and a `priority`: `P0` (must fix — bugs, security, data loss), `P1` (should \
+fix), or `P2` (minor / nit). Reserve P0/P1 for real harm and file style/quality observations as P2, so \
+low-value notes never crowd out blockers.\n\
 - Each finding: a short `title`, a `body` (why it matters), an optional `suggestion` (the EXACT \
 replacement source for that one line — no diff markers or fences), and optional `resources` (URLs).\n\
 - If the change is sound, call `submit_findings` with an empty `findings` array and a one-line \
@@ -244,7 +247,7 @@ mod tests {
                 tool_call_reply(
                     "submit_findings",
                     r#"{"summary":"Missing expiry check.","findings":[
-                        {"file":"a.rs","line":7,"severity":"error","title":"No expiry","body":"accepts expired tokens"}
+                        {"file":"a.rs","line":7,"priority":"P0","category":"security","title":"No expiry","body":"accepts expired tokens"}
                     ]}"#,
                 ),
             ],
