@@ -89,14 +89,28 @@ pub async fn run_native_agent(
             continue;
         }
 
+        // Dispatch every call in the turn before acting on a terminal outcome: a model may emit
+        // parallel tool calls (e.g. a last `add_review_comment` alongside `finish`), and we must not
+        // drop the others just because `finish` appeared first. Each dispatch still runs its side
+        // effect (the write tools buffer immediately); we only defer the loop-control decision.
+        let mut should_finish = false;
+        let mut abort_reason = None;
         for call in &calls {
             match tools.dispatch(call).await {
-                ToolOutcome::Finish => return Ok(()),
-                ToolOutcome::Abort(reason) => anyhow::bail!("review agent aborted: {reason}"),
+                ToolOutcome::Finish => should_finish = true,
+                ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
                     messages.push(ChatMessage::tool(call.id.as_str(), result));
                 }
             }
+        }
+        // Abort wins over finish if the model somehow asked for both — it's the safer outcome (a
+        // failed run posts nothing).
+        if let Some(reason) = abort_reason {
+            anyhow::bail!("review agent aborted: {reason}");
+        }
+        if should_finish {
+            return Ok(());
         }
     }
 

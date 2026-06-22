@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS pending_review_actions (
     category   TEXT,                 -- inline only
     suggestion TEXT,                 -- inline only (exact replacement for `line`)
     body       TEXT        NOT NULL, -- inline body / comment body / summary text
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- An inline finding must carry a location; enforce it at the DB level (defense in depth — the
+    -- endpoint already requires file+line).
+    CONSTRAINT inline_has_location CHECK (action <> 'inline' OR (file IS NOT NULL AND line IS NOT NULL))
 );
 
 -- One inline finding per (task, file, line): a re-emitted finding overwrites rather than duplicates.

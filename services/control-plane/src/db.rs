@@ -205,6 +205,22 @@ pub async fn clear_pending_review(pool: &PgPool, task_id: Uuid) -> Result<(), sq
         .map(|_| ())
 }
 
+/// Clear one class of buffered action for a task (`inline` | `comment` | `summary`). Used by the
+/// flush to drop each part **as it posts**, so a second finalize (e.g. a retried delivery) re-posts
+/// only the parts that previously failed — never a duplicate of one that already succeeded (ADR-0037).
+pub async fn clear_pending_action(
+    pool: &PgPool,
+    task_id: Uuid,
+    action: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM pending_review_actions WHERE task_id = $1 AND action = $2")
+        .bind(task_id)
+        .bind(action)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
 /// Buffer (or overwrite) one inline finding. Last write wins per `(task, file, line)` — a
 /// re-emitted finding refines rather than duplicates (ADR-0037; content hashes would let a reworded
 /// re-run slip through).

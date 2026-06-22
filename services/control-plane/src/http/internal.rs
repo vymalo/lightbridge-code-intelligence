@@ -774,7 +774,9 @@ pub async fn finalize_review(
         pr: context.target_id,
     };
 
-    // 1) Buffered replies → a single consolidated thread comment (works on a PR or an issue).
+    // 1) Buffered replies → a single consolidated thread comment (works on a PR or an issue). On a
+    // successful post we drop the comment rows immediately, so a re-finalize (e.g. a retried delivery
+    // after a later step failed) never double-posts this reply.
     let mut posted_reply = false;
     if !pending.comments.is_empty() {
         let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
@@ -788,7 +790,10 @@ pub async fn finalize_review(
             )
             .await
         {
-            Ok(_) => posted_reply = true,
+            Ok(_) => {
+                posted_reply = true;
+                let _ = crate::db::clear_pending_action(pool, id, "comment").await;
+            }
             Err(error) => {
                 tracing::warn!(%error, task_id = %id, "posting consolidated reply failed (non-fatal)")
             }
@@ -801,6 +806,7 @@ pub async fn finalize_review(
     let post_pr_review = context.target_type == "pull_request"
         && (has_inline || pending.summary.is_some() || pending.is_empty());
     let mut posted_review = false;
+    let mut review_failed = false;
     if post_pr_review {
         let pr = context.target_id;
         let findings: Vec<crate::review::Finding> = pending
@@ -818,10 +824,14 @@ pub async fn finalize_review(
                 resources: Vec::new(),
             })
             .collect();
+        // A present-but-blank summary falls back to the default, so the verdict is never empty.
         let summary = pending
             .summary
-            .clone()
-            .unwrap_or_else(|| DEFAULT_CLEAN_SUMMARY.to_string());
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CLEAN_SUMMARY)
+            .to_string();
 
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
             match app
@@ -900,17 +910,23 @@ pub async fn finalize_review(
                     label_has_error,
                 )
                 .await;
+                // Drop the inline + summary rows now that the review is on GitHub, so a re-finalize
+                // doesn't post a duplicate review.
+                let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+                let _ = crate::db::clear_pending_action(pool, id, "summary").await;
             }
             Err(error) => {
                 tracing::error!(%error, task_id = %id, "flushing PR review failed");
                 react(app, &state.review, &target, "confused").await;
-                // Leave the buffer intact so a retry can flush again.
-                return (StatusCode::BAD_GATEWAY, "could not post review").into_response();
+                // Leave the inline/summary rows intact so a re-finalize can post the review; don't
+                // bail early, so the kind is still recorded and any posted reply isn't lost.
+                review_failed = true;
             }
         }
     }
 
-    // 3) Record the emergent run kind (ADR-0037) and clear the buffer.
+    // 3) Record the emergent run kind (ADR-0037). The buffer was cleared per-part as each post
+    // succeeded; any rows left belong to a part that failed and a re-finalize will retry.
     let kind = match (has_inline, posted_reply) {
         (true, true) => "mixed",
         (true, false) => "review",
@@ -918,8 +934,9 @@ pub async fn finalize_review(
         (false, false) => "review", // summary-only or empty → a (clean) review
     };
     let _ = crate::db::set_task_kind(pool, id, kind).await;
-    if let Err(error) = crate::db::clear_pending_review(pool, id).await {
-        tracing::warn!(%error, task_id = %id, "clearing pending buffer failed (non-fatal)");
+
+    if review_failed {
+        return (StatusCode::BAD_GATEWAY, "could not post review").into_response();
     }
     Json(serde_json::json!({ "kind": kind, "review": posted_review, "reply": posted_reply }))
         .into_response()
