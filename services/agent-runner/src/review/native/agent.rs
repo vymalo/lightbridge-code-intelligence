@@ -47,6 +47,7 @@ pub async fn run_native_agent(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
+    repo_instructions: Option<&str>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -72,7 +73,7 @@ pub async fn run_native_agent(
         max_tokens: review.max_tokens,
     };
 
-    let mut messages = build_messages(review, command, diff);
+    let mut messages = build_messages(review, command, diff, repo_instructions);
 
     for turn in 0..MAX_TURNS {
         let completion = chat
@@ -126,7 +127,12 @@ pub async fn run_native_agent(
 /// Assemble the system (operator prompt + tool-protocol) and user (request + diff) messages. The
 /// system prompt is the **required** operator-owned guidance (ADR-0037 — no built-in default); the
 /// tool-protocol is appended last so it's the final instruction the model sees.
-fn build_messages(review: &ReviewConfig, command: &str, diff: Option<&PrDiff>) -> Vec<ChatMessage> {
+fn build_messages(
+    review: &ReviewConfig,
+    command: &str,
+    diff: Option<&PrDiff>,
+    repo_instructions: Option<&str>,
+) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
 
     let mut user = format!("The maintainer's request: {command}");
@@ -152,6 +158,13 @@ fn build_messages(review: &ReviewConfig, command: &str, diff: Option<&PrDiff>) -
             "\n\nNo diff is available for this run; answer or review against the working tree and \
              keep every claim grounded in the tools.",
         ),
+    }
+
+    // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
+    // already labelled and the tool-protocol/mission in the system message stays authoritative).
+    if let Some(instructions) = repo_instructions {
+        user.push_str("\n\n");
+        user.push_str(instructions);
     }
 
     vec![ChatMessage::system(system), ChatMessage::user(user)]
@@ -238,7 +251,7 @@ mod tests {
     #[test]
     fn build_messages_carries_request_and_uses_operator_prompt() {
         let review = review_config("http://unused/v1".to_string());
-        let msgs = build_messages(&review, "propose a better implementation", None);
+        let msgs = build_messages(&review, "propose a better implementation", None, None);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         let system = msgs[0].content.as_deref().expect("system content");
@@ -321,6 +334,7 @@ mod tests {
             &review,
             "@lightbridge review",
             Some(&diff),
+            None,
             &[],
             &cpc,
             &embc,
@@ -359,7 +373,7 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
+        let err = run_native_agent(&review, "review", None, None, &[], &cpc, &embc, Uuid::nil())
             .await
             .expect_err("abort is an error");
         assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
@@ -373,7 +387,7 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(&review, "review", None, &[], &cpc, &embc, Uuid::nil())
+        let err = run_native_agent(&review, "review", None, None, &[], &cpc, &embc, Uuid::nil())
             .await
             .expect_err("should give up");
         assert!(

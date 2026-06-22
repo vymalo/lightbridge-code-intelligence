@@ -4,13 +4,12 @@
 //! reads its task id + control-plane callback wiring from env, fetches the task context (repo
 //! coordinates + a short-lived installation token) from the control plane, clones the repo at the
 //! relevant commit, runs the task, and reports a terminal status back. The control plane owns the
-//! trust boundary — it mints the token and (in a later slice) validates findings and writes to
-//! GitHub (ADR-0002, docs/opencode-acp-mcp.md).
+//! trust boundary — it mints the token and validates findings + writes to GitHub (ADR-0002, ADR-0022).
 //!
 //! The lifecycle: clone → semantic index (tree-sitter → pgvector, slice 2) → structural index
-//! (Graphify → Neo4j, slice 3) → review (the native agent loop over the retrieval tools by default,
-//! ADR-0026; `REVIEW_AGENT=opencode` falls back to the legacy subprocess) → report. Indexing is
-//! required; the structural graph and the review are best-effort and non-fatal.
+//! (Graphify → Neo4j, slice 3) → review (the native agent loop, ADR-0026/0037, which acts via mediated
+//! write tools the control plane flushes) → report. Indexing is required; the structural graph and the
+//! review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
 use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
@@ -227,10 +226,14 @@ async fn run(
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
+            // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and
+            // fold them into the prompt as untrusted context so the review respects house rules.
+            let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
             match review::run_native_agent(
                 review,
                 &context.command,
                 diff.as_ref(),
+                repo_instructions.as_deref(),
                 &attribution,
                 client,
                 &embedder,

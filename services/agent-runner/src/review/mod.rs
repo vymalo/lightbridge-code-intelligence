@@ -6,6 +6,7 @@
 //! flushes one grouped review on finalize (ADR-0037). The former OpenCode subprocess + the stdio MCP
 //! servers it spawned were removed in #140 — this is the only review path.
 
+pub mod instructions;
 pub mod native;
 
 pub use native::agent::run_native_agent;
