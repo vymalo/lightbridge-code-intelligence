@@ -223,6 +223,7 @@ fn app(state: AppState) -> Router {
         .route("/tasks/{id}", get(tasks::get))
         .route("/tasks/{id}/review", get(tasks::get_review))
         .route("/tasks/{id}/transcript", get(tasks::get_transcript))
+        .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
         // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
@@ -406,8 +407,36 @@ async fn main() -> anyhow::Result<()> {
     match role.as_str() {
         "serve" => serve(state).await,
         "dispatcher" => run_dispatcher(state).await,
-        other => anyhow::bail!("unknown role {other:?} (expected: serve | dispatcher)"),
+        "poller" => run_poller(state).await,
+        other => anyhow::bail!("unknown role {other:?} (expected: serve | dispatcher | poller)"),
     }
+}
+
+/// The poller role (ADR-0035): a single replica that periodically reads reactions on the comments we
+/// posted and reconciles them into `review_feedback`. Requires a database and — unlike serve — the
+/// GitHub App key (to mint installation tokens); run as ONE replica so reactions aren't double-polled.
+async fn run_poller(state: AppState) -> anyhow::Result<()> {
+    let pool = state
+        .db
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("poller requires DATABASE_URL"))?;
+    let app = state.github.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "poller requires the GitHub App key (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY)"
+        )
+    })?;
+    spawn_metrics_server(state.metrics.clone());
+    let interval = std::time::Duration::from_secs(
+        std::env::var("POLLER_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    );
+    let within_days = std::env::var("POLLER_WINDOW_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14);
+    queue::poller::run(pool, app, interval, within_days).await
 }
 
 /// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).

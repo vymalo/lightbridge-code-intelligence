@@ -172,7 +172,8 @@ impl GithubApp {
 
     /// Post a plain comment on an issue or PR thread (`POST issues/{n}/comments`). Used for the `ask`
     /// run kind (ADR-0033): a conversational answer, not a diff-scoped review. PRs share the issues
-    /// comment endpoint, so this works for either target. Returns the comment's `html_url` when present.
+    /// comment endpoint, so this works for either target. Returns the comment's `id` (kept so the
+    /// feedback poller can read its reactions, ADR-0035) + `html_url`.
     pub async fn create_issue_comment(
         &self,
         token: &str,
@@ -180,10 +181,11 @@ impl GithubApp {
         repo: &str,
         issue: i64,
         body: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<PostedComment> {
         use anyhow::Context;
         #[derive(Deserialize)]
         struct CommentResponse {
+            id: Option<i64>,
             html_url: Option<String>,
         }
         let comment: CommentResponse = self
@@ -204,7 +206,102 @@ impl GithubApp {
             .json()
             .await
             .context("parsing issue comment response")?;
-        Ok(comment.html_url)
+        Ok(PostedComment {
+            id: comment.id,
+            html_url: comment.html_url,
+        })
+    }
+
+    /// List the inline comments of a posted review (`GET pulls/{pr}/reviews/{review_id}/comments`).
+    /// The create-review response omits per-comment ids; we fetch them here so the feedback poller can
+    /// read each comment's reactions (ADR-0035). Returns `(comment_id, path, line)` for each.
+    pub async fn list_review_comments(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        pr: i64,
+        review_id: i64,
+    ) -> anyhow::Result<Vec<ReviewCommentRef>> {
+        use anyhow::Context;
+        #[derive(Deserialize)]
+        struct RawComment {
+            id: i64,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            line: Option<i64>,
+        }
+        let raw: Vec<RawComment> = self
+            .http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews/{review_id}/comments?per_page=100"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("requesting review comments")?
+            .error_for_status()
+            .context("github rejected the review-comments request")?
+            .json()
+            .await
+            .context("parsing review comments")?;
+        Ok(raw
+            .into_iter()
+            .map(|c| ReviewCommentRef {
+                id: c.id,
+                path: c.path,
+                line: c.line,
+            })
+            .collect())
+    }
+
+    /// Read the reactions on a comment (ADR-0035). The endpoint differs by comment kind: an inline PR
+    /// review comment uses `pulls/comments/{id}/reactions`, a plain issue/PR comment uses
+    /// `issues/comments/{id}/reactions`. Returns `(reactor_login, reaction_content)` pairs.
+    pub async fn list_comment_reactions(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        comment_id: i64,
+        is_review_comment: bool,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        use anyhow::Context;
+        let kind = if is_review_comment { "pulls" } else { "issues" };
+        #[derive(Deserialize)]
+        struct RawReaction {
+            content: String,
+            user: Option<RawUser>,
+        }
+        #[derive(Deserialize)]
+        struct RawUser {
+            login: String,
+        }
+        let raw: Vec<RawReaction> = self
+            .http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/{kind}/comments/{comment_id}/reactions?per_page=100"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("requesting comment reactions")?
+            .error_for_status()
+            .context("github rejected the reactions request")?
+            .json()
+            .await
+            .context("parsing reactions")?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|r| r.user.map(|u| (u.login, r.content)))
+            .collect())
     }
 
     /// Fetch a repository's default branch. Used by index-on-approve (Epic #75): a repo registered
@@ -354,6 +451,22 @@ pub struct ReviewComment {
 pub struct PostedReview {
     pub id: Option<i64>,
     pub html_url: Option<String>,
+}
+
+/// The result of posting an issue/PR comment: its `id` (for the feedback poller, ADR-0035) + `html_url`.
+#[derive(Debug, Default)]
+pub struct PostedComment {
+    pub id: Option<i64>,
+    pub html_url: Option<String>,
+}
+
+/// An inline review comment GitHub created, fetched after posting so the feedback poller knows its id
+/// (ADR-0035). `path`/`line` correlate it back to the finding.
+#[derive(Debug, Clone)]
+pub struct ReviewCommentRef {
+    pub id: i64,
+    pub path: Option<String>,
+    pub line: Option<i64>,
 }
 
 #[cfg(test)]

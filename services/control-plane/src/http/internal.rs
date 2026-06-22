@@ -681,8 +681,22 @@ pub async fn finalize_review(
             )
             .await
         {
-            Ok(_) => {
+            Ok(posted_comment) => {
                 posted_reply = true;
+                // Record the reply's id so the feedback poller can read its reactions (ADR-0035).
+                if let Some(cid) = posted_comment.id {
+                    let _ = crate::db::store_review_comments(
+                        pool,
+                        id,
+                        &[crate::db::ReviewCommentRef {
+                            github_comment_id: cid,
+                            kind: "reply".to_string(),
+                            file: None,
+                            line: None,
+                        }],
+                    )
+                    .await;
+                }
                 let _ = crate::db::clear_pending_action(pool, id, "comment").await;
             }
             Err(error) => {
@@ -802,6 +816,34 @@ pub async fn finalize_review(
                     label_has_error,
                 )
                 .await;
+                // Capture the inline comment ids (the create-review response omits them) so the
+                // feedback poller can read each one's reactions (ADR-0035). Best-effort.
+                if let Some(review_id) = posted.id {
+                    match app
+                        .list_review_comments(&token, &context.owner, &context.name, pr, review_id)
+                        .await
+                    {
+                        Ok(refs) => {
+                            let stored: Vec<crate::db::ReviewCommentRef> = refs
+                                .into_iter()
+                                .map(|c| crate::db::ReviewCommentRef {
+                                    github_comment_id: c.id,
+                                    kind: "inline".to_string(),
+                                    file: c.path,
+                                    line: c.line.map(|l| l as i32),
+                                })
+                                .collect();
+                            if let Err(error) =
+                                crate::db::store_review_comments(pool, id, &stored).await
+                            {
+                                tracing::warn!(%error, task_id = %id, "storing review comment ids failed (non-fatal)");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, task_id = %id, "fetching review comment ids failed (non-fatal)")
+                        }
+                    }
+                }
                 // Drop the inline + summary rows now that the review is on GitHub, so a re-finalize
                 // doesn't post a duplicate review.
                 let _ = crate::db::clear_pending_action(pool, id, "inline").await;

@@ -3,5 +3,6 @@
 
 pub(crate) mod dispatcher;
 pub(crate) mod lifecycle;
+pub(crate) mod poller;
 pub(crate) mod reaper;
 pub(crate) mod tasks;
