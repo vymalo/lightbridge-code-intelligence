@@ -99,11 +99,10 @@ impl Finding {
         } else {
             "blue"
         };
-        // shields.io static-badge URL is `/badge/<label>-<message>-<color>`; a leading dash makes the
-        // label empty so the *message* (P0 / security) gets the coloured background — otherwise
-        // `/badge/P0-red` reads as label `P0`, message `red`, default grey (Gemini, #151).
+        // shields.io reads a single-dash `/badge/<message>-<color>` as a label-less coloured badge:
+        // `/badge/P0-red` renders "P0" on red (verified — identical to the `/badge/-P0-red` form).
         format!(
-            "![{p}](https://img.shields.io/badge/-{p}-{pc}) ![{c}](https://img.shields.io/badge/-{c}-{cc})",
+            "![{p}](https://img.shields.io/badge/{p}-{pc}) ![{c}](https://img.shields.io/badge/{c}-{cc})",
             p = priority,
             pc = priority_color,
             c = badge_label(category),
@@ -373,10 +372,10 @@ mod tests {
         let body = inline_body(&f);
         // Level is a coloured shields.io badge image (ADR-0032), not text: P0 red + security red.
         assert!(
-            body.starts_with("![P0](https://img.shields.io/badge/-P0-red)"),
+            body.starts_with("![P0](https://img.shields.io/badge/P0-red)"),
             "priority badge leads: {body}"
         );
-        assert!(body.contains("![security](https://img.shields.io/badge/-security-red)"));
+        assert!(body.contains("![security](https://img.shields.io/badge/security-red)"));
         assert!(body.contains("**Null deref**"));
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
@@ -394,7 +393,7 @@ mod tests {
         };
         assert_eq!(f.priority(), "P0");
         assert_eq!(f.category(), "correctness");
-        assert!(inline_body(&f).contains("https://img.shields.io/badge/-P0-red"));
+        assert!(inline_body(&f).contains("https://img.shields.io/badge/P0-red"));
     }
 
     #[test]
