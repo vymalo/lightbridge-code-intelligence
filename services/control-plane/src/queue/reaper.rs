@@ -281,6 +281,7 @@ mod tests {
                 target_type: "pull_request".to_string(),
                 target_id: 7,
                 command_text: "review".to_string(),
+                kind: "review".to_string(),
                 base_sha: None,
                 head_sha: Some("head1".to_string()),
                 run_epoch: 0,

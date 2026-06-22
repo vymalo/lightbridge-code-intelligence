@@ -343,6 +343,18 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
     body
 }
 
+/// Render an `ask` answer (ADR-0033) as a reply comment: the agent's Markdown answer verbatim under a
+/// heading, plus the same untrusted-output disclosure the review body carries. No diff scoping — a
+/// question gets a direct reply.
+pub fn render_answer_body(answer: &str) -> String {
+    format!(
+        "## Lightbridge answer\n\n{}\n\n---\n_🤖 AI-generated answer — treat it as untrusted, \
+         verify before acting; a human owns the final decision \
+         ([AI governance](https://adorsys-gis.github.io/ai-governance/))._",
+        answer.trim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +527,21 @@ mod tests {
         assert!(
             body.contains("AI-generated review"),
             "governance disclosure"
+        );
+    }
+
+    #[test]
+    fn render_answer_body_wraps_answer_with_heading_and_disclosure() {
+        let body = render_answer_body("  Use an `RwLock` for read-heavy access.  ");
+        assert!(body.starts_with("## Lightbridge answer"), "headed: {body}");
+        assert!(body.contains("Use an `RwLock` for read-heavy access."));
+        assert!(
+            !body.contains("  Use an"),
+            "answer is trimmed before rendering"
+        );
+        assert!(
+            body.contains("AI-generated answer") && body.contains("AI governance"),
+            "carries the untrusted-output disclosure"
         );
     }
 }

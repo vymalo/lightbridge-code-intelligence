@@ -56,6 +56,17 @@ one line and return no findings — silence is better than noise.\n\
 it in one click. You may not edit files or run commands.\n\n\
 Keep `summary` to 1–3 sentences: does the change do what it intends, and is it correct and safe?";
 
+/// The default **ask** guidance (ADR-0033) — persona for a conversational answer rather than a
+/// diff-scoped review. Used by the native agent's `ask` run; the fixed ask contract is appended
+/// after it (in `native::agent`).
+pub const DEFAULT_ASK_GUIDANCE: &str = "\
+You are Lightbridge, an expert engineer answering a maintainer's question about a pull request and \
+its codebase. Use the repository and the retrieval tools as your source of truth — investigate \
+before you answer, and never speculate about code you have not looked up.\n\n\
+Optimise for the reader's time: lead with a direct answer, then a brief, concrete justification. \
+Cite specific files/symbols you found. When you recommend a change, show the exact code. Be honest \
+about uncertainty and say what you could not determine.";
+
 /// The fixed output contract appended after the guidance and the diff. The parser ([`parse_review`])
 /// and the control plane's scope-and-suggestion handling depend on this exact shape, so it is NOT
 /// operator-overridable.
@@ -100,6 +111,40 @@ pub async fn run_review(
         ReviewAgent::OpenCode => {
             run_opencode_review(checkout, review, command, diff, attribution).await
         }
+    }
+}
+
+/// Produce a conversational answer for an `ask` run (ADR-0033). Only the native agent supports `ask`
+/// (it's the default, ADR-0026); the legacy OpenCode subprocess — kept solely as a review fallback
+/// pending removal (#140) — has no answer path, so an `ask` under it is a clear error rather than a
+/// silent generic review.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ask(
+    review: &ReviewConfig,
+    question: &str,
+    diff: Option<&PrDiff>,
+    attribution: &[(String, String)],
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    task_id: Uuid,
+) -> anyhow::Result<String> {
+    match review.agent {
+        ReviewAgent::Native => {
+            native::agent::run_native_ask(
+                review,
+                question,
+                diff,
+                attribution,
+                client,
+                embedder,
+                task_id,
+            )
+            .await
+        }
+        ReviewAgent::OpenCode => anyhow::bail!(
+            "ask runs require the native agent (REVIEW_AGENT=native, the default); the OpenCode \
+             fallback has no answer path"
+        ),
     }
 }
 

@@ -26,6 +26,7 @@ pub const VECTOR_SEMANTIC_SEARCH: &str = "lightbridge_vector_semantic_search";
 pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
 pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
 pub const SUBMIT_FINDINGS: &str = "submit_findings";
+pub const SUBMIT_ANSWER: &str = "submit_answer";
 pub const REPORT_PROGRESS: &str = "report_progress";
 pub const ABORT: &str = "abort";
 
@@ -39,7 +40,9 @@ pub enum ToolOutcome {
     Continue(String),
     /// The model called `submit_findings` with a valid payload — this is the review.
     Submit(ReviewResult),
-    /// The model called `abort` — it can't produce a useful review. Recorded, not a crash.
+    /// The model called `submit_answer` (ADR-0033 `ask`) — this is the conversational answer.
+    Answer(String),
+    /// The model called `abort` — it can't produce a useful result. Recorded, not a crash.
     Abort(String),
 }
 
@@ -65,6 +68,11 @@ struct GetCallersArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnswerArgs {
+    answer: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NoteArgs {
     note: String,
 }
@@ -74,8 +82,9 @@ struct AbortArgs {
     reason: String,
 }
 
-/// The tools advertised to the model, in a stable order.
-pub fn tool_defs() -> Vec<ToolDef> {
+/// The read-only retrieval tools the model investigates with — shared by the `review` and `ask`
+/// surfaces (both ground their output in the same repo context).
+fn retrieval_tool_defs() -> Vec<ToolDef> {
     let limit_schema = serde_json::json!({
         "type": "integer",
         "description": "Maximum number of results (default 10, max 100)."
@@ -120,6 +129,38 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "required": ["node_id"],
             }),
         ),
+    ]
+}
+
+/// The `report_progress` + `abort` control tools, shared by both surfaces.
+fn aux_control_tool_defs() -> Vec<ToolDef> {
+    vec![
+        ToolDef::function(
+            REPORT_PROGRESS,
+            "Optionally report a short progress note for observability. Does not affect the result.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "note": { "type": "string" } },
+                "required": ["note"],
+            }),
+        ),
+        ToolDef::function(
+            ABORT,
+            "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded \
+             as a clean abort, not a crash.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "reason": { "type": "string" } },
+                "required": ["reason"],
+            }),
+        ),
+    ]
+}
+
+/// The tools advertised for a **review** run, in a stable order: retrieval + `submit_findings` + aux.
+pub fn tool_defs() -> Vec<ToolDef> {
+    let mut defs = retrieval_tool_defs();
+    defs.push(
         ToolDef::function(
             SUBMIT_FINDINGS,
             "Submit the final review. Call this exactly once when done. Every finding's `line` MUST \
@@ -149,26 +190,29 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "required": ["summary", "findings"],
             }),
         ),
-        ToolDef::function(
-            REPORT_PROGRESS,
-            "Optionally report a short progress note for observability. Does not affect the review.",
-            serde_json::json!({
-                "type": "object",
-                "properties": { "note": { "type": "string" } },
-                "required": ["note"],
-            }),
-        ),
-        ToolDef::function(
-            ABORT,
-            "Abort the review when you cannot produce a useful result (e.g. the diff is unreadable). \
-             Recorded as a clean abort, not a crash.",
-            serde_json::json!({
-                "type": "object",
-                "properties": { "reason": { "type": "string" } },
-                "required": ["reason"],
-            }),
-        ),
-    ]
+    );
+    defs.extend(aux_control_tool_defs());
+    defs
+}
+
+/// The tools advertised for an **ask** run (ADR-0033): retrieval + `submit_answer` + aux. Same
+/// investigation surface as a review, but the run ends with a conversational answer, not findings.
+pub fn ask_tool_defs() -> Vec<ToolDef> {
+    let mut defs = retrieval_tool_defs();
+    defs.push(ToolDef::function(
+        SUBMIT_ANSWER,
+        "Submit your final answer to the user's question, as GitHub-flavored Markdown. Call this \
+         exactly once when done — do not answer in prose outside the tool.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": { "type": "string", "description": "The full Markdown answer to the user's question, grounded in what the tools found." },
+            },
+            "required": ["answer"],
+        }),
+    ));
+    defs.extend(aux_control_tool_defs());
+    defs
 }
 
 /// Runs tool calls against the control-plane retrieval API. Holds only borrowed clients + the task id.
@@ -217,6 +261,12 @@ impl Tools<'_> {
                      \"line\": 42, \"priority\": \"P0\", \"category\": \"security\", \"title\": \"…\", \
                      \"body\": \"…\", \"suggestion\": \"optional\", \"resources\": [\"optional\"]}}]}}. \
                      priority is P0|P1|P2; category is security|correctness|quality|style|performance."
+                )),
+            },
+            SUBMIT_ANSWER => match parse::<AnswerArgs>(args) {
+                Ok(a) => ToolOutcome::Answer(a.answer),
+                Err(e) => ToolOutcome::Continue(format!(
+                    "{e} Expected JSON like {{\"answer\": \"…your Markdown answer…\"}}."
                 )),
             },
             REPORT_PROGRESS => match parse::<NoteArgs>(args) {
@@ -315,6 +365,57 @@ mod tests {
                 ABORT,
             ]
         );
+    }
+
+    #[test]
+    fn ask_tool_defs_swap_submit_findings_for_submit_answer() {
+        let names: Vec<_> = ask_tool_defs()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                VECTOR_SEMANTIC_SEARCH,
+                GRAPH_FIND_SYMBOL,
+                GRAPH_GET_CALLERS,
+                SUBMIT_ANSWER,
+                REPORT_PROGRESS,
+                ABORT,
+            ],
+            "ask offers submit_answer, not submit_findings"
+        );
+    }
+
+    // ── Positive: a valid submit_answer payload becomes an Answer ───────────────────────────────
+    #[tokio::test]
+    async fn dispatch_submit_answer_valid_yields_answer() {
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        match tools(&cp, &emb)
+            .dispatch(&call(
+                SUBMIT_ANSWER,
+                r#"{"answer":"Use an `Arc<Mutex<_>>` here."}"#,
+            ))
+            .await
+        {
+            ToolOutcome::Answer(a) => assert_eq!(a, "Use an `Arc<Mutex<_>>` here."),
+            other => panic!("expected Answer, got {other:?}"),
+        }
+    }
+
+    // ── Negative: a malformed submit_answer payload is a recoverable Continue, not Answer ───────
+    #[tokio::test]
+    async fn dispatch_submit_answer_invalid_is_recoverable() {
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        match tools(&cp, &emb)
+            .dispatch(&call(SUBMIT_ANSWER, r#"{"reply":"wrong field"}"#))
+            .await
+        {
+            ToolOutcome::Continue(s) => assert!(s.to_lowercase().contains("expected"), "hint: {s}"),
+            other => panic!("expected Continue (recoverable), got {other:?}"),
+        }
     }
 
     // ── Positive: a search call embeds the query, hits the control plane, returns the hits ──────
