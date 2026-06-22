@@ -216,6 +216,20 @@ mod tests {
         }
     }
 
+    // The user's free-text instruction (carried from the @mention comment, #138) reaches the prompt.
+    #[test]
+    fn build_messages_carries_the_instruction_into_the_user_prompt() {
+        let review = review_config("http://unused/v1".to_string());
+        let msgs = build_messages(&review, "propose a better implementation", None);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        let user = msgs[1].content.as_deref().expect("user content");
+        assert!(
+            user.contains("propose a better implementation"),
+            "instruction must reach the prompt; got: {user}"
+        );
+    }
+
     // ── Positive e2e: search → results → submit_findings → validated ReviewResult ───────────────
     #[tokio::test]
     async fn native_loop_searches_then_submits() {

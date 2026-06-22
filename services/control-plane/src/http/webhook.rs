@@ -105,6 +105,34 @@ fn mentions_handle(body: &str, handle: &str) -> bool {
     body.trim_start().to_ascii_lowercase().starts_with(&mention)
 }
 
+/// Upper bound on the free-text instruction carried from a comment into the agent prompt. The text
+/// only steers reasoning (write-back is still diff-validated, ADR-0022), but we cap it so a giant
+/// comment can't blow up the prompt.
+const MAX_INSTRUCTION_CHARS: usize = 2_000;
+
+/// The free-text instruction in an `@<handle> …` comment: the body with the leading `@<handle>`
+/// stripped, trimmed, and length-bounded (#138). Returns `None` for a bare mention (the caller then
+/// defaults to a plain `review`). A parsed instruction equal to the reserved `index` command is also
+/// treated as `None`, so a comment can never masquerade as the system's index task (the runner skips
+/// review on `command == "index"`).
+fn parse_instruction(body: &str, handle: &str) -> Option<String> {
+    let trimmed = body.trim_start();
+    let mention = format!("@{handle}");
+    // Re-verify the leading mention so this is correct standalone; `is_char_boundary` guards the slice
+    // against a multi-byte char straddling the mention length (e.g. a non-ASCII body).
+    if trimmed.len() < mention.len()
+        || !trimmed.is_char_boundary(mention.len())
+        || !trimmed[..mention.len()].eq_ignore_ascii_case(&mention)
+    {
+        return None;
+    }
+    let instruction = trimmed[mention.len()..].trim();
+    if instruction.is_empty() || instruction.eq_ignore_ascii_case("index") {
+        return None;
+    }
+    Some(instruction.chars().take(MAX_INSTRUCTION_CHARS).collect())
+}
+
 /// `pull_request` events. `opened` → the automatic first review. `closed` → cancel the PR's active
 /// tasks (the reaper then stops their Jobs). `synchronize`/`reopened` do nothing — a re-review is
 /// requested with an `@<handle>` comment ([`handle_issue_comment`]).
@@ -298,7 +326,10 @@ async fn handle_issue_comment(
         github_delivery_id: delivery_id.to_string(),
         target_type: "pull_request".to_string(),
         target_id: pr_number,
-        command_text: "review".to_string(),
+        // Carry the user's free-text instruction into the task → prompt (#138); a bare @mention
+        // defaults to a plain review.
+        command_text: parse_instruction(body, &state.app_handle)
+            .unwrap_or_else(|| "review".to_string()),
         base_sha,
         head_sha,
         run_epoch,
@@ -566,6 +597,57 @@ mod tests {
             "@someone-else go",
             "lightbridge-assistant"
         ));
+    }
+
+    #[test]
+    fn parse_instruction_extracts_free_text_after_the_handle() {
+        let h = "lightbridge-assistant";
+        // Free text is captured, the @handle stripped, surrounding space trimmed.
+        assert_eq!(
+            parse_instruction("@lightbridge-assistant can you propose a better impl?", h)
+                .as_deref(),
+            Some("can you propose a better impl?")
+        );
+        // Case-insensitive handle + leading whitespace.
+        assert_eq!(
+            parse_instruction("  @Lightbridge-Assistant   focus on the auth path", h).as_deref(),
+            Some("focus on the auth path")
+        );
+        // Multiline body: leading mention stripped, the rest (incl. newlines) kept and trimmed.
+        assert_eq!(
+            parse_instruction(
+                "@lightbridge-assistant review this\nand check error handling",
+                h
+            )
+            .as_deref(),
+            Some("review this\nand check error handling")
+        );
+    }
+
+    #[test]
+    fn parse_instruction_defaults_for_bare_or_unsafe_bodies() {
+        let h = "lightbridge-assistant";
+        // Bare mention (with/without trailing space) → None → caller defaults to "review".
+        assert_eq!(parse_instruction("@lightbridge-assistant", h), None);
+        assert_eq!(parse_instruction("@lightbridge-assistant   \n  ", h), None);
+        // A comment that would masquerade as the reserved `index` command → None (no review skip).
+        assert_eq!(parse_instruction("@lightbridge-assistant index", h), None);
+        assert_eq!(parse_instruction("@lightbridge-assistant INDEX", h), None);
+        // Not addressed to us → None (mentions_handle already gates this, but be standalone-correct).
+        assert_eq!(
+            parse_instruction("cc @lightbridge-assistant please", h),
+            None
+        );
+        // Non-ASCII immediately after `@` must not panic the slice.
+        assert_eq!(parse_instruction("@日本語 hello", h), None);
+    }
+
+    #[test]
+    fn parse_instruction_bounds_length() {
+        let h = "bot";
+        let long = format!("@bot {}", "x".repeat(MAX_INSTRUCTION_CHARS + 500));
+        let parsed = parse_instruction(&long, h).expect("some");
+        assert_eq!(parsed.chars().count(), MAX_INSTRUCTION_CHARS);
     }
 
     #[test]
