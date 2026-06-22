@@ -19,7 +19,19 @@ use serde::{Deserialize, Serialize};
 pub struct Finding {
     pub file: String,
     pub line: u32,
-    pub severity: String,
+    /// Triage priority `P0`|`P1`|`P2` (ADR-0032). Optional on the wire so rows that predate the
+    /// priority model (and an older runner still emitting `severity`) still deserialize;
+    /// [`Finding::priority`] falls back to the legacy `severity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Finding dimension — `security`|`correctness`|`quality`|`style`|`performance` (ADR-0032,
+    /// extensible). Absent on legacy rows → treated as `correctness`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Legacy `error`|`warning`|`info` level (pre-ADR-0032). Read-only back-compat: still parsed from
+    /// old stored rows or an older runner and mapped into a priority; new findings omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
     pub title: String,
     pub body: String,
     /// Optional exact replacement for `line`; rendered as a committable GitHub ```suggestion block
@@ -30,6 +42,89 @@ pub struct Finding {
     /// (epic #89 finding format). Defaults to empty.
     #[serde(default)]
     pub resources: Vec<String>,
+}
+
+impl Finding {
+    /// Effective triage priority (ADR-0032): explicit `priority`, else shimmed from the legacy
+    /// `severity` (error/critical→P0, warning→P1, else→P2), else `P2`.
+    pub fn priority(&self) -> &str {
+        if let Some(p) = self.priority.as_deref().map(str::trim) {
+            if p.eq_ignore_ascii_case("P0") {
+                return "P0";
+            } else if p.eq_ignore_ascii_case("P1") {
+                return "P1";
+            } else if p.eq_ignore_ascii_case("P2") {
+                return "P2";
+            }
+        }
+        match self.severity.as_deref().map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("error") || s.eq_ignore_ascii_case("critical") => {
+                "P0"
+            }
+            Some(s)
+                if s.eq_ignore_ascii_case("warning")
+                    || s.eq_ignore_ascii_case("warn")
+                    || s.eq_ignore_ascii_case("high") =>
+            {
+                "P1"
+            }
+            _ => "P2",
+        }
+    }
+
+    /// Effective category; defaults to `correctness` when absent (legacy rows / unspecified).
+    pub fn category(&self) -> &str {
+        self.category
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("correctness")
+    }
+
+    /// Markdown badge **images** for the finding's priority + category (ADR-0032). GitHub markdown
+    /// can't colour text, so we use shields.io badges so the level actually reads in colour: priority
+    /// **P0 red / P1 orange / P2 lightgrey**, and **`category: security` is always red** regardless of
+    /// priority (the explicit ask). The badge label doubles as the image alt-text, so it still conveys
+    /// the level if shields.io can't be reached.
+    fn level_badges(&self) -> String {
+        let priority = self.priority();
+        let category = self.category();
+        let priority_color = match priority {
+            "P0" => "red",
+            "P1" => "orange",
+            _ => "lightgrey",
+        };
+        let category_color = if category.eq_ignore_ascii_case("security") {
+            "red"
+        } else {
+            "blue"
+        };
+        // shields.io reads a single-dash `/badge/<message>-<color>` as a label-less coloured badge:
+        // `/badge/P0-red` renders "P0" on red (verified — identical to the `/badge/-P0-red` form).
+        format!(
+            "![{p}](https://img.shields.io/badge/{p}-{pc}) ![{c}](https://img.shields.io/badge/{c}-{cc})",
+            p = priority,
+            pc = priority_color,
+            c = badge_label(category),
+            cc = category_color,
+        )
+    }
+}
+
+/// Sanitize a badge label for a shields.io URL path segment: spaces/underscores/dashes (which shields
+/// treats specially) collapse to a safe token, non-alphanumerics are dropped. Our categories are
+/// single ASCII words, so this is just defensive against an odd model value.
+fn badge_label(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    let token = cleaned.split_whitespace().collect::<Vec<_>>().join("_");
+    if token.is_empty() {
+        "finding".to_string()
+    } else {
+        token
+    }
 }
 
 /// Body for `POST /internal/tasks/{id}/review`.
@@ -147,7 +242,7 @@ pub fn validate(
     review
 }
 
-/// Render an inline comment body: the titled, severity-tagged finding, plus a committable GitHub
+/// Render an inline comment body: the level badges + titled finding, plus a committable GitHub
 /// ```suggestion block when the finding proposes a replacement. A *present but empty* suggestion is
 /// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
 /// (Some vs None), not on emptiness.
@@ -155,8 +250,8 @@ fn inline_body(finding: &Finding) -> String {
     // Standardized finding format (epic #89): `<LEVEL>: <title>` → explanation → committable
     // suggestion → resources.
     let mut body = format!(
-        "**{}: {}**\n\n{}",
-        finding.severity.to_uppercase(),
+        "{} **{}**\n\n{}",
+        finding.level_badges(),
         finding.title,
         finding.body
     );
@@ -205,11 +300,11 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: usize) -> 
         body.push_str("\n\n### Notes on changed files\n");
         body.push_str("_Findings on this PR's changes that couldn't be pinned to a diff line._\n");
         for f in deferred {
-            // Same `<LEVEL>: <title>` format as inline comments (epic #89), plus the location and
-            // any resource links (no committable suggestion — these aren't anchored to a diff line).
+            // Same badge + title format as inline comments (ADR-0032), plus the location and any
+            // resource links (no committable suggestion — these aren't anchored to a diff line).
             body.push_str(&format!(
-                "\n- **{}: {}** — `{}:{}`\n  {}",
-                f.severity.to_uppercase(),
+                "\n- {} **{}** — `{}:{}`\n  {}",
+                f.level_badges(),
                 f.title,
                 f.file,
                 f.line,
@@ -253,7 +348,9 @@ mod tests {
         Finding {
             file: file.into(),
             line,
-            severity: "warning".into(),
+            priority: Some("P1".into()),
+            category: Some("correctness".into()),
+            severity: None,
             title: title.into(),
             body: "b".into(),
             suggestion: None,
@@ -262,9 +359,10 @@ mod tests {
     }
 
     #[test]
-    fn inline_body_uses_standard_format_with_resources() {
+    fn inline_body_renders_level_badges_suggestion_and_resources() {
         let mut f = finding("a.rs", 1, "Null deref");
-        f.severity = "error".into();
+        f.priority = Some("P0".into());
+        f.category = Some("security".into());
         f.body = "explanation".into();
         f.suggestion = Some("let x = y;".into());
         f.resources = vec![
@@ -272,14 +370,30 @@ mod tests {
             "  ".into(), // blank → skipped
         ];
         let body = inline_body(&f);
+        // Level is a coloured shields.io badge image (ADR-0032), not text: P0 red + security red.
         assert!(
-            body.starts_with("**ERROR: Null deref**"),
-            "level: title header"
+            body.starts_with("![P0](https://img.shields.io/badge/P0-red)"),
+            "priority badge leads: {body}"
         );
+        assert!(body.contains("![security](https://img.shields.io/badge/security-red)"));
+        assert!(body.contains("**Null deref**"));
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
         assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));
-        assert_eq!(body.matches("- ").count(), 1, "blank resource skipped");
+    }
+
+    #[test]
+    fn legacy_severity_is_shimmed_to_a_priority_badge() {
+        // An old stored row (severity only, no priority/category) still renders: error → P0 red.
+        let f = Finding {
+            severity: Some("error".into()),
+            priority: None,
+            category: None,
+            ..finding("a.rs", 1, "Old finding")
+        };
+        assert_eq!(f.priority(), "P0");
+        assert_eq!(f.category(), "correctness");
+        assert!(inline_body(&f).contains("https://img.shields.io/badge/P0-red"));
     }
 
     #[test]

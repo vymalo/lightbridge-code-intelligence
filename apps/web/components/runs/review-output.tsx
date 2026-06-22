@@ -2,20 +2,40 @@ import { ChevronRight, ExternalLink } from "lucide-react";
 import type { Review, ReviewFinding } from "@/lib/domain/tasks";
 import { cn } from "@/lib/utils/cn";
 
-/** Severity → daisyUI badge color. Unknown severities fall back to a neutral (ghost) chip. */
-function severityBadge(severity: string): string {
-  switch (severity.toLowerCase()) {
-    case "critical":
+/** Effective triage priority (ADR-0032): explicit `priority`, else shimmed from a legacy `severity`
+ * (error/critical→P0, warning→P1, else→P2), else P2. */
+function priorityOf(finding: ReviewFinding): "P0" | "P1" | "P2" {
+  const p = finding.priority?.trim().toUpperCase();
+  if (p === "P0" || p === "P1" || p === "P2") return p;
+  switch (finding.severity?.trim().toLowerCase()) {
     case "error":
-      return "badge-error";
-    case "high":
+    case "critical":
+      return "P0";
     case "warning":
     case "warn":
+    case "high":
+      return "P1";
+    default:
+      return "P2";
+  }
+}
+
+/** Effective category; defaults to `correctness` for rows without one. */
+function categoryOf(finding: ReviewFinding): string {
+  return finding.category?.trim() || "correctness";
+}
+
+function isSecurity(finding: ReviewFinding): boolean {
+  return categoryOf(finding).toLowerCase() === "security";
+}
+
+/** Priority → daisyUI badge color: P0 red, P1 amber, P2 neutral. */
+function priorityBadge(priority: string): string {
+  switch (priority) {
+    case "P0":
+      return "badge-error";
+    case "P1":
       return "badge-warning";
-    case "medium":
-    case "low":
-    case "info":
-      return "badge-info";
     default:
       return "badge-ghost";
   }
@@ -66,7 +86,8 @@ export function ReviewOutput({ review }: { review: Review }) {
  * `<details>` so it works without client JS; high-severity findings open by default. */
 function FindingItem({ finding }: { finding: ReviewFinding }) {
   const hasDetail = Boolean(finding.body || finding.suggestion || finding.resources?.length);
-  const defaultOpen = ["critical", "error"].includes(finding.severity.toLowerCase());
+  // P0 (blockers) and any security finding open by default — the things a reader must not miss.
+  const defaultOpen = priorityOf(finding) === "P0" || isSecurity(finding);
 
   // No body/suggestion/resources → a static row, not a `<details>` (an expandable-but-empty box
   // reads as broken).
@@ -125,17 +146,29 @@ function FindingItem({ finding }: { finding: ReviewFinding }) {
   );
 }
 
-/** The shared collapsed header for a finding: severity chip · title · file:line. */
+/** The shared collapsed header for a finding: priority chip · category chip · title · file:line.
+ * Priority drives the colour (P0 red / P1 amber / P2 neutral); a `security` category is always red,
+ * regardless of priority (ADR-0032). */
 function FindingHeader({ finding }: { finding: ReviewFinding }) {
+  const priority = priorityOf(finding);
+  const security = isSecurity(finding);
   return (
     <>
       <span
         className={cn(
           "badge badge-soft badge-xs font-medium uppercase tracking-wide",
-          severityBadge(finding.severity),
+          security ? "badge-error" : priorityBadge(priority),
         )}
       >
-        {finding.severity}
+        {priority}
+      </span>
+      <span
+        className={cn(
+          "badge badge-soft badge-xs font-medium tracking-wide",
+          security ? "badge-error" : "badge-ghost",
+        )}
+      >
+        {categoryOf(finding)}
       </span>
       <span className="text-sm font-medium">{finding.title}</span>
       <span className="ml-auto font-mono text-xs text-base-content/60">
