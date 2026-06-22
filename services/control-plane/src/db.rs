@@ -112,6 +112,9 @@ pub struct ReviewRow {
     pub findings: Value,
     /// Permalink to the posted review on the PR (epic #89); `None` for older rows / if GitHub omitted it.
     pub review_url: Option<String>,
+    /// The GitHub review id we created (ADR-0035) — kept so a feedback signal (👍/👎) can correlate
+    /// back to this run. `None` for older rows / non-PR runs.
+    pub github_review_id: Option<i64>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -129,16 +132,18 @@ pub async fn upsert_review(
     out_of_scope_count: i32,
     findings: &Value,
     review_url: Option<&str>,
+    github_review_id: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO reviews \
-         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings, review_url) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings, review_url, github_review_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (task_id) DO UPDATE SET \
            summary = EXCLUDED.summary, body = EXCLUDED.body, \
            inline_count = EXCLUDED.inline_count, deferred_count = EXCLUDED.deferred_count, \
            out_of_scope_count = EXCLUDED.out_of_scope_count, findings = EXCLUDED.findings, \
-           review_url = EXCLUDED.review_url, created_at = now()",
+           review_url = EXCLUDED.review_url, github_review_id = EXCLUDED.github_review_id, \
+           created_at = now()",
     )
     .bind(task_id)
     .bind(summary)
@@ -148,6 +153,7 @@ pub async fn upsert_review(
     .bind(out_of_scope_count)
     .bind(findings)
     .bind(review_url)
+    .bind(github_review_id)
     .execute(pool)
     .await
     .map(|_| ())
@@ -1762,6 +1768,7 @@ mod tests {
             0,
             &findings,
             Some("https://github.com/o/r/pull/7#pullrequestreview-1"),
+            Some(987654),
         )
         .await
         .unwrap();
@@ -1774,11 +1781,18 @@ mod tests {
             row.review_url.as_deref(),
             Some("https://github.com/o/r/pull/7#pullrequestreview-1")
         );
+        assert_eq!(
+            row.github_review_id,
+            Some(987654),
+            "review id persisted (ADR-0035)"
+        );
 
         // Re-post upserts in place (still one row).
-        upsert_review(&pool, task_id, "sum2", "body2", 0, 0, 0, &findings, None)
-            .await
-            .unwrap();
+        upsert_review(
+            &pool, task_id, "sum2", "body2", 0, 0, 0, &findings, None, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             get_review(&pool, task_id).await.unwrap().unwrap().summary,
             "sum2"
