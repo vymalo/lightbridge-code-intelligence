@@ -1,6 +1,6 @@
 # ADR-0015: Web console design language & component system
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0027](0027-daisyui-design-system.md) (component/token *mechanism* only; the design *philosophy* is retained)
 - **Date:** 2026-06-19
 
 ## Context and Problem Statement

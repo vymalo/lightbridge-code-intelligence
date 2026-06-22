@@ -34,7 +34,7 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0012](0012-rfc-process-alongside-adrs.md) | RFC process alongside ADRs | Accepted |
 | [0013](0013-local-dev-and-build-tooling.md) | Local dev & build tooling (just, xtask, compose, nextest, wiremock) | Accepted |
 | [0014](0014-keycloak-oidc-resource-server.md) | Keycloak OIDC — web client + resource server | Accepted |
-| [0015](0015-web-console-design-language.md) | Web console design language & component system (shadcn/ui) | Accepted |
+| [0015](0015-web-console-design-language.md) | Web console design language & component system (shadcn/ui) | Superseded by ADR-0027 |
 | [0016](0016-dashboard-information-architecture.md) | Dashboard information architecture & task-run views | Accepted |
 | [0017](0017-agent-runner-control-plane-bootstrap.md) | Agent runner bootstraps from the control plane (no App key in the Job) | Accepted |
 | [0018](0018-openai-compatible-embeddings.md) | OpenAI-compatible API for all embeddings (eaig/core-gateway; no bundled model) | Accepted |
@@ -43,10 +43,10 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0021](0021-opencode-headless-review-agent.md) | OpenCode (headless `run`) is the review agent; generated opencode.json wires eaig + MCP | Superseded by 0026 |
 | [0022](0022-review-writeback-control-plane.md) | Control plane validates findings against the PR diff and posts the review (no GitHub creds in the Job) | Accepted |
 | [0023](0023-db-backed-rbac.md) | Permission-based authz: the token carries a permissions list under a configurable claim (aud still verified); enforce per-capability; no roles/DB | Accepted |
-| [0024](0024-web-console-redesign-v2.md) | Web console redesign v2 — richer surfaces, grouped nav + ⌘K, runs table, insights (within the ADR-0015 contract) | Proposed |
+| [0024](0024-web-console-redesign-v2.md) | Web console redesign v2 — richer surfaces, grouped nav + ⌘K, runs table, insights (within the ADR-0015 contract) | Accepted |
 | [0025](0025-review-reuses-base-index.md) | Review reuses the base index instead of re-indexing every run (perf) | Accepted |
 | [0026](0026-native-review-agent.md) | Native Rust review agent with structured tool calls; drop OpenCode (robust output + control tools) | Accepted |
-| [0027](0027-daisyui-design-system.md) | Adopt daisyUI (dracula theme) as the component layer; supersede ADR-0015's bespoke component/token mechanism | Proposed |
+| [0027](0027-daisyui-design-system.md) | Adopt daisyUI (dracula theme) as the component layer; supersede ADR-0015's bespoke component/token mechanism | Accepted |
 | [0028](0028-agent-job-control-sidecar.md) | Agent Job = control sidecar + single configurable main container (closed built-in pipeline) | Proposed |
 | [0029](0029-focused-review-not-generic-runner.md) | Scope boundary: a focused code-review system, not a generic step/CI runner (reject arbitrary steps, CRD/operator, workflow engines) | Proposed |
 | [0030](0030-repo-review-config.md) | Repo-level review configuration (`.lightbridge-code-review.jsonc`) — extend understanding, not execution | Proposed |
