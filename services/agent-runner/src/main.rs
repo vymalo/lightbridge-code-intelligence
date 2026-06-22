@@ -8,7 +8,8 @@
 //! GitHub (ADR-0002, docs/opencode-acp-mcp.md).
 //!
 //! The lifecycle: clone → semantic index (tree-sitter → pgvector, slice 2) → structural index
-//! (Graphify → Neo4j, slice 3) → review (OpenCode over the MCP tools, slice 5) → report. Indexing is
+//! (Graphify → Neo4j, slice 3) → review (the native agent loop over the retrieval tools by default,
+//! ADR-0026; `REVIEW_AGENT=opencode` falls back to the legacy subprocess) → report. Indexing is
 //! required; the structural graph and the review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
@@ -216,9 +217,11 @@ async fn run(
         (0, "reused base index".to_string())
     };
 
-    // ── Review: OpenCode over the MCP tools → validated GitHub write-back ────────────────────
-    // (slice 5 produces the review, slice 6 submits it; the control plane validates against the PR
-    // diff and posts). Runs only when the LLM is configured; non-fatal (indexing already landed).
+    // ── Review: native agent loop (default, ADR-0026) over the retrieval tools → validated GitHub
+    // write-back ──────────────────────────────────────────────────────────────────────────────
+    // (the agent produces the review, the control plane validates it against the PR diff and posts).
+    // `REVIEW_AGENT=opencode` falls back to the legacy subprocess. Runs only when the LLM is
+    // configured; non-fatal (indexing already landed).
     // A standalone `index` task (target_type `repository`, Epic #75) indexes the default branch only —
     // there's no PR to review, so skip the review step regardless of LLM config.
     let review_summary = match review_config.filter(|_| context.command != "index") {

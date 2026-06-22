@@ -141,21 +141,23 @@ fn require_field(section: &str, name: &str, value: &str) -> anyhow::Result<Strin
 /// Configuration for the OpenCode review agent's LLM — an OpenAI-compatible chat endpoint (the eaig
 /// gateway in prod; ADR-0021). Like embeddings, **no default model** so a misconfigured Job fails
 /// loudly. Optional as a whole: absent `LLM_MODEL`, the runner skips the review step (indexing-only).
-/// Which review agent the runner drives (ADR-0026). `REVIEW_AGENT=native` opts into the in-process
-/// Rust loop; anything else (incl. unset) keeps the OpenCode subprocess. Phased migration — the
-/// default flips to `Native` once the loop is dogfooded.
+/// Which review agent the runner drives (ADR-0026). The in-process native Rust loop is the **default**;
+/// set `REVIEW_AGENT=opencode` to fall back to the legacy OpenCode subprocess (kept until a
+/// real-gateway dogfood confirms native, then removed along with OpenCode/Bun from the image).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewAgent {
-    #[default]
+    /// Legacy OpenCode subprocess — the rollback path (`REVIEW_AGENT=opencode`).
     OpenCode,
+    /// In-process native Rust loop (ADR-0026).
+    #[default]
     Native,
 }
 
 impl ReviewAgent {
     fn from_env() -> Self {
         match std::env::var("REVIEW_AGENT") {
-            Ok(v) if v.eq_ignore_ascii_case("native") => Self::Native,
-            _ => Self::default(),
+            Ok(v) if v.eq_ignore_ascii_case("opencode") => Self::OpenCode,
+            _ => Self::default(), // native
         }
     }
 }
@@ -254,4 +256,15 @@ fn require(name: &str) -> anyhow::Result<String> {
 fn parse_required(name: &str) -> anyhow::Result<Uuid> {
     let raw = require(name)?;
     Uuid::parse_str(&raw).map_err(|_| anyhow::anyhow!("{name} is not a valid UUID: {raw:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_agent_defaults_to_native() {
+        // ADR-0026 cutover: native is the default; OpenCode is now opt-in (the rollback path).
+        assert_eq!(ReviewAgent::default(), ReviewAgent::Native);
+    }
 }
