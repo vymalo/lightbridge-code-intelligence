@@ -8,9 +8,9 @@
 //! Built in phases behind `REVIEW_AGENT=native|opencode` (ADR-0026). This module currently holds:
 //!
 //! - [`chat`] — the Chat Completions client (request/response types + tool-call protocol).
+//! - [`tools`] — the agent's tool surface (retrieval + control) and the in-process dispatcher.
 //!
-//! Still to come (later PRs): the tool registry + in-process dispatch (the same retrieval tools the
-//! MCP servers expose, plus the control tools `submit_findings`/`report_progress`/`abort`), and the
-//! loop itself.
+//! Still to come (next PR): the loop itself, behind `REVIEW_AGENT=native|opencode`.
 
 pub mod chat;
+pub mod tools;
