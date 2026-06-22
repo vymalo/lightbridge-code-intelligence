@@ -161,6 +161,28 @@ pub struct SymbolHit {
     pub start_line: i64,
 }
 
+/// One entry in the agent run transcript (ADR-0034): an assistant turn (its reasoning text +
+/// `tool_calls`, with the turn's token usage) or a tool result. Submitted in order; the control plane
+/// assigns the sequence. Tool-result content is truncated by the runner to keep the row bounded.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptEntry {
+    /// `assistant` or `tool`.
+    pub role: String,
+    /// Assistant reasoning text or the tool result; `None` for an assistant turn that only called tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// The assistant turn's `tool_calls` array (raw JSON), when it called tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// For a tool-result entry, which tool produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusUpdate<'a> {
     status: &'a str,
@@ -318,6 +340,27 @@ impl ControlPlaneClient {
             .context("finalizing review")?
             .error_for_status()
             .context("control plane rejected the finalize")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/transcript` — submit the agent run transcript (ADR-0034) for
+    /// observability. Best-effort: a failure here must not fail the task.
+    pub async fn submit_transcript(
+        &self,
+        task_id: Uuid,
+        entries: &[TranscriptEntry],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/transcript", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "entries": entries }))
+            .send()
+            .await
+            .context("submitting transcript")?
+            .error_for_status()
+            .context("control plane rejected the transcript")?;
         Ok(())
     }
 

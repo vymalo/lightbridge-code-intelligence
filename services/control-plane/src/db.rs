@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -160,6 +160,88 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
         .bind(task_id)
         .fetch_optional(pool)
         .await
+}
+
+// ── ADR-0034 agent run transcript ──────────────────────────────────────────────────────────────
+
+/// One transcript entry submitted by the runner (the ingest shape; mirrors
+/// `agent-runner::bootstrap::client::TranscriptEntry`).
+#[derive(Debug, Deserialize)]
+pub struct TranscriptInput {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Value>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub prompt_tokens: Option<i64>,
+    #[serde(default)]
+    pub completion_tokens: Option<i64>,
+}
+
+/// One stored transcript entry, serialized to `GET /tasks/{id}/transcript` (ADR-0034) for the
+/// dashboard timeline.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct TranscriptRow {
+    pub seq: i32,
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Option<Value>,
+    pub tool_name: Option<String>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Replace a task's transcript with `entries` (ordered). The runner submits the whole transcript once
+/// at run end; a re-submit (task retry) replaces the prior rows, so the row set always reflects the
+/// latest run. Done in one transaction so a reader never sees a half-written transcript.
+pub async fn replace_transcript(
+    pool: &PgPool,
+    task_id: Uuid,
+    entries: &[TranscriptInput],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM agent_transcript WHERE task_id = $1")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    for (seq, e) in entries.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO agent_transcript \
+             (id, task_id, seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(task_id)
+        .bind(seq as i32)
+        .bind(&e.role)
+        .bind(&e.content)
+        .bind(&e.tool_calls)
+        .bind(&e.tool_name)
+        .bind(e.prompt_tokens)
+        .bind(e.completion_tokens)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// Load a task's transcript in order (ADR-0034), or an empty vec if none was recorded.
+pub async fn get_transcript(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<Vec<TranscriptRow>, sqlx::Error> {
+    sqlx::query_as::<_, TranscriptRow>(
+        "SELECT seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, created_at \
+         FROM agent_transcript WHERE task_id = $1 ORDER BY seq",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
 }
 
 // ── ADR-0037 pending review actions ────────────────────────────────────────────────────────────
@@ -1703,6 +1785,64 @@ mod tests {
         );
 
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    /// ADR-0034: a transcript stores in order and a re-submit replaces it (a task retry re-sends the
+    /// whole run), so the stored set always reflects the latest run.
+    #[sqlx::test]
+    async fn transcript_replace_and_read(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(get_transcript(&pool, task_id).await.unwrap().is_empty());
+
+        let first = vec![
+            TranscriptInput {
+                role: "assistant".to_string(),
+                content: Some("let me search".to_string()),
+                tool_calls: Some(
+                    serde_json::json!([{ "function": { "name": "lightbridge_vector_semantic_search" } }]),
+                ),
+                tool_name: None,
+                prompt_tokens: Some(1200),
+                completion_tokens: Some(30),
+            },
+            TranscriptInput {
+                role: "tool".to_string(),
+                content: Some("hit: a.rs".to_string()),
+                tool_calls: None,
+                tool_name: Some("lightbridge_vector_semantic_search".to_string()),
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ];
+        replace_transcript(&pool, task_id, &first).await.unwrap();
+        let rows = get_transcript(&pool, task_id).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 0);
+        assert_eq!(rows[0].role, "assistant");
+        assert_eq!(rows[0].prompt_tokens, Some(1200));
+        assert_eq!(rows[1].role, "tool");
+        assert_eq!(
+            rows[1].tool_name.as_deref(),
+            Some("lightbridge_vector_semantic_search")
+        );
+
+        // A retry re-submits a (shorter) transcript → fully replaces the old one.
+        let second = vec![TranscriptInput {
+            role: "assistant".to_string(),
+            content: Some("done".to_string()),
+            tool_calls: None,
+            tool_name: None,
+            prompt_tokens: Some(500),
+            completion_tokens: Some(10),
+        }];
+        replace_transcript(&pool, task_id, &second).await.unwrap();
+        let rows = get_transcript(&pool, task_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "replaced, not appended");
+        assert_eq!(rows[0].content.as_deref(), Some("done"));
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an

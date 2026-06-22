@@ -177,6 +177,32 @@ pub struct ChunkBatch {
     pub chunks: Vec<ChunkInput>,
 }
 
+/// Body for `POST /internal/tasks/{id}/transcript` — the agent run transcript (ADR-0034).
+#[derive(Debug, Deserialize)]
+pub struct TranscriptSubmission {
+    pub entries: Vec<crate::db::TranscriptInput>,
+}
+
+/// `POST /internal/tasks/{id}/transcript` — store the agent run transcript (ADR-0034). Replaces any
+/// prior transcript for the task (a retry re-submits the whole thing).
+pub async fn ingest_transcript(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(submission): Json<TranscriptSubmission>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::replace_transcript(pool, id, &submission.entries).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "storing transcript failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
 /// `POST /internal/tasks/{id}/chunks` — ingest indexed code chunks from the runner.
 ///
 /// The runner submits chunks in batches as it processes files; the control plane writes them to

@@ -133,12 +133,24 @@ pub struct ChatParams {
     pub max_tokens: Option<i64>,
 }
 
-/// The assistant's reply for one turn: its message (text and/or `tool_calls`) plus the provider's
-/// `finish_reason` (e.g. `tool_calls`, `stop`, `length`) so the loop can detect truncation.
+/// The assistant's reply for one turn: its message (text and/or `tool_calls`), the provider's
+/// `finish_reason` (e.g. `tool_calls`, `stop`, `length`) so the loop can detect truncation, and the
+/// token `usage` for the turn (for the transcript/observability, ADR-0034).
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    pub usage: Option<Usage>,
+}
+
+/// Token usage for one completion, as reported by the OpenAI-compatible API. All optional — some
+/// gateways omit it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: Option<i64>,
+    #[serde(default)]
+    pub completion_tokens: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -161,6 +173,8 @@ struct ChatRequest<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +269,7 @@ impl ChatClient {
             .await
             .context("parsing chat completions response")?;
 
+        let usage = response.usage;
         let choice = response
             .choices
             .into_iter()
@@ -263,6 +278,7 @@ impl ChatClient {
 
         Ok(Completion {
             finish_reason: choice.finish_reason,
+            usage,
             message: ChatMessage {
                 role: choice
                     .message

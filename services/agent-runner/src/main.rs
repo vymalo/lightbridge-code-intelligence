@@ -227,7 +227,8 @@ async fn run(
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
-            match review::run_native_agent(
+            let mut transcript = Vec::new();
+            let outcome = review::run_native_agent(
                 review,
                 &context.command,
                 diff.as_ref(),
@@ -235,9 +236,17 @@ async fn run(
                 client,
                 &embedder,
                 config.task_id,
+                &mut transcript,
             )
-            .await
-            {
+            .await;
+            // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the
+            // most useful to inspect. Best-effort: never let it change the task result.
+            if !transcript.is_empty() {
+                if let Err(error) = client.submit_transcript(config.task_id, &transcript).await {
+                    tracing::warn!(%error, "submitting transcript failed (non-fatal)");
+                }
+            }
+            match outcome {
                 // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed run is
                 // NOT finalized, so a mid-run death posts nothing (crash-safe). Finalize failure IS
                 // fatal (unlike the rest of review, which is best-effort): the review is ready and the
