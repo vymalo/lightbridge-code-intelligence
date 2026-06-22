@@ -1,6 +1,6 @@
 # ADR-0027: Adopt daisyUI (dracula theme) as the component layer
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

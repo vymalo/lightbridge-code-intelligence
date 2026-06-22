@@ -1,6 +1,6 @@
 # ADR-0024: Web console redesign v2 — surfaces, navigation, table & insights
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-21
 
 ## Context and Problem Statement

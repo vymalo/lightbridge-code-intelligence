@@ -1,7 +1,7 @@
 # Lightbridge Code Intelligence
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub App](https://img.shields.io/badge/GitHub-App-green.svg)](https://github.com/apps)
+[![GitHub App](https://img.shields.io/badge/GitHub-App-green.svg)](https://github.com/apps/lightbridge-assistant)
 
 Lightbridge is a GitHub App for **intelligent code review and repository Q&A**. It listens for
 GitHub webhook events, records work in a Rust control plane, and runs each task in an isolated,
