@@ -1,7 +1,7 @@
 import { SESSION_COOKIE } from "@lightbridge/auth";
 import { cookies } from "next/headers";
-import type { Repository } from "@/lib/repos";
-import type { Review, Task } from "@/lib/tasks";
+import type { Repository } from "@/lib/domain/repos";
+import type { Review, Task } from "@/lib/domain/tasks";
 
 /**
  * Server-side client for the control plane's read API (resource server). Runs only in Server

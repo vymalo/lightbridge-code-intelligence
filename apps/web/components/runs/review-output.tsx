@@ -1,6 +1,6 @@
 import { ChevronRight, ExternalLink } from "lucide-react";
-import { cn } from "@/lib/cn";
-import type { Review, ReviewFinding } from "@/lib/tasks";
+import type { Review, ReviewFinding } from "@/lib/domain/tasks";
+import { cn } from "@/lib/utils/cn";
 
 /** Severity → daisyUI badge color. Unknown severities fall back to a neutral (ghost) chip. */
 function severityBadge(severity: string): string {

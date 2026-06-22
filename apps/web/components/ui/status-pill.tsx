@@ -1,6 +1,6 @@
 import { cva } from "class-variance-authority";
-import { cn } from "@/lib/cn";
-import { type StatusVariant, statusVisual } from "@/lib/tasks";
+import { type StatusVariant, statusVisual } from "@/lib/domain/tasks";
+import { cn } from "@/lib/utils/cn";
 
 // Status variant → daisyUI badge color (ADR-0027). `badge-soft` keeps the calm, tinted fill from the
 // ADR-0016 status model; pending/cancelled stay neutral (ghost). Keyed by the domain `StatusVariant`.

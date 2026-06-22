@@ -13,8 +13,8 @@ use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 
 use crate::db;
-use crate::k8s::TaskLauncher;
-use crate::reaper;
+use crate::integrations::k8s::TaskLauncher;
+use crate::queue::reaper;
 
 /// Defaults for the dispatcher timings when the file config doesn't set them.
 const DEFAULT_CLAIM_LEASE_SECS: u64 = 60;
@@ -104,7 +104,7 @@ pub async fn run<L: TaskLauncher>(
                     tracing::error!(%error, "reaper cycle failed");
                 }
                 // Durable backstop for repo data purge (a spawned purge can be lost on restart).
-                crate::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
+                crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
             // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so
@@ -171,8 +171,8 @@ async fn dispatch<L: TaskLauncher>(
     let started = std::time::Instant::now();
     match launcher.launch(task).await {
         Ok(job_name) => {
-            crate::metrics::dispatch_outcome("launched");
-            crate::metrics::dispatch_launch_seconds(started.elapsed().as_secs_f64());
+            crate::http::metrics::dispatch_outcome("launched");
+            crate::http::metrics::dispatch_launch_seconds(started.elapsed().as_secs_f64());
             match db::set_task_job(pool, task.id, &job_name).await {
                 Ok(()) => tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job"),
                 Err(error) => {
@@ -183,7 +183,7 @@ async fn dispatch<L: TaskLauncher>(
             }
         }
         Err(error) => {
-            crate::metrics::dispatch_outcome("failed");
+            crate::http::metrics::dispatch_outcome("failed");
             tracing::error!(%error, task_id = %task.id, "failed to launch job; requeueing");
             if let Err(release_error) = db::release_task(pool, task.id, cfg.launch_backoff).await {
                 tracing::error!(%release_error, task_id = %task.id, "failed to requeue task");

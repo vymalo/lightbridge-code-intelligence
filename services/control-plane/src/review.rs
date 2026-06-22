@@ -272,7 +272,10 @@ mod tests {
             "  ".into(), // blank → skipped
         ];
         let body = inline_body(&f);
-        assert!(body.starts_with("**ERROR: Null deref**"), "level: title header");
+        assert!(
+            body.starts_with("**ERROR: Null deref**"),
+            "level: title header"
+        );
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
         assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));

@@ -80,7 +80,7 @@ async fn set_status(caller: Caller, state: AppState, id: i64, status: &str) -> R
             );
             // Denial removes the repo from scope → purge its index data (Epic #75, Milestone B).
             if status == "disabled" {
-                crate::lifecycle::spawn_purge(&state, id);
+                crate::queue::lifecycle::spawn_purge(&state, id);
             }
             // Approval opts the repo in → index its default branch (Epic #75, Milestone B). Spawned:
             // it makes GitHub calls (token mint, default-branch resolve) that must not block the
@@ -173,7 +173,7 @@ async fn enqueue_index_on_approve(
 
     match crate::db::create_index_task(pool, repo_id, installation_id).await {
         Ok(Some(task_id)) => {
-            crate::metrics::task_created();
+            crate::http::metrics::task_created();
             tracing::info!(repository_id = repo_id, %task_id, "approved: enqueued base index task")
         }
         Ok(None) => {

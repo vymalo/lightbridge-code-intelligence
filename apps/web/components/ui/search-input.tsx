@@ -1,6 +1,6 @@
 import { Search } from "lucide-react";
 import type { InputHTMLAttributes } from "react";
-import { cn } from "@/lib/cn";
+import { cn } from "@/lib/utils/cn";
 
 /** A search box on the daisyUI `input` primitive (ADR-0027): the `input` class styles the wrapping
  * label, the leading magnifier sits inside it, and the real `<input>` is borderless within. Sizing /

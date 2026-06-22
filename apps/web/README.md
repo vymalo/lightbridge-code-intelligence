@@ -23,6 +23,27 @@ capabilities (`task:read/cancel`, `repo:read/approve/deny`, `review:read`, …).
   approved; decisions are reversible.
 - **Settings** — account, GitHub-App link, effective permissions.
 
+## Layout
+
+Components and lib modules are grouped by *what they are*, so the shape is self-evident:
+
+```
+app/                 App Router routes (one folder per surface) + api/ route handlers
+components/
+  runs/              run list, table, timeline, row, logs, review output
+  repos/             repository list
+  overview/          insights / KPIs
+  shell/             dashboard chrome — console shell, nav links, ⌘K palette
+  ui/                design-system primitives (button, card, pill, states, …)
+lib/
+  domain/            domain types + presentation logic (tasks, repos, insights)
+  auth/              OIDC client + session/claims
+  server/            server-side API clients (control-plane calls, admin)
+  utils/             cross-cutting helpers (cn, config)
+  hooks/             shared client hooks
+middleware.ts        permission gate for /dashboard/*
+```
+
 ## Design system
 
 daisyUI v5 with the **dracula** theme, **dark-only**, on Tailwind v4

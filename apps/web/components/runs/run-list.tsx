@@ -3,13 +3,13 @@
 import { LayoutList, Table2 } from "lucide-react";
 import { parseAsInteger, parseAsStringLiteral, useQueryState } from "nuqs";
 import { useMemo } from "react";
-import { RunTable } from "@/components/run-table";
-import { RunTimeline } from "@/components/run-timeline";
-import { StatusLine } from "@/components/states";
+import { RunTable } from "@/components/runs/run-table";
+import { RunTimeline } from "@/components/runs/run-timeline";
 import { SearchInput } from "@/components/ui/search-input";
-import { cn } from "@/lib/cn";
+import { StatusLine } from "@/components/ui/states";
+import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/domain/tasks";
 import { useLocalStorageState } from "@/lib/hooks/use-local-storage-state";
-import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/tasks";
+import { cn } from "@/lib/utils/cn";
 
 const FILTER_VALUES = ["all", "active", "pending", "success", "error", "muted"] as const;
 const FILTERS: { value: (typeof FILTER_VALUES)[number]; label: string }[] = [

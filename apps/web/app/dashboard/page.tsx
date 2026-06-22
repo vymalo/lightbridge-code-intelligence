@@ -1,11 +1,11 @@
 import Link from "next/link";
-import { Insights } from "@/components/insights";
-import { RunRow } from "@/components/run-row";
-import { ApiErrorLine, EmptyState } from "@/components/states";
+import { Insights } from "@/components/overview/insights";
+import { RunRow } from "@/components/runs/run-row";
 import { buttonClass } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
-import { listTasks } from "@/lib/api";
-import { githubAppInstallUrl } from "@/lib/config";
+import { ApiErrorLine, EmptyState } from "@/components/ui/states";
+import { listTasks } from "@/lib/server/api";
+import { githubAppInstallUrl } from "@/lib/utils/config";
 
 // Task state changes server-side; always render fresh.
 export const dynamic = "force-dynamic";

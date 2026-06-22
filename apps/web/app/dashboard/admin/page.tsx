@@ -1,11 +1,11 @@
 import { Check, X } from "lucide-react";
-import { ApiErrorLine, StatusLine } from "@/components/states";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { ApiErrorLine, StatusLine } from "@/components/ui/states";
 import { Pill } from "@/components/ui/status-pill";
-import { hasPermission, listAdminRepos } from "@/lib/admin";
-import { approvalVisual, type Repository, repoSlug } from "@/lib/repos";
-import { currentClaims } from "@/lib/session";
+import { currentClaims } from "@/lib/auth/session";
+import { approvalVisual, type Repository, repoSlug } from "@/lib/domain/repos";
+import { hasPermission, listAdminRepos } from "@/lib/server/admin";
 import { approveRepoAction, denyRepoAction } from "./actions";
 
 export const dynamic = "force-dynamic";

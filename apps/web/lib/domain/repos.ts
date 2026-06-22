@@ -3,7 +3,7 @@
  * `/repositories` payload (`RepositoryRow` in `services/control-plane/src/db.rs`). Edge-safe.
  */
 
-import type { StatusVariant } from "@/lib/tasks";
+import type { StatusVariant } from "@/lib/domain/tasks";
 
 /** A connected repository plus its run-activity summary. */
 export interface Repository {

@@ -7,9 +7,9 @@ import { Card } from "@/components/ui/card";
 import { Pagination } from "@/components/ui/pagination";
 import { SearchInput } from "@/components/ui/search-input";
 import { Pill } from "@/components/ui/status-pill";
+import { approvalVisual, type Repository, repoSlug, repoUrl } from "@/lib/domain/repos";
+import { relativeTime } from "@/lib/domain/tasks";
 import { usePagination } from "@/lib/hooks/use-pagination";
-import { approvalVisual, type Repository, repoSlug, repoUrl } from "@/lib/repos";
-import { relativeTime } from "@/lib/tasks";
 
 const PAGE_SIZE = 12;
 

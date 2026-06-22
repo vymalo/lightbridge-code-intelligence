@@ -5,6 +5,11 @@
 # Recipes use just's default `sh` shell so the entrypoint works on minimal environments
 # (no zsh required). Keep recipe bodies POSIX-compatible.
 
+# `chronic` (moreutils) runs a command and prints its output only if it fails — keeps a green gate
+# quiet. Resolves to the empty string when not installed, so commands just run normally. The Rust
+# side delegates to `cargo xtask`, which applies the same chronic wrapping internally.
+chronic := `command -v chronic >/dev/null 2>&1 && printf chronic || true`
+
 # List available recipes.
 default:
     @just --list
@@ -41,38 +46,30 @@ dev-web:
 
 # --- Quality (shift-left: run before pushing) ---
 
-# Format everything (Biome for JS/TS, rustfmt for Rust).
+# Format everything (Biome for JS/TS; rustfmt via xtask).
 fmt:
-    pnpm format
-    cargo fmt
+    {{chronic}} pnpm format
+    cargo xtask fmt
 
-# Lint + format-check everything.
+# Lint + format-check everything (Biome for JS/TS; clippy via xtask).
 lint:
-    pnpm lint
-    cargo clippy --all-targets -- -D warnings
+    {{chronic}} pnpm lint
+    cargo xtask lint
 
-# Run all tests (JS via Turborepo, Rust via cargo-nextest, falling back to cargo test).
+# Run all tests (JS via Turborepo; Rust via xtask — nextest, falling back to cargo test).
 test:
-    pnpm test
-    @if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run; else cargo test; fi
+    {{chronic}} pnpm test
+    cargo xtask test
 
-# Codegen stays DEFERRED (ADR-0005); this only lints `control-plane.cstack` so the
-# schema-first source of truth cannot silently drift from src/types.rs. Best-effort:
-# skips with a hint when cratestack-cli is absent, so CI never hard-requires compiling
-# a young external crate. Install to enforce: cargo install cratestack-cli --version 0.4.9
-# Validate the cratestack schema against the documented 0.4.x grammar.
+# Validate the cratestack schema against the documented 0.4.x grammar (codegen deferred, ADR-0005).
+# Best-effort: skips with a hint when cratestack-cli is absent. See xtask for the logic.
 validate-schema:
-    @if command -v cratestack-cli >/dev/null 2>&1; then \
-        cratestack-cli validate services/control-plane/schema/control-plane.cstack; \
-    else \
-        echo "cratestack-cli not installed — skipping schema validation."; \
-        echo "Install to enforce: cargo install cratestack-cli --version 0.4.9"; \
-    fi
+    cargo xtask validate-schema
 
-# The full local CI gate (delegates the Rust side to cargo xtask).
-ci: validate-schema
-    pnpm lint
-    pnpm build
+# The full local CI gate. The Rust side (schema check, fmt-check, clippy, tests) lives in xtask.
+ci:
+    {{chronic}} pnpm lint
+    {{chronic}} pnpm build
     cargo xtask ci
 
 # --- Local infra (docker compose: Postgres+pgvector, Neo4j, Keycloak) ---

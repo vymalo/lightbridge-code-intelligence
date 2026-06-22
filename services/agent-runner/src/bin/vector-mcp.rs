@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use agent_runner::client::ControlPlaneClient;
-use agent_runner::config::{EmbeddingsConfig, RunnerConfig};
-use agent_runner::embeddings::EmbeddingsClient;
+use agent_runner::bootstrap::client::ControlPlaneClient;
+use agent_runner::bootstrap::config::{EmbeddingsConfig, RunnerConfig};
+use agent_runner::indexer::embeddings::EmbeddingsClient;
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router, ServiceExt};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;

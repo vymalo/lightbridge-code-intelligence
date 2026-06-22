@@ -212,18 +212,21 @@ follow-up.
 ## Monorepo layout
 
 A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust automation
-([ADR-0009](docs/adr/0009-pnpm-turborepo-monorepo.md)).
+([ADR-0009](docs/adr/0009-pnpm-turborepo-monorepo.md)). Three language stacks live side by side:
+**TypeScript** (`apps/`, `packages/`), **Rust** (`services/`, `xtask/`), and **Python** (`tools/`).
 
-| Path | What it is |
-|---|---|
-| `apps/web` | Next.js (App Router) web console; OIDC Auth Code + PKCE login against Keycloak ([ADR-0014](docs/adr/0014-keycloak-oidc-resource-server.md)) |
-| `packages/auth` | Shared OIDC/JWT helpers (token verification, claims, session cookie) |
-| `packages/tsconfig` | Shared TypeScript configs |
-| `services/control-plane` | Rust (Axum) control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. [README](services/control-plane/README.md) |
-| `services/agent-runner` | Rust per-task Job: bootstraps from the control plane, clones, indexes (pgvector + Neo4j), and runs the review agent. [README](services/agent-runner/README.md) |
-| `xtask` | Cargo `xtask` for Rust automation (`cargo xtask ci`, etc.) |
-| `docs/` | Documentation set, ADRs, RFCs, ways of working |
-| `deploy/` | Per-environment Helm values (`deploy/envs/`) consumed by the `ai-helm` chart; image tags promoted by argocd-image-updater (GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
+| Path | Stack | What it is |
+|---|---|---|
+| `apps/web` | TS | Next.js (App Router) web console; OIDC Auth Code + PKCE login against Keycloak ([ADR-0014](docs/adr/0014-keycloak-oidc-resource-server.md)). [README](apps/web/README.md) |
+| `packages/auth` | TS | Shared OIDC/JWT helpers (token verification, claims, session cookie) |
+| `packages/tsconfig` | TS | Shared TypeScript configs |
+| `services/control-plane` | Rust | Axum control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. [README](services/control-plane/README.md) |
+| `services/agent-runner` | Rust | Per-task Job: bootstraps from the control plane, clones, indexes (pgvector + Neo4j), and runs the review agent. [README](services/agent-runner/README.md) |
+| `services/config` | Rust | Shared config loader: one JSON file + `{env:VAR:-default}` substitution, used by both Rust services. [README](services/config/README.md) |
+| `xtask` | Rust | Cargo `xtask` workspace automation — the Rust side of `just` (`cargo xtask ci\|fmt\|lint\|test\|build`) |
+| `tools/dashboard-gen` | Python | Generates the Grafana dashboards-as-code into the Helm chart. [README](tools/dashboard-gen/README.md) |
+| `docs/` | — | Documentation set, ADRs, RFCs, ways of working |
+| `deploy/` | — | Per-environment Helm values (`deploy/envs/`) consumed by the `ai-helm` chart; image tags promoted by argocd-image-updater (GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
 
 ### Kubernetes layout
 

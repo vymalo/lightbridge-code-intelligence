@@ -10,7 +10,7 @@ import {
   type StatusVariant,
   statusVisual,
   type Task,
-} from "@/lib/tasks";
+} from "@/lib/domain/tasks";
 
 const DAY_MS = 86_400_000;
 const MONTH_DAY_FORMATTER = new Intl.DateTimeFormat("en", {

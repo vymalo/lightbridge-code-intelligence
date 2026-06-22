@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use agent_runner::client::ControlPlaneClient;
-use agent_runner::config::RunnerConfig;
+use agent_runner::bootstrap::client::ControlPlaneClient;
+use agent_runner::bootstrap::config::RunnerConfig;
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router, ServiceExt};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -70,7 +70,7 @@ impl GraphMcp {
 }
 
 /// Render a query result as a JSON string, or a recoverable error message for the model.
-fn render(result: anyhow::Result<Vec<agent_runner::client::SymbolHit>>) -> String {
+fn render(result: anyhow::Result<Vec<agent_runner::bootstrap::client::SymbolHit>>) -> String {
     match result.and_then(|hits| Ok(serde_json::to_string_pretty(&hits)?)) {
         Ok(json) => json,
         Err(error) => format!("error: {error:#}"),

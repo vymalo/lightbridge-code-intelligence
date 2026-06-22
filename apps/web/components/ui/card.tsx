@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { cn } from "@/lib/cn";
+import { cn } from "@/lib/utils/cn";
 
 /** Flat surface card on the daisyUI `card` primitive (ADR-0027): hairline border (`card-border`),
  * no shadow, base-200 surface. Header/body keep a dense, hairline-divided rhythm. */

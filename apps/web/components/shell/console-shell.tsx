@@ -1,10 +1,10 @@
 import { GitPullRequest, LayoutGrid, ListChecks, Settings, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { CommandPalette } from "@/components/command-palette";
-import { NavLink } from "@/components/nav-link";
+import { CommandPalette } from "@/components/shell/command-palette";
+import { NavLink } from "@/components/shell/nav-link";
 import { buttonClass } from "@/components/ui/button";
-import { githubAppInstallUrl } from "@/lib/config";
+import { githubAppInstallUrl } from "@/lib/utils/config";
 
 /** The console chrome (ADR-0016; grouped nav + ⌘K palette in ADR-0024): a left sidebar nav split
  * into hairline-separated groups + a slim top bar with a command palette, around contained content.
