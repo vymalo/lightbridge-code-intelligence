@@ -1,5 +1,14 @@
 # Indexing and Storage
 
+> **Current state vs design.** This document is partly aspirational. Today: embeddings are
+> OpenAI-compatible and the **model/dimensions are configurable** (the live deployment uses a 4096-dim
+> model over an internal gateway, not a 1536-dim one — [ADR-0018](adr/0018-openai-compatible-embeddings.md));
+> the structural graph is extracted by **Graphify** and written by the control plane
+> ([ADR-0019](adr/0019-graphify-cli-structural-graph.md)); pgvector currently runs **exact search (no
+> ANN index)**; and a review **reuses the base index** rather than maintaining a PR overlay
+> ([ADR-0025](adr/0025-review-reuses-base-index.md)) — the language enrichers, HNSW default, and
+> incremental PR-overlay sections below are the intended direction, not all built yet.
+
 ## Indexing goals
 
 The indexing pipeline builds two complementary views of the repository:

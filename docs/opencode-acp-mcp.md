@@ -1,5 +1,12 @@
 # OpenCode ACP and MCP Integration
 
+> **⚠️ Largely historical.** This document describes an early ACP-subprocess design. In practice the
+> runner drives OpenCode **headless** (`opencode run`), and that is being **replaced by a native Rust
+> agent loop** with structured tool calls ([ADR-0026](adr/0026-native-review-agent.md)). The retrieval
+> tools are thin clients of the control-plane API rather than standalone MCP servers in the review path
+> ([ADR-0020](adr/0020-mcp-servers-via-control-plane.md)). Read this for background; treat ADR-0026 and
+> ADR-0020 as the current truth.
+
 ## Why OpenCode here
 
 OpenCode is used as the task-time reasoning runtime. Lightbridge does not depend on it for system

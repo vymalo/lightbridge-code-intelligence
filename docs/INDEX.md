@@ -40,7 +40,8 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 2. [Components and data models](components-and-data-models.md)
 3. [GitHub App and Rust control plane](github-app-and-control-plane.md)
 4. [Indexing and storage](indexing-and-storage.md)
-5. [OpenCode ACP and MCP integration](opencode-acp-mcp.md)
+5. [Jobs and task lifecycle](jobs-and-lifecycle.md)
+6. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
 
 ### Platform engineer path
 1. [Architecture overview](architecture.md)
@@ -50,9 +51,10 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 ### Web & auth path
 1. [Architecture overview — Web & auth tier](architecture.md#web--auth-tier)
 2. [ADR-0006: Next.js (App Router) for the web UI](adr/0006-nextjs-app-router-web-ui.md)
-3. [ADR-0007: better-auth with a rust-backend delegation plugin](adr/0007-better-auth-rust-backend-plugin.md) (superseded by ADR-0014)
-4. [ADR-0014: Keycloak OIDC — web client + control-plane resource server](adr/0014-keycloak-oidc-resource-server.md)
-5. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
+3. [ADR-0014: Keycloak OIDC — web client + control-plane resource server](adr/0014-keycloak-oidc-resource-server.md) (supersedes the better-auth/rust-backend idea in [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md))
+4. [ADR-0023: permission-based authz (permissions claim, per-capability)](adr/0023-db-backed-rbac.md)
+5. [ADR-0027: daisyUI (dracula) design system](adr/0027-daisyui-design-system.md)
+6. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
 
 ## Design principles
 
@@ -62,5 +64,8 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 - Agent execution is isolated per task
 - All write actions are controller-validated
 - Security posture depends on trust level of source branch / fork
-- Authentication (authN) is delegated to our own portable Rust backend; authorization (authZ)
-  at the gateway is a separate concern (Envoy/Authorino + `lightbridge-authz`)
+- Authentication (authN) is **Keycloak OIDC** — the web console is an OIDC client and the control
+  plane a resource server ([ADR-0014](adr/0014-keycloak-oidc-resource-server.md), which supersedes the
+  earlier better-auth/rust-backend plugin idea in ADR-0007). Authorization (authZ) is
+  **permission-based**: the token carries a `permissions` list under a configurable claim, enforced
+  per-capability ([ADR-0023](adr/0023-db-backed-rbac.md))
