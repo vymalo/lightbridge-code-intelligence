@@ -1,6 +1,6 @@
 # ADR-0035: Capture 👍/👎 on posted reviews as a feedback signal
 
-- **Status:** Proposed
+- **Status:** Proposed (capture mechanism **corrected** below: GitHub does not webhook reactions — poll the REST API instead)
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement
@@ -29,16 +29,24 @@ Two parts; the first is a prerequisite and lands first regardless of the rest:
 1. **Persist created IDs (prerequisite).** On write-back, capture and store `github_review_id` and each
    inline comment's `github_comment_id`, correlated to the finding that produced it (extend the
    `reviews`/findings rows or add a `review_comments` table). Cheap, independently useful, and unblocks
-   everything below — **do this now even before the feature ships.**
-2. **Capture inbound reactions.** Subscribe the webhook to reaction events
-   (`pull_request_review_comment` / `issue_comment` reactions). GitHub sends both `created` and
-   `deleted` actions (a user can un-react), so handle both: on **created** for a comment id we own,
-   upsert a row in **`review_feedback`** `(finding ref, github_comment_id, reactor, reaction,
-   created_at)`; on **deleted**, remove (or tombstone) the matching row so aggregated counts stay in
-   sync with GitHub. Aggregate per finding and per run; **expose in the dashboard run page** ([ADR-0016](0016-dashboard-information-architecture.md))
-   as 👍/👎 counts on each finding and a run-level summary. The dataset (finding text + transcript
+   everything below — **do this now even before the feature ships.** Note: GitHub's create-review
+   response is a single review object (id + `html_url`); the per-inline-comment ids are **not** in it,
+   so capturing them needs a follow-up `GET /pulls/{pr}/reviews/{id}/comments` correlated back to
+   findings by `(path, line)`.
+2. **Capture reactions — by polling, not a webhook (CORRECTED).** GitHub does **not** emit webhook
+   events for reactions (verified against the webhook-events docs: there is no `reaction` event, and
+   `issue_comment`/`pull_request_review_comment` fire on comment create/edit/delete, never on a
+   reaction). So the original "subscribe to reaction events" plan is infeasible. Instead, a **periodic
+   job polls the reactions REST API** for the comment/review ids we own
+   (`GET …/comments/{id}/reactions`) and **reconciles** the result into **`review_feedback`**
+   `(finding ref, github_comment_id, reactor, reaction, created_at)`: new reactions are upserted, and a
+   reaction that has disappeared is deleted/tombstoned — reconciliation gives us the "un-react"
+   ("deleted") behaviour for free without a webhook. Aggregate per finding and per run; **expose in the
+   dashboard run page** ([ADR-0016](0016-dashboard-information-architecture.md)) as 👍/👎 counts on each
+   finding and a run-level summary. The dataset (finding text + transcript
    [ADR-0034](0034-agent-run-transcript-and-observability.md) + verdict) becomes the seed for offline
-   evaluation/tuning.
+   evaluation/tuning. The poller fits the existing control-plane background loops (dispatcher/reaper) or
+   the jobs sidecar ([ADR-0028](0028-agent-job-control-sidecar.md)).
 
 ### Consequences
 

@@ -131,15 +131,19 @@ impl GithubApp {
         pr: i64,
         body: &str,
         comments: &[ReviewComment],
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<PostedReview> {
         use anyhow::Context;
         let payload = serde_json::json!({
             "body": body,
             "event": "COMMENT",
             "comments": comments,
         });
+        // The create-review response is a single review object — `id` + `html_url`. It does NOT carry
+        // the per-inline-comment ids (those need a follow-up GET .../reviews/{id}/comments); we keep
+        // the review id now so feedback (ADR-0035) can correlate back to this run.
         #[derive(Deserialize)]
         struct ReviewResponse {
+            id: Option<i64>,
             html_url: Option<String>,
         }
         let review: ReviewResponse = self
@@ -160,7 +164,10 @@ impl GithubApp {
             .json()
             .await
             .context("parsing PR review response")?;
-        Ok(review.html_url)
+        Ok(PostedReview {
+            id: review.id,
+            html_url: review.html_url,
+        })
     }
 
     /// Post a plain comment on an issue or PR thread (`POST issues/{n}/comments`). Used for the `ask`
@@ -339,6 +346,14 @@ pub struct ReviewComment {
     pub line: u32,
     pub side: &'static str,
     pub body: String,
+}
+
+/// The result of posting a PR review: the GitHub review `id` (kept so feedback can correlate back to
+/// the run, ADR-0035) and its `html_url` permalink. Both `Option` since GitHub may omit them.
+#[derive(Debug, Default)]
+pub struct PostedReview {
+    pub id: Option<i64>,
+    pub html_url: Option<String>,
 }
 
 #[cfg(test)]
