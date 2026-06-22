@@ -307,7 +307,8 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
             f.title,
             f.file,
             f.line,
-            f.body
+            // Indent continuation lines so a multi-line body stays inside the list item (Gemini #153).
+            f.body.replace('\n', "\n  ")
         ));
         for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
             body.push_str(&format!("\n  - {link}"));
