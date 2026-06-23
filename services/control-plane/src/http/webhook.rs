@@ -110,27 +110,14 @@ fn mentions_handle(body: &str, handle: &str) -> bool {
 /// comment can't blow up the prompt.
 const MAX_INSTRUCTION_CHARS: usize = 2_000;
 
-/// The free-text instruction in an `@<handle> …` comment: the body with the leading `@<handle>`
-/// stripped, trimmed, and length-bounded (#138). Returns `None` for a bare mention (the caller then
-/// defaults to a plain `review`). A parsed instruction equal to the reserved `index` command is also
-/// treated as `None`, so a comment can never masquerade as the system's index task (the runner skips
-/// review on `command == "index"`).
-fn parse_instruction(body: &str, handle: &str) -> Option<String> {
-    let trimmed = body.trim_start();
-    let mention = format!("@{handle}");
-    // Re-verify the leading mention so this is correct standalone; `is_char_boundary` guards the slice
-    // against a multi-byte char straddling the mention length (e.g. a non-ASCII body).
-    if trimmed.len() < mention.len()
-        || !trimmed.is_char_boundary(mention.len())
-        || !trimmed[..mention.len()].eq_ignore_ascii_case(&mention)
-    {
-        return None;
-    }
-    let instruction = trimmed[mention.len()..].trim();
-    if instruction.is_empty() || instruction.eq_ignore_ascii_case("index") {
-        return None;
-    }
-    Some(instruction.chars().take(MAX_INSTRUCTION_CHARS).collect())
+/// The command carried from an `@<handle> …` comment into the task/prompt: the WHOLE comment body,
+/// trimmed and length-bounded (#138). We pass the full message — NOT just the text after the handle —
+/// so the agent (which knows its own name from the system prompt) sees the complete request, including
+/// co-mentions like `@<handle> & /gemini please review this` that stripping the handle would mangle.
+/// `mentions_handle` already gates that the comment is addressed to us and the mention leads, and since
+/// the body therefore starts with `@<handle>` it can never exactly equal the reserved `index` command.
+fn command_from_comment(body: &str) -> String {
+    body.trim().chars().take(MAX_INSTRUCTION_CHARS).collect()
 }
 
 /// `pull_request` events. `opened` → the automatic first review. `closed` → cancel the PR's active
@@ -319,31 +306,28 @@ async fn handle_issue_comment(
         (None, None)
     };
 
-    let run_epoch = crate::db::next_run_epoch(
-        pool,
-        repository_id,
-        target_type,
-        number,
-        "review",
-        head_sha.as_deref(),
-    )
-    .await
-    .unwrap_or(0);
-    // Carry the user's free-text instruction into the task → prompt (#138); a bare @mention defaults
-    // to a plain review. The agent decides review-vs-answer from the instruction and acts via its
-    // tools — the run kind is recorded by the control plane at finalize (emergent, ADR-0037), not
-    // classified here.
+    // Carry the WHOLE comment into the task → prompt (#138): the agent knows its own name from the
+    // system prompt, so it interprets "@<handle> please review this" — and co-mentions like
+    // "@<handle> & /gemini …" — itself; stripping the handle mangled those. The agent decides
+    // review-vs-answer from the text and acts via its tools; the run kind is recorded at finalize
+    // (emergent, ADR-0037), not classified here.
+    let command_text = command_from_comment(body);
+    // An @mention is an explicit human command: it must ALWAYS create a task. True webhook
+    // redeliveries are already deduped upstream by the `github_deliveries` delivery-id PRIMARY KEY,
+    // so content-idempotency adds nothing here — and previously dropped legitimate re-requests when
+    // the same wording landed on an unchanged head. `create_explicit_task` folds the next epoch into
+    // the INSERT, so every mention lands a fresh, non-colliding row atomically. `run_epoch` is
+    // ignored by that path (the INSERT computes it).
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
         github_delivery_id: delivery_id.to_string(),
         target_type: target_type.to_string(),
         target_id: number,
-        command_text: parse_instruction(body, &state.app_handle)
-            .unwrap_or_else(|| "review".to_string()),
+        command_text,
         base_sha,
         head_sha,
-        run_epoch,
+        run_epoch: 0,
     };
     tracing::info!(
         delivery_id,
@@ -351,7 +335,33 @@ async fn handle_issue_comment(
         kind = target_type,
         "@mention requested"
     );
-    create_review_task(state, pool, task, owner, name, delivery_id).await;
+    create_explicit_review_task(state, pool, task, owner, name, delivery_id).await;
+}
+
+/// Insert an **explicit @mention** task (always lands a row, never content-deduped) and, on insert,
+/// 👀 the PR (spawned so external GitHub calls can't block the webhook's ~10s deadline). The auto
+/// open path uses [`create_review_task`] instead, which keeps content-idempotency.
+async fn create_explicit_review_task(
+    state: &crate::AppState,
+    pool: &sqlx::PgPool,
+    task: crate::db::NewTask,
+    owner: &str,
+    name: &str,
+    delivery_id: &str,
+) {
+    let (pr, installation_id) = (task.target_id, task.installation_id);
+    match crate::db::create_explicit_task(pool, &task).await {
+        Ok(task_id) => {
+            crate::http::metrics::task_created();
+            tracing::info!(delivery_id, %task_id, pr, "created explicit review task");
+            let state = state.clone();
+            let (owner, name) = (owner.to_string(), name.to_string());
+            tokio::spawn(async move {
+                react_seen(&state, &owner, &name, installation_id, pr).await;
+            });
+        }
+        Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create explicit task"),
+    }
 }
 
 /// Insert a review task and, on a real insert, 👀 the PR (spawned so external GitHub calls can't
@@ -616,54 +626,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_instruction_extracts_free_text_after_the_handle() {
-        let h = "lightbridge-assistant";
-        // Free text is captured, the @handle stripped, surrounding space trimmed.
+    fn command_from_comment_keeps_the_whole_message() {
+        // The full comment is preserved (handle NOT stripped), surrounding whitespace trimmed — so the
+        // agent sees its own name and any co-mentions and interprets them itself.
         assert_eq!(
-            parse_instruction("@lightbridge-assistant can you propose a better impl?", h)
-                .as_deref(),
-            Some("can you propose a better impl?")
+            command_from_comment("@lightbridge-assistant please review this"),
+            "@lightbridge-assistant please review this"
         );
-        // Case-insensitive handle + leading whitespace.
+        // Co-mention that the old handle-stripping mangled into "& /gemini please review this".
         assert_eq!(
-            parse_instruction("  @Lightbridge-Assistant   focus on the auth path", h).as_deref(),
-            Some("focus on the auth path")
+            command_from_comment("  @lightbridge-assistant & /gemini please review this  "),
+            "@lightbridge-assistant & /gemini please review this"
         );
-        // Multiline body: leading mention stripped, the rest (incl. newlines) kept and trimmed.
+        // Multiline body kept intact (trimmed at the ends).
         assert_eq!(
-            parse_instruction(
-                "@lightbridge-assistant review this\nand check error handling",
-                h
-            )
-            .as_deref(),
-            Some("review this\nand check error handling")
+            command_from_comment("@lightbridge-assistant review this\nand check error handling"),
+            "@lightbridge-assistant review this\nand check error handling"
         );
     }
 
     #[test]
-    fn parse_instruction_defaults_for_bare_or_unsafe_bodies() {
-        let h = "lightbridge-assistant";
-        // Bare mention (with/without trailing space) → None → caller defaults to "review".
-        assert_eq!(parse_instruction("@lightbridge-assistant", h), None);
-        assert_eq!(parse_instruction("@lightbridge-assistant   \n  ", h), None);
-        // A comment that would masquerade as the reserved `index` command → None (no review skip).
-        assert_eq!(parse_instruction("@lightbridge-assistant index", h), None);
-        assert_eq!(parse_instruction("@lightbridge-assistant INDEX", h), None);
-        // Not addressed to us → None (mentions_handle already gates this, but be standalone-correct).
-        assert_eq!(
-            parse_instruction("cc @lightbridge-assistant please", h),
-            None
-        );
-        // Non-ASCII immediately after `@` must not panic the slice.
-        assert_eq!(parse_instruction("@日本語 hello", h), None);
-    }
-
-    #[test]
-    fn parse_instruction_bounds_length() {
-        let h = "bot";
+    fn command_from_comment_bounds_length() {
         let long = format!("@bot {}", "x".repeat(MAX_INSTRUCTION_CHARS + 500));
-        let parsed = parse_instruction(&long, h).expect("some");
-        assert_eq!(parsed.chars().count(), MAX_INSTRUCTION_CHARS);
+        assert_eq!(
+            command_from_comment(&long).chars().count(),
+            MAX_INSTRUCTION_CHARS
+        );
     }
 
     #[test]
