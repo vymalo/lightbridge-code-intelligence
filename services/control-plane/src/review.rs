@@ -303,10 +303,12 @@ pub fn validate(
 /// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
 /// (Some vs None), not on emptiness.
 fn inline_body(finding: &Finding) -> String {
-    // Standardized finding format (epic #89): `<LEVEL>: <title>` → explanation → committable
-    // suggestion → resources.
+    // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
+    // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
+    // which GitHub renders as a line break in comments) so the level reads as a header, not a prefix
+    // crowding the title.
     let mut body = format!(
-        "{} **{}**\n\n{}",
+        "{}\n**{}**\n\n{}",
         finding.level_badges(),
         finding.title,
         finding.body
@@ -352,11 +354,13 @@ fn normalize_path(path: &str) -> String {
 pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]) -> String {
     let mut body = format!("## Lightbridge review\n\n{summary}");
 
-    // A finding as a `- badges **title** — `file:line`` bullet + indented resource links. Shared by
-    // the changed-files notes and the out-of-scope section so every finding reads the same.
+    // A finding as a bullet whose first line is the badge row, with the bold title + `file:line` on the
+    // next (indented) line and the body under that — so the badges never share a line with the title,
+    // matching the inline rendering. The 2-space indent keeps the continuation lines inside the list
+    // item (Gemini #153). Shared by the changed-files notes and the out-of-scope section.
     let render_finding = |body: &mut String, f: &Finding| {
         body.push_str(&format!(
-            "\n- {} **{}** — `{}:{}`\n  {}",
+            "\n- {}\n  **{}** — `{}:{}`\n  {}",
             f.level_badges(),
             f.title,
             f.file,
@@ -461,6 +465,11 @@ mod tests {
         );
         assert!(body.contains("![security](https://img.shields.io/badge/security-red)"));
         assert!(body.contains("**Null deref**"));
+        // The badge row sits on its own line, with the bold title on the next line (not crowding it).
+        assert!(
+            body.contains(")\n**Null deref**"),
+            "badges and title on separate lines: {body}"
+        );
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
         assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));
@@ -610,6 +619,11 @@ mod tests {
         assert!(body.contains("Looks risky."));
         assert!(body.contains("Issue"));
         assert!(body.contains("`a.rs:5`"));
+        // The bullet's badge row is on its own line; the title + file:line follow on the next line.
+        assert!(
+            body.contains("\n  **Issue** — `a.rs:5`"),
+            "badges and title on separate lines in the bullet: {body}"
+        );
         // Out-of-scope findings are surfaced in a collapsible section (not dropped, ADR-0033) but
         // DEMOTED — informational header, terse title + file, and crucially NO severity badge (they
         // are pre-existing, not findings on this change).
