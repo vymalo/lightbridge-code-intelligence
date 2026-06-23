@@ -939,7 +939,8 @@ async fn add_review_labels(
     }
 }
 
-/// The runner's status report. `detail` is optional free text for diagnostics (not persisted yet).
+/// The runner's status report. `detail` is optional free text for diagnostics — persisted to the
+/// task's `error_detail` (#137) so the console can surface why a run did not post a review.
 #[derive(Debug, Deserialize)]
 pub struct StatusUpdate {
     pub status: String,
@@ -963,7 +964,11 @@ pub async fn set_status(
     if let Some(detail) = &update.detail {
         tracing::info!(task_id = %id, status = %update.status, detail, "runner status report");
     }
-    match crate::db::set_task_status(pool, id, &update.status).await {
+    // #137: persist the runner's free-text `detail` (e.g. a failure reason, or a "posted nothing"
+    // no-op) so the console can surface why a run did not post a review. Previously this was only
+    // logged and dropped ("not persisted yet"), which is why a 14-day audit found 98 of 144 (~68%)
+    // "succeeded" PR-review tasks had posted nothing with no recorded reason.
+    match crate::db::set_task_status(pool, id, &update.status, update.detail.as_deref()).await {
         Ok(true) => {
             // ADR-0037 idempotency: a runner (re)starting its task clears any buffer left by a prior
             // attempt, so a retry accumulates from empty rather than appending to a partial review.

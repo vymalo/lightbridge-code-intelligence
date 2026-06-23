@@ -60,6 +60,9 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
   const now = Date.now();
   const variant = statusVisual(task.status).variant;
   const isError = variant === "error";
+  // A run that finished "succeeded" but recorded a reason posted nothing (#137): a silent no-op, not
+  // a real clean review. Surface it so it isn't mistaken for a passing review.
+  const silentNoOp = variant === "success" && Boolean(task.error_detail);
   // A run is cancellable while it's still pending or active; the button also needs `task:cancel`.
   const cancellable = variant === "pending" || variant === "active";
   const canCancel = cancellable && hasPermission(await currentClaims(), "task:cancel");
@@ -87,9 +90,20 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         <Card className="border-error">
           <CardBody>
             <StatusLine tone="error">
-              This run ended in a {statusVisual(task.status).label.toLowerCase()} state. Detailed
-              error output will appear here once the agent runner reports results.
+              {task.error_detail
+                ? `Review did not post: ${task.error_detail}`
+                : `This run ended in a ${statusVisual(
+                    task.status,
+                  ).label.toLowerCase()} state. No reason was reported by the agent runner.`}
             </StatusLine>
+          </CardBody>
+        </Card>
+      )}
+
+      {silentNoOp && (
+        <Card className="border-warning">
+          <CardBody>
+            <StatusLine tone="error">Review did not post: {task.error_detail}</StatusLine>
           </CardBody>
         </Card>
       )}
