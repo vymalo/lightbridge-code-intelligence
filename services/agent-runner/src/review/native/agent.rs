@@ -6,14 +6,19 @@
 //! / `add_comment` is buffered control-plane-side; `finish` ends the run and the caller flushes the
 //! buffer as one grouped review. The loop is bounded ([`MAX_TURNS`]) and treats a tool/argument error
 //! as a recoverable turn (the model gets the error text back and retries), only failing on `abort`, an
-//! exhausted turn budget, or a transport error. A run that fails this way is **never finalized**, so a
-//! mid-run death posts nothing (crash-safe). Cancellation comes for free: `run()` races the whole task
-//! against the self-cancel poll, so a cancelled task drops the in-flight future.
+//! exhausted turn budget, a deterministic transport error, or the per-run circuit breaker tripping. A
+//! transport layer (ADR-0039) wraps each turn with a generous timeout, bounded retry/backoff on
+//! transient failures, optional failover to a secondary model, and a per-run circuit breaker; the HTTP
+//! error body is folded into the error so a failed run is legible. A run that fails is **never
+//! finalized**, so a mid-run death posts nothing (crash-safe). Cancellation comes for free: `run()`
+//! races the whole task against the self-cancel poll, so a cancelled task drops the in-flight future.
+
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use uuid::Uuid;
 
-use super::chat::{ChatClient, ChatMessage, ChatParams};
+use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy};
 use super::tools::{tool_defs, ToolOutcome, Tools, ADD_REVIEW_COMMENT};
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
@@ -56,8 +61,36 @@ pub async fn run_native_agent(
     // it afterwards (even on error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
 ) -> anyhow::Result<()> {
-    let chat = ChatClient::new(&review.base_url, &review.api_key, &review.model)
-        .with_attribution(attribution);
+    let chat = ChatClient::with_timeout(
+        &review.base_url,
+        &review.api_key,
+        &review.model,
+        Duration::from_secs(review.resilience.request_timeout_secs),
+    )
+    .with_attribution(attribution);
+    // Optional secondary model for failover (ADR-0039): same gateway/key, different model id.
+    let fallback = review
+        .resilience
+        .fallback_model
+        .as_deref()
+        .map(|m| chat.for_model(m));
+    let retry_policy = RetryPolicy {
+        max_retries: review.resilience.max_retries,
+        ..RetryPolicy::default()
+    };
+    // Proof-of-work (ADR-0039): a run is legible from pod logs alone — which model, which gateway, and
+    // the resilience policy in force. host-only for the base URL (the path/key are uninteresting/secret).
+    tracing::info!(
+        task_id = %task_id,
+        model = %review.model,
+        fallback_model = review.resilience.fallback_model.as_deref().unwrap_or("(none)"),
+        base_url_host = %base_url_host(&review.base_url),
+        request_timeout_secs = review.resilience.request_timeout_secs,
+        max_retries = review.resilience.max_retries,
+        circuit_breaker_threshold = review.resilience.circuit_breaker_threshold,
+        "review agent starting"
+    );
+
     let tools = Tools {
         client,
         embedder,
@@ -78,14 +111,100 @@ pub async fn run_native_agent(
 
     let mut messages = build_messages(review, command, diff, repo_instructions);
 
+    // Per-run circuit breaker (ADR-0039): consecutive turn-failures. The Job is ephemeral, so this is
+    // deliberately per-process — no cross-process state. Resets on the first turn that succeeds.
+    let mut consecutive_failures = 0u32;
+    let breaker_threshold = review.resilience.circuit_breaker_threshold;
+
     for turn in 0..MAX_TURNS {
-        let completion = chat
-            .complete(&messages, &defs, params)
+        let turn_started = Instant::now();
+        // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
+        // secondary model (when configured) once for this turn. The outcome is either a completion, or
+        // a turn-level error we classify before deciding whether to keep going.
+        let turn_result = match chat
+            .complete_with_retry(&messages, &defs, params, retry_policy)
             .await
-            .with_context(|| format!("agent chat turn {turn}"))?;
+        {
+            Ok(c) => Ok(c),
+            Err(primary_err) => match (&fallback, primary_err.transient) {
+                (Some(fb), true) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        turn,
+                        primary_model = %review.model,
+                        fallback_model = %fb.model(),
+                        error = %primary_err,
+                        "primary model exhausted retries; failing over to secondary model"
+                    );
+                    fb.complete_with_retry(&messages, &defs, params, retry_policy)
+                        .await
+                        .map_err(|fb_err| ChatTurnError {
+                            error: fb_err
+                                .error
+                                .context(format!("failover model {} also failed", fb.model())),
+                            transient: fb_err.transient,
+                        })
+                }
+                _ => Err(ChatTurnError {
+                    error: primary_err.error,
+                    transient: primary_err.transient,
+                }),
+            },
+        };
+
+        let completion = match turn_result {
+            Ok(c) => {
+                // The turn produced a model reply → the chain is healthy again.
+                consecutive_failures = 0;
+                c
+            }
+            Err(turn_err) => {
+                // A deterministic failure (4xx other than 429, a malformed body) won't get better by
+                // trying again — fail the run now with the legible reason. A transient failure counts
+                // toward the per-run circuit breaker: keep going until it trips or the budget runs out,
+                // rather than wasting the whole budget against a chain that's clearly down.
+                if !turn_err.transient {
+                    return Err(turn_err.error).with_context(|| format!("agent chat turn {turn}"));
+                }
+                consecutive_failures += 1;
+                tracing::warn!(
+                    task_id = %task_id,
+                    turn,
+                    consecutive_failures,
+                    breaker_threshold,
+                    error = %turn_err.error,
+                    "transient turn failure after retries (and failover, if configured)"
+                );
+                if breaker_threshold > 0 && consecutive_failures >= breaker_threshold {
+                    return Err(turn_err.error).with_context(|| {
+                        format!(
+                            "review agent circuit breaker tripped after {consecutive_failures} \
+                             consecutive turn failures (threshold {breaker_threshold}); failing fast \
+                             at turn {turn}"
+                        )
+                    });
+                }
+                continue;
+            }
+        };
+        let turn_latency_ms = turn_started.elapsed().as_millis() as u64;
+
         let usage = completion.usage;
         let assistant = completion.message;
         let calls = assistant.tool_calls.clone();
+
+        // One concise line per turn (ADR-0034/0039): index, tools called, tokens, wall-clock latency.
+        // Full content lives in the transcript; this keeps pod logs legible without the payloads.
+        let tool_names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+        tracing::info!(
+            task_id = %task_id,
+            turn,
+            tools = ?tool_names,
+            prompt_tokens = usage.and_then(|u| u.prompt_tokens).unwrap_or(-1),
+            completion_tokens = usage.and_then(|u| u.completion_tokens).unwrap_or(-1),
+            latency_ms = turn_latency_ms,
+            "agent turn complete"
+        );
         // Record the assistant turn in the transcript (ADR-0034): its reasoning + tool calls + tokens.
         transcript.push(TranscriptEntry {
             role: "assistant".to_string(),
@@ -117,6 +236,14 @@ pub async fn run_native_agent(
         let mut should_finish = false;
         let mut abort_reason = None;
         for call in &calls {
+            let tool = call.function.name.as_str();
+            // One concise line per tool dispatch; for the mediated write tools, note the buffer effect.
+            match tool {
+                ADD_REVIEW_COMMENT | "add_comment" => tracing::info!(
+                    task_id = %task_id, turn, tool, "tool dispatch (finding/reply buffered)"
+                ),
+                _ => tracing::info!(task_id = %task_id, turn, tool, "tool dispatch"),
+            }
             match tools.dispatch(call).await {
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
@@ -193,6 +320,25 @@ fn build_messages(
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
+/// A turn-level chat failure after retries (and failover, if configured), carrying whether the
+/// underlying error was transient — the loop keeps a transient one going toward the circuit breaker
+/// but fails the run immediately on a deterministic one.
+struct ChatTurnError {
+    error: anyhow::Error,
+    transient: bool,
+}
+
+/// The host of a base URL for logging — keeps the path/query (and any embedded token) out of logs
+/// while still identifying which gateway a run hit. Falls back to a redacted marker if unparseable.
+fn base_url_host(base_url: &str) -> String {
+    base_url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .map(|hostport| hostport.to_string())
+        .unwrap_or_else(|| "(unparseable)".to_string())
+}
+
 /// `s` truncated to at most `max` bytes, never slicing through a multi-byte char.
 fn truncate_on_boundary(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -267,6 +413,13 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            // Fast resilience defaults so the loop tests don't sleep on the (mocked) failure paths.
+            resilience: crate::bootstrap::config::ResilienceConfig {
+                request_timeout_secs: 5,
+                max_retries: 0,
+                circuit_breaker_threshold: 3,
+                fallback_model: None,
+            },
         }
     }
 
@@ -417,6 +570,95 @@ mod tests {
         .await
         .expect_err("abort is an error");
         assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
+    }
+
+    // ── Failover: the primary model 5xx's; the configured secondary model handles the turn and the
+    // run finishes cleanly (ADR-0039). Mocks are matched on the request body's `model` field. ──────
+    #[tokio::test]
+    async fn native_loop_fails_over_to_secondary_model() {
+        use wiremock::matchers::body_partial_json;
+
+        let chat = MockServer::start().await;
+        // Primary model "m" always 5xx (transient → retries exhaust → failover).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({ "model": "m" })))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&chat)
+            .await;
+        // Secondary model "m-fallback" finishes immediately.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({ "model": "m-fallback" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_reply(
+                "finish",
+                r#"{"summary":"handled by fallback"}"#,
+            )))
+            .mount(&chat)
+            .await;
+
+        // No diff → no inline finalize; only the summary endpoint is hit on finish.
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.resilience.fallback_model = Some("m-fallback".to_string());
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("fallback model finishes the run");
+    }
+
+    // ── Circuit breaker: the chain is down (persistent 5xx) and no fallback is set, so the run fails
+    // fast at the breaker threshold instead of consuming the whole turn budget (ADR-0039). ─────────
+    #[tokio::test]
+    async fn native_loop_circuit_breaker_trips_fast() {
+        let chat = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&chat)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.resilience.circuit_breaker_threshold = 1; // trip on the first failure
+        let cpc = ControlPlaneClient::new("http://unused", "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let err = run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("breaker trips");
+        assert!(
+            format!("{err:#}").contains("circuit breaker tripped"),
+            "got: {err:#}"
+        );
     }
 
     // ── Negative e2e: a model that never finishes is cut off by the turn budget ─────────────────

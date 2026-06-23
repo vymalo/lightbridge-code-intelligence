@@ -17,6 +17,22 @@ const DEFAULT_AGENT_CONFIG_PATH: &str = "/etc/lightbridge/agent.json";
 /// Default ceiling on the diff pasted into the review prompt (chars).
 pub const DEFAULT_MAX_DIFF_CHARS: usize = 60_000;
 
+/// Default per-request timeout for the chat HTTP client (seconds). Deliberately **generous**: eaig can
+/// legitimately take up to ~2 minutes to answer a turn, so an aggressive timeout would kill a
+/// slow-but-valid response (ADR-0039). Overridable via `LLM_REQUEST_TIMEOUT_SECS` /
+/// `review.request_timeout_secs`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
+
+/// Default number of **retries** (so total attempts = retries + 1) on a transient turn failure
+/// (connect/timeout, HTTP 429, HTTP 5xx). 4xx other than 429 is deterministic and never retried.
+/// Overridable via `LLM_MAX_RETRIES` / `review.max_retries`.
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// Default per-run circuit-breaker threshold: after this many *consecutive* turn failures the run
+/// fails fast rather than burning the whole turn budget (ADR-0039). Overridable via
+/// `LLM_CIRCUIT_BREAKER_THRESHOLD` / `review.circuit_breaker_threshold`.
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
 /// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
@@ -54,6 +70,18 @@ pub struct ReviewFile {
     pub top_p: Option<f64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub max_tokens: Option<i64>,
+    /// Resilience knobs (ADR-0039). All optional — unset falls back to the safe defaults above so a
+    /// deploy works without an ai-helm values change. Numeric-string tolerant for `{env:…}` values.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub max_retries: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub circuit_breaker_threshold: Option<u64>,
+    /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
+    /// (ADR-0039). Unset = single-model behaviour (unchanged).
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -161,6 +189,72 @@ pub struct ReviewConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// Resilience policy for the LLM transport: timeout, retry/backoff, circuit breaker, failover
+    /// (ADR-0039). Always present (defaults applied at resolve time).
+    pub resilience: ResilienceConfig,
+}
+
+/// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
+/// per turn, so the timeout is deliberately generous; retries are bounded and only fire on transient
+/// failures; a per-run circuit breaker fails fast before the turn budget is exhausted; an optional
+/// secondary model provides config-gated failover.
+#[derive(Debug, Clone)]
+pub struct ResilienceConfig {
+    /// Per-request timeout (seconds) for one chat round-trip.
+    pub request_timeout_secs: u64,
+    /// Retries on a transient turn failure (total attempts = `max_retries + 1`).
+    pub max_retries: u32,
+    /// Consecutive turn-failures before the per-run circuit breaker trips and the run fails fast.
+    pub circuit_breaker_threshold: u32,
+    /// Optional secondary model to fail over to once the primary exhausts its retries on a turn.
+    pub fallback_model: Option<String>,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+            fallback_model: None,
+        }
+    }
+}
+
+impl ResilienceConfig {
+    /// From env vars, each falling back to the safe default when unset/unparseable. Used by the
+    /// env-config path; the file-config path builds this from the `review.*` fields.
+    fn from_env() -> Self {
+        Self {
+            request_timeout_secs: parse_env_u64("LLM_REQUEST_TIMEOUT_SECS")
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_retries: parse_env_u64("LLM_MAX_RETRIES")
+                .map(|n| n as u32)
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            circuit_breaker_threshold: parse_env_u64("LLM_CIRCUIT_BREAKER_THRESHOLD")
+                .map(|n| n as u32)
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
+            fallback_model: std::env::var("LLM_FALLBACK_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// Parse a `u64` env var, returning `None` when unset, empty, or unparseable (the caller applies its
+/// own default). A bad value is logged so a fat-fingered env is diagnosable rather than silently ignored.
+fn parse_env_u64(name: &str) -> Option<u64> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(var = name, value = %raw, "ignoring non-numeric env value; using default");
+                None
+            }
+        },
+        _ => None,
+    }
 }
 
 impl ReviewConfig {
@@ -183,6 +277,7 @@ impl ReviewConfig {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            resilience: ResilienceConfig::from_env(),
         }))
     }
 
@@ -205,6 +300,36 @@ impl ReviewConfig {
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
+            // File config wins when set, else the env (so an operator can still tune via env even with
+            // a ConfigMap mounted), else the safe default.
+            resilience: ResilienceConfig {
+                request_timeout_secs: r
+                    .request_timeout_secs
+                    .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+                max_retries: r
+                    .max_retries
+                    .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
+                    .map(|n| n as u32)
+                    .unwrap_or(DEFAULT_MAX_RETRIES),
+                circuit_breaker_threshold: r
+                    .circuit_breaker_threshold
+                    .or_else(|| parse_env_u64("LLM_CIRCUIT_BREAKER_THRESHOLD"))
+                    .map(|n| n as u32)
+                    .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
+                fallback_model: r
+                    .fallback_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        std::env::var("LLM_FALLBACK_MODEL")
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    }),
+            },
         }))
     }
 }
@@ -265,6 +390,10 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                request_timeout_secs: None,
+                max_retries: None,
+                circuit_breaker_threshold: None,
+                fallback_model: None,
             }),
         };
         let err =
