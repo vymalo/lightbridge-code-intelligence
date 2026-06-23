@@ -744,40 +744,60 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
 ///
 /// The `run_epoch` is folded into the INSERT — `COALESCE(MAX(run_epoch), -1) + 1` over the SAME
 /// columns as the idempotency index (minus `run_epoch`), using the REAL `command_text` — so it is
-/// computed and consumed in a single statement. That is atomic and collision-free: two
-/// near-simultaneous deliveries each get a fresh, distinct epoch, with no TOCTOU window and no
-/// `ON CONFLICT` drop. On insert, notifies [`TASK_QUEUED_CHANNEL`] like [`create_task`].
+/// computed and consumed in a single statement.
+///
+/// That subquery+insert is NOT atomic under READ COMMITTED: two near-simultaneous deliveries for the
+/// same natural key can each read the same `MAX` and collide on `tasks_idempotency_idx` (`23505`).
+/// We **retry** on that unique violation (a fresh `MAX` is computed each attempt, so the loser just
+/// lands the next epoch) — bounded, so a genuinely persistent conflict can't spin forever. This keeps
+/// the "an explicit mention always lands a task" guarantee even under concurrency. On insert, notifies
+/// [`TASK_QUEUED_CHANNEL`] like [`create_task`].
 pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Error> {
-    let id = Uuid::new_v4();
-    let new_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-           (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
-            WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
-              AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
-           'queued') \
-         RETURNING id",
-    )
-    .bind(id)
-    .bind(task.repository_id)
-    .bind(task.installation_id)
-    .bind(&task.github_delivery_id)
-    .bind(&task.target_type)
-    .bind(task.target_id)
-    .bind(&task.command_text)
-    .bind(&task.base_sha)
-    .bind(&task.head_sha)
-    .fetch_one(pool)
-    .await?;
-
-    // Wake a listening dispatcher; harmless if none is connected (the dispatcher also polls).
-    let _ = sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(TASK_QUEUED_CHANNEL)
-        .bind(new_id.to_string())
-        .execute(pool)
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let id = Uuid::new_v4();
+        let result = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
+             target_id, command_text, base_sha, head_sha, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+               (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
+                WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
+                  AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
+               'queued') \
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(task.repository_id)
+        .bind(task.installation_id)
+        .bind(&task.github_delivery_id)
+        .bind(&task.target_type)
+        .bind(task.target_id)
+        .bind(&task.command_text)
+        .bind(&task.base_sha)
+        .bind(&task.head_sha)
+        .fetch_one(pool)
         .await;
-    Ok(new_id)
+        match result {
+            Ok(new_id) => {
+                // Wake a listening dispatcher; harmless if none is connected (it also polls).
+                let _ = sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(TASK_QUEUED_CHANNEL)
+                    .bind(new_id.to_string())
+                    .execute(pool)
+                    .await;
+                return Ok(new_id);
+            }
+            // Lost the epoch race — recompute MAX and try the next epoch.
+            Err(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some("23505") && attempt < MAX_ATTEMPTS =>
+            {
+                tracing::debug!(attempt, "explicit-task epoch race (23505); retrying");
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Cancel a PR's active tasks (queued/running/posting_result) — used when the PR is closed so its
