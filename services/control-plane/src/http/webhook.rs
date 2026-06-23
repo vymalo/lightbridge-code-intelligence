@@ -319,31 +319,28 @@ async fn handle_issue_comment(
         (None, None)
     };
 
-    let run_epoch = crate::db::next_run_epoch(
-        pool,
-        repository_id,
-        target_type,
-        number,
-        "review",
-        head_sha.as_deref(),
-    )
-    .await
-    .unwrap_or(0);
     // Carry the user's free-text instruction into the task → prompt (#138); a bare @mention defaults
     // to a plain review. The agent decides review-vs-answer from the instruction and acts via its
     // tools — the run kind is recorded by the control plane at finalize (emergent, ADR-0037), not
     // classified here.
+    let command_text =
+        parse_instruction(body, &state.app_handle).unwrap_or_else(|| "review".to_string());
+    // An @mention is an explicit human command: it must ALWAYS create a task. True webhook
+    // redeliveries are already deduped upstream by the `github_deliveries` delivery-id PRIMARY KEY,
+    // so content-idempotency adds nothing here — and previously dropped legitimate re-requests when
+    // the same wording landed on an unchanged head. `create_explicit_task` folds the next epoch into
+    // the INSERT, so every mention lands a fresh, non-colliding row atomically. `run_epoch` is
+    // ignored by that path (the INSERT computes it).
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
         github_delivery_id: delivery_id.to_string(),
         target_type: target_type.to_string(),
         target_id: number,
-        command_text: parse_instruction(body, &state.app_handle)
-            .unwrap_or_else(|| "review".to_string()),
+        command_text,
         base_sha,
         head_sha,
-        run_epoch,
+        run_epoch: 0,
     };
     tracing::info!(
         delivery_id,
@@ -351,7 +348,33 @@ async fn handle_issue_comment(
         kind = target_type,
         "@mention requested"
     );
-    create_review_task(state, pool, task, owner, name, delivery_id).await;
+    create_explicit_review_task(state, pool, task, owner, name, delivery_id).await;
+}
+
+/// Insert an **explicit @mention** task (always lands a row, never content-deduped) and, on insert,
+/// 👀 the PR (spawned so external GitHub calls can't block the webhook's ~10s deadline). The auto
+/// open path uses [`create_review_task`] instead, which keeps content-idempotency.
+async fn create_explicit_review_task(
+    state: &crate::AppState,
+    pool: &sqlx::PgPool,
+    task: crate::db::NewTask,
+    owner: &str,
+    name: &str,
+    delivery_id: &str,
+) {
+    let (pr, installation_id) = (task.target_id, task.installation_id);
+    match crate::db::create_explicit_task(pool, &task).await {
+        Ok(task_id) => {
+            crate::http::metrics::task_created();
+            tracing::info!(delivery_id, %task_id, pr, "created explicit review task");
+            let state = state.clone();
+            let (owner, name) = (owner.to_string(), name.to_string());
+            tokio::spawn(async move {
+                react_seen(&state, &owner, &name, installation_id, pr).await;
+            });
+        }
+        Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create explicit task"),
+    }
 }
 
 /// Insert a review task and, on a real insert, 👀 the PR (spawned so external GitHub calls can't

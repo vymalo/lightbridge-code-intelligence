@@ -649,9 +649,9 @@ pub struct NewTask {
     pub command_text: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
-    /// Re-run discriminator (RFC-0001). `0` for the automatic first review; an explicit re-review
-    /// (e.g. an `@mention`) uses the next epoch so the idempotency index lets a new task through for
-    /// the same head SHA. See [`next_run_epoch`].
+    /// Re-run discriminator (RFC-0001), used by the content-idempotent [`create_task`] path (the
+    /// automatic first review uses `0`). The explicit `@mention` path goes through
+    /// [`create_explicit_task`], which computes the epoch inside the INSERT and ignores this field.
     pub run_epoch: i32,
 }
 
@@ -737,29 +737,47 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     Ok(inserted)
 }
 
-/// Next `run_epoch` for an explicit re-run of a task's natural key: `max(run_epoch) + 1`, or `0` if
-/// none exists yet. Lets a manual re-review (same head SHA) get past the idempotency index.
-pub async fn next_run_epoch(
-    pool: &PgPool,
-    repository_id: i64,
-    target_type: &str,
-    target_id: i64,
-    command_text: &str,
-    head_sha: Option<&str>,
-) -> Result<i32, sqlx::Error> {
-    let next: Option<i32> = sqlx::query_scalar(
-        "SELECT MAX(run_epoch) + 1 FROM tasks \
-         WHERE repository_id = $1 AND target_type = $2 AND target_id = $3 \
-           AND command_text = $4 AND head_sha IS NOT DISTINCT FROM $5",
+/// Enqueue an **explicit human command** (an `@mention`), which must ALWAYS land a task — never
+/// content-deduped. True webhook redeliveries are already collapsed upstream by the
+/// `github_deliveries` PRIMARY KEY, so content-idempotency on this path adds nothing and only drops
+/// legitimate re-requests.
+///
+/// The `run_epoch` is folded into the INSERT — `COALESCE(MAX(run_epoch), -1) + 1` over the SAME
+/// columns as the idempotency index (minus `run_epoch`), using the REAL `command_text` — so it is
+/// computed and consumed in a single statement. That is atomic and collision-free: two
+/// near-simultaneous deliveries each get a fresh, distinct epoch, with no TOCTOU window and no
+/// `ON CONFLICT` drop. On insert, notifies [`TASK_QUEUED_CHANNEL`] like [`create_task`].
+pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    let new_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
+         target_id, command_text, base_sha, head_sha, run_epoch, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+           (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
+            WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
+              AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
+           'queued') \
+         RETURNING id",
     )
-    .bind(repository_id)
-    .bind(target_type)
-    .bind(target_id)
-    .bind(command_text)
-    .bind(head_sha)
+    .bind(id)
+    .bind(task.repository_id)
+    .bind(task.installation_id)
+    .bind(&task.github_delivery_id)
+    .bind(&task.target_type)
+    .bind(task.target_id)
+    .bind(&task.command_text)
+    .bind(&task.base_sha)
+    .bind(&task.head_sha)
     .fetch_one(pool)
     .await?;
-    Ok(next.unwrap_or(0))
+
+    // Wake a listening dispatcher; harmless if none is connected (the dispatcher also polls).
+    let _ = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(TASK_QUEUED_CHANNEL)
+        .bind(new_id.to_string())
+        .execute(pool)
+        .await;
+    Ok(new_id)
 }
 
 /// Cancel a PR's active tasks (queued/running/posting_result) — used when the PR is closed so its
@@ -1555,6 +1573,66 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    /// An explicit `@mention` command (`create_explicit_task`) must ALWAYS land a row — never be
+    /// content-deduped. Two identical "review this" mentions on the same (repo, target, head) create
+    /// TWO distinct tasks at consecutive epochs N and N+1, with no silent drop. This is the
+    /// regression guard for the prod bug where a repeated re-request collided with the idempotency
+    /// index and vanished.
+    #[sqlx::test]
+    async fn explicit_mention_always_creates_a_task_at_the_next_epoch(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let mention = |head: &str| NewTask {
+            repository_id: repo_id,
+            installation_id: 99,
+            github_delivery_id: "d1".to_string(),
+            target_type: "pull_request".to_string(),
+            target_id: 7,
+            command_text: "review this".to_string(),
+            base_sha: Some("base".to_string()),
+            head_sha: Some(head.to_string()),
+            run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
+        };
+
+        let first = create_explicit_task(&pool, &mention("h1")).await.unwrap();
+        let second = create_explicit_task(&pool, &mention("h1")).await.unwrap();
+        assert_ne!(first, second, "a repeated mention is not deduped");
+
+        let epochs: Vec<i32> = sqlx::query_scalar(
+            "SELECT run_epoch FROM tasks WHERE command_text = 'review this' ORDER BY run_epoch",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(epochs, vec![0, 1], "consecutive epochs N and N+1");
+    }
+
+    /// The auto `pull_request` path keeps content-idempotency: a duplicate `opened` then
+    /// `synchronize` for the SAME head and command "review" collapses to ONE task (GitHub commonly
+    /// delivers both for a single head). Only the explicit `@mention` path was changed.
+    #[sqlx::test]
+    async fn auto_review_collapses_duplicate_opened_and_synchronize(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        let opened = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap();
+        assert!(opened.is_some(), "the opened event creates the task");
+
+        let synchronize = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap();
+        assert!(
+            synchronize.is_none(),
+            "a duplicate for the same head is collapsed"
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "exactly one auto-review task for the head");
+    }
+
     /// The dispatcher claim takes exactly one queued task and leaves none for the next claim — the
     /// `SKIP LOCKED` guard that lets dispatcher replicas run concurrently without double-claiming.
     #[sqlx::test]
@@ -1618,26 +1696,14 @@ mod tests {
         assert_eq!(embedding_dim(&pool).await, 1536);
     }
 
-    /// `cancel_active_tasks_for_pr` cancels a PR's active task; `next_run_epoch` bumps so a manual
-    /// re-review on the same head can create a new task (webhook re-trigger path).
+    /// `cancel_active_tasks_for_pr` cancels a PR's active task when the PR is closed.
     #[sqlx::test]
-    async fn cancel_pr_and_next_run_epoch(pool: PgPool) {
+    async fn cancel_active_tasks_for_pr_cancels_the_prs_task(pool: PgPool) {
         let repo_id = seed(&pool).await;
         let id = create_task(&pool, &pr_task(repo_id, "h1"))
             .await
             .unwrap()
             .unwrap();
-
-        // One task exists at epoch 0 for this key → next is 1.
-        let epoch = next_run_epoch(&pool, repo_id, "pull_request", 7, "review", Some("h1"))
-            .await
-            .unwrap();
-        assert_eq!(epoch, 1);
-        // A never-seen key starts at 0.
-        let zero = next_run_epoch(&pool, repo_id, "pull_request", 999, "review", Some("x"))
-            .await
-            .unwrap();
-        assert_eq!(zero, 0);
 
         // Closing the PR cancels its active task.
         let cancelled = cancel_active_tasks_for_pr(&pool, repo_id, 7).await.unwrap();
