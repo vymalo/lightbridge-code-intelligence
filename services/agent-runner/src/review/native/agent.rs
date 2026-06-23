@@ -71,10 +71,14 @@ const WINDDOWN_MIN_TURNS: usize = 2;
 
 /// The first turn index at which the wind-down (reduced tool set + budget message) kicks in. Reserves
 /// `max(WINDDOWN_MIN_TURNS, max_turns / 10)` turns at the tail of the budget, clamped so it never lands
-/// before turn 1 (we always allow at least one full-toolset turn) nor at/after the ceiling.
+/// before turn 1 (we always allow at least one full-toolset turn). A `max_turns=1` budget is degenerate
+/// — one turn can't both investigate AND wind down — so it returns `1`, which the single turn (`turn=0`)
+/// never reaches: that run gets no wind-down and the `Exhausted` backstop catches it (fine for a
+/// one-turn budget).
 fn winddown_turn(max_turns: usize) -> usize {
     if max_turns <= WINDDOWN_MIN_TURNS {
         // Tiny budgets: wind down on the final turn so there's still one investigation turn first.
+        // (`max_turns=1` → `1`, unreachable by the only turn → no wind-down; the backstop handles it.)
         return max_turns.saturating_sub(1).max(1);
     }
     let reserve = WINDDOWN_MIN_TURNS.max(max_turns / 10);
@@ -215,9 +219,11 @@ pub async fn run_native_agent(
                  any remaining findings now with add_review_comment/add_comment, then call `finish` \
                  with your overall verdict. (The investigation tools are no longer available.)"
             )));
-        } else if !halfway_nudged && halfway > 0 && turn >= halfway {
+        } else if !in_winddown && !halfway_nudged && halfway > 0 && turn >= halfway {
             // Softer one-time nudge around the halfway mark — keep it light; the tool restriction at
-            // the wind-down boundary is the real lever.
+            // the wind-down boundary is the real lever. `!in_winddown` guards small budgets where
+            // `winddown <= halfway`: once we've announced wind-down ("finalize now"), we must NOT then
+            // push the softer "you're past halfway" message — that would be a conflicting instruction.
             halfway_nudged = true;
             messages.push(ChatMessage::user(
                 "You're past halfway on your turn budget — start converging: record what you've found \
