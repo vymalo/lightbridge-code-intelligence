@@ -316,14 +316,18 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
     }
 
     if !out_of_scope.is_empty() {
-        // Surface, don't drop: a collapsed `<details>` keeps the review scoped to the change while
-        // leaving the observations recoverable (ADR-0033). `<details>` works in GitHub markdown.
+        // Demoted, not dropped (ADR-0033 keeps them recoverable; Google eng-practices says file a bug
+        // for pre-existing issues, don't block the CL). These are on code this PR does NOT change, so
+        // they are NOT findings on it: render them **without** severity badges or bodies — just a terse
+        // title + file in a collapsed section — so they read as informational pre-existing notes, not
+        // the alarming P0 false-positives a human had to refute on izhub#207.
         let n = out_of_scope.len();
         body.push_str(&format!(
-            "\n\n<details>\n<summary>{n} observation(s) about code outside this PR's diff</summary>\n"
+            "\n\n<details>\n<summary>{n} pre-existing observation(s) about code outside this PR's diff \
+             (informational — not findings on this change)</summary>\n"
         ));
         for f in out_of_scope {
-            render_finding(&mut body, f);
+            body.push_str(&format!("\n- **{}** — `{}`", f.title, f.file));
         }
         body.push_str("\n</details>");
     }
@@ -508,13 +512,18 @@ mod tests {
         assert!(body.contains("Looks risky."));
         assert!(body.contains("Issue"));
         assert!(body.contains("`a.rs:5`"));
-        // Out-of-scope findings are surfaced in a collapsible section (not dropped, ADR-0033) —
-        // count line + recoverable content.
+        // Out-of-scope findings are surfaced in a collapsible section (not dropped, ADR-0033) but
+        // DEMOTED — informational header, terse title + file, and crucially NO severity badge (they
+        // are pre-existing, not findings on this change).
         assert!(body.contains("<details>"), "collapsible section present");
-        assert!(body.contains("1 observation(s) about code outside this PR's diff"));
+        assert!(body.contains("1 pre-existing observation(s) about code outside this PR's diff"));
         assert!(
-            body.contains("Unrelated nit") && body.contains("`vendor/lib.rs:9`"),
-            "the out-of-scope finding's content is recoverable"
+            body.contains("Unrelated nit") && body.contains("`vendor/lib.rs`"),
+            "the out-of-scope finding's title + file are recoverable"
+        );
+        assert!(
+            !body.contains("`vendor/lib.rs:9`"),
+            "out-of-scope notes carry no line anchor (the file isn't in the diff)"
         );
         assert!(
             body.contains("AI-generated review"),

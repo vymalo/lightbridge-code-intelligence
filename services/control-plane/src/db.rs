@@ -2388,7 +2388,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(cleared, None, "a fresh `running` transition clears error_detail");
+        assert_eq!(
+            cleared, None,
+            "a fresh `running` transition clears error_detail"
+        );
     }
 
     /// Create then claim a task (claim sets it `running` with a lease) so status-transition tests
