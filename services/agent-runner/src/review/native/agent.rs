@@ -331,10 +331,12 @@ struct ChatTurnError {
 /// The host of a base URL for logging — keeps the path/query (and any embedded token) out of logs
 /// while still identifying which gateway a run hit. Falls back to a redacted marker if unparseable.
 fn base_url_host(base_url: &str) -> String {
-    base_url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split(['/', '?', '#']).next())
+    // Fall back to the whole string when there's no scheme separator (e.g. `gateway.example/v1`),
+    // so a schemeless URL still logs its host rather than "(unparseable)".
+    let without_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
         .map(|hostport| hostport.to_string())
         .unwrap_or_else(|| "(unparseable)".to_string())
 }

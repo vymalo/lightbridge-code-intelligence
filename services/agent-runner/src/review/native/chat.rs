@@ -363,7 +363,10 @@ impl ChatClient {
                     if !err.transient || attempt >= policy.max_retries {
                         return Err(err);
                     }
-                    let wait = err.retry_after.map(|d| d.min(policy.max_backoff)).unwrap_or_else(|| policy.backoff(attempt));
+                    let wait = err
+                        .retry_after
+                        .map(|d| d.min(policy.max_backoff))
+                        .unwrap_or_else(|| policy.backoff(attempt));
                     tracing::warn!(
                         model = %self.model,
                         attempt = attempt + 1,
@@ -406,8 +409,10 @@ impl ChatClient {
             .send()
             .await
             .map_err(|e| {
-                // A transport error (connect refused, DNS, or our own per-request timeout) is transient.
-                let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                // Only connect/timeout transport errors are worth a retry. A request-construction
+                // error (`is_request`: bad URL, invalid headers, serialization) is deterministic — it
+                // will fail identically every attempt, so don't burn retries on it.
+                let transient = e.is_timeout() || e.is_connect();
                 ChatError {
                     error: anyhow::Error::new(e).context("chat completions request failed"),
                     transient,
