@@ -7,17 +7,18 @@
 #
 # `publish` also cosign-signs each pushed digest (keyless, GitHub OIDC). On every main
 # build argocd-image-updater promotes the newest signed `sha-<gitsha>` by committing it
-# to deploy/envs/production/values.yaml — see deploy/README.md.
+# to the adorsys-gis/ai-helm-values repo (NOT this repo) — see deploy/README.md.
 name: Build images
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
-    # Don't rebuild on commits that only touch deploy tags or docs. Critically, this breaks the
-    # argocd-image-updater feedback loop: image-updater writes the new image tag back to
-    # deploy/envs/production/values.yaml on main, and without this filter that push would
-    # re-trigger a build → newer image → another write-back → … (a runaway rebuild loop).
+    # Don't rebuild on commits that only touch deploy manifests or docs (no code change → no new
+    # image). image-updater's write-back now lands in adorsys-gis/ai-helm-values, not here, so it
+    # can no longer trigger a rebuild loop in this repo — but skipping deploy/docs-only pushes is
+    # still the correct, cheaper behavior (and deploy/ still holds the observability + keycloak
+    # manifests).
     paths-ignore:
       - "deploy/**"
       - "docs/**"
