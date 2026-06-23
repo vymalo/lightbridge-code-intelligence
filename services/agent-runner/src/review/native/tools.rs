@@ -14,7 +14,10 @@
 //! A tool/argument error is returned to the model as text (so it can retry/rephrase), never as a
 //! loop-killing error — the same recovery property the MCP servers had.
 
+use std::path::{Component, Path, PathBuf};
+
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::chat::{ToolCall, ToolDef};
@@ -26,6 +29,7 @@ use crate::indexer::embeddings::EmbeddingsClient;
 pub const VECTOR_SEMANTIC_SEARCH: &str = "lightbridge_vector_semantic_search";
 pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
 pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
+pub const READ_FILE: &str = "read_file";
 pub const ADD_REVIEW_COMMENT: &str = "add_review_comment";
 pub const ADD_COMMENT: &str = "add_comment";
 pub const FINISH: &str = "finish";
@@ -34,6 +38,10 @@ pub const ABORT: &str = "abort";
 
 const DEFAULT_LIMIT: i64 = 10;
 const MAX_LIMIT: i64 = 100;
+
+/// Hard ceiling on a single `read_file` (matches the per-file budget in `review::instructions`): a
+/// bounded read so a huge or hostile file in the checkout can't exhaust the runner's memory.
+const READ_FILE_CAP: usize = 64 * 1024;
 
 /// What the loop should do after a tool call.
 #[derive(Debug)]
@@ -65,6 +73,15 @@ struct GetCallersArgs {
     node_id: String,
     #[serde(default)]
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFileArgs {
+    path: String,
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    end_line: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +193,24 @@ fn aux_control_tool_defs() -> Vec<ToolDef> {
 /// The full tool surface (ADR-0037), in a stable order: retrieval + write actions + control.
 pub fn tool_defs() -> Vec<ToolDef> {
     let mut defs = retrieval_tool_defs();
+    // `read_file` is a read/investigation tool, grouped with retrieval: when the index returns nothing
+    // the model can still open the actual file from the checkout instead of flailing blind (epic #137).
+    defs.push(ToolDef::function(
+        READ_FILE,
+        "Read a UTF-8 text file from the checked-out repository (the working tree under review). Path \
+         is relative to the repo root; absolute paths and `..` traversal are rejected. Returns up to \
+         64 KiB; pass `start_line`/`end_line` (1-based, inclusive) to read a slice. Use this to look \
+         at the actual source when the search/graph tools come up empty.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the repo root (no leading `/`, no `..`)." },
+                "start_line": { "type": "integer", "description": "Optional 1-based first line to return (inclusive)." },
+                "end_line": { "type": "integer", "description": "Optional 1-based last line to return (inclusive)." },
+            },
+            "required": ["path"],
+        }),
+    ));
     defs.push(ToolDef::function(
         ADD_REVIEW_COMMENT,
         "Record one inline review finding on a line the diff adds or changes. Call once per finding \
@@ -218,11 +253,13 @@ pub fn tool_defs() -> Vec<ToolDef> {
     defs
 }
 
-/// Runs tool calls against the control-plane API. Holds only borrowed clients + the task id.
+/// Runs tool calls against the control-plane API. Holds only borrowed clients + the task id + the
+/// checkout root (`read_file` reads the working tree from here, path-sanitized to within it).
 pub struct Tools<'a> {
     pub client: &'a ControlPlaneClient,
     pub embedder: &'a EmbeddingsClient,
     pub task_id: Uuid,
+    pub checkout_root: &'a Path,
 }
 
 impl Tools<'_> {
@@ -253,6 +290,12 @@ impl Tools<'_> {
                         .graph_get_callers(self.task_id, &a.node_id, clamp_limit(a.limit))
                         .await;
                     ToolOutcome::Continue(render(name, r))
+                }
+                Err(e) => ToolOutcome::Continue(e),
+            },
+            READ_FILE => match parse::<ReadFileArgs>(args) {
+                Ok(a) => {
+                    ToolOutcome::Continue(self.read_file(&a.path, a.start_line, a.end_line).await)
                 }
                 Err(e) => ToolOutcome::Continue(e),
             },
@@ -322,9 +365,76 @@ impl Tools<'_> {
             },
             other => ToolOutcome::Continue(format!(
                 "error: unknown tool {other:?}. Available tools: {VECTOR_SEMANTIC_SEARCH}, \
-                 {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {ADD_REVIEW_COMMENT}, {ADD_COMMENT}, \
-                 {FINISH}, {REPORT_PROGRESS}, {ABORT}."
+                 {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {READ_FILE}, {ADD_REVIEW_COMMENT}, \
+                 {ADD_COMMENT}, {FINISH}, {REPORT_PROGRESS}, {ABORT}."
             )),
+        }
+    }
+
+    /// Read a file from the checkout, path-sanitized to within the checkout root. Returns the content
+    /// (optionally sliced to `start_line..=end_line`, 1-based inclusive), or a recoverable error string
+    /// the model can act on. Bounded to [`READ_FILE_CAP`] bytes — never an unbounded read.
+    async fn read_file(
+        &self,
+        rel: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> String {
+        let resolved = match resolve_in_root(self.checkout_root, rel) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // Bounded read: open + `take(cap + 1)` so a huge/hostile file can't exhaust memory, and the
+        // extra byte lets us tell that the file was longer than the budget (→ a truncation note).
+        let Ok(file) = tokio::fs::File::open(&resolved).await else {
+            return format!("error: could not open {rel:?} (file not found or unreadable).");
+        };
+        let mut buf = Vec::new();
+        if file
+            .take((READ_FILE_CAP + 1) as u64)
+            .read_to_end(&mut buf)
+            .await
+            .is_err()
+        {
+            return format!("error: could not read {rel:?}.");
+        }
+        let over_cap = buf.len() > READ_FILE_CAP;
+        buf.truncate(READ_FILE_CAP);
+        // Capping by bytes may split a multi-byte char at the end; keep the valid UTF-8 prefix.
+        let content = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).unwrap_or_default()
+            }
+        };
+
+        match (start_line, end_line) {
+            (None, None) => {
+                if over_cap {
+                    format!("{content}\n… [truncated at {READ_FILE_CAP} bytes]")
+                } else {
+                    content
+                }
+            }
+            _ => {
+                // 1-based inclusive slice; clamp to a sane window so swapped/out-of-range bounds give a
+                // usable result rather than an error.
+                let start = start_line.unwrap_or(1).max(1);
+                let end = end_line.unwrap_or(usize::MAX).max(start);
+                let lines: Vec<&str> = content.lines().collect();
+                let total = lines.len();
+                if start > total {
+                    return format!(
+                        "error: start_line {start} is past the end of {rel:?} ({total} lines)."
+                    );
+                }
+                let last = end.min(total);
+                let slice = lines[start - 1..last].join("\n");
+                format!("{rel} lines {start}-{last} (of {total}):\n{slice}")
+            }
         }
     }
 
@@ -363,6 +473,36 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
+/// Resolve a model-supplied relative path within `root`, rejecting anything that would escape it.
+/// Lexical (no filesystem/symlink resolution): an absolute path, a Windows prefix/root, or any `..`
+/// component is rejected, and the cleaned path is joined onto `root`. Errors are model-facing strings.
+fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(rel);
+    let mut cleaned = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            // A leading `/` or a drive prefix would escape the checkout — reject outright.
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "error: {rel:?} must be a path relative to the repo root (no leading `/`)."
+                ));
+            }
+            // `..` could traverse above the root; never allow it (we don't canonicalize symlinks).
+            Component::ParentDir => {
+                return Err(format!(
+                    "error: {rel:?} must not contain `..` (path traversal)."
+                ));
+            }
+            Component::CurDir => {}
+            Component::Normal(part) => cleaned.push(part),
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        return Err(format!("error: {rel:?} is not a file path."));
+    }
+    Ok(root.join(cleaned))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,15 +522,18 @@ mod tests {
     }
 
     fn tools<'a>(cp: &'a ControlPlaneClient, emb: &'a EmbeddingsClient) -> Tools<'a> {
+        // Most tool tests don't touch the filesystem; the checkout root only matters for `read_file`,
+        // which has its own tests that pass a real tempdir.
         Tools {
             client: cp,
             embedder: emb,
             task_id: Uuid::nil(),
+            checkout_root: Path::new("/nonexistent-checkout-root"),
         }
     }
 
     #[test]
-    fn tool_defs_expose_the_eight_tools_in_order() {
+    fn tool_defs_expose_the_nine_tools_in_order() {
         let names: Vec<_> = tool_defs()
             .iter()
             .map(|t| t.function.name.clone())
@@ -401,6 +544,7 @@ mod tests {
                 VECTOR_SEMANTIC_SEARCH,
                 GRAPH_FIND_SYMBOL,
                 GRAPH_GET_CALLERS,
+                READ_FILE,
                 ADD_REVIEW_COMMENT,
                 ADD_COMMENT,
                 FINISH,
@@ -408,6 +552,67 @@ mod tests {
                 ABORT,
             ]
         );
+    }
+
+    // ── read_file path sanitization: absolute paths and `..` traversal are rejected ─────────────
+    #[test]
+    fn resolve_in_root_rejects_absolute_and_traversal() {
+        let root = Path::new("/tmp/checkout");
+        assert!(resolve_in_root(root, "/etc/passwd").is_err(), "absolute");
+        assert!(
+            resolve_in_root(root, "../secrets.txt").is_err(),
+            "parent traversal"
+        );
+        assert!(
+            resolve_in_root(root, "src/../../escape").is_err(),
+            "embedded traversal"
+        );
+        assert!(resolve_in_root(root, "").is_err(), "empty path");
+        // A normal relative path resolves under the root.
+        let ok = resolve_in_root(root, "src/lib.rs").expect("clean path");
+        assert_eq!(ok, root.join("src/lib.rs"));
+        // A leading `./` is harmless and stripped.
+        let ok = resolve_in_root(root, "./src/lib.rs").expect("dot-prefixed path");
+        assert_eq!(ok, root.join("src/lib.rs"));
+    }
+
+    // ── read_file happy path: reads the file under the checkout root and can slice by line ───────
+    #[tokio::test]
+    async fn read_file_reads_and_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.rs"), "line1\nline2\nline3\nline4\n")
+            .await
+            .unwrap();
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let t = Tools {
+            client: &cp,
+            embedder: &emb,
+            task_id: Uuid::nil(),
+            checkout_root: dir.path(),
+        };
+        // Full read returns the whole file.
+        let full = t.read_file("a.rs", None, None).await;
+        assert!(
+            full.contains("line1") && full.contains("line4"),
+            "got: {full}"
+        );
+        // Sliced read returns only the requested 1-based inclusive window.
+        let slice = t.read_file("a.rs", Some(2), Some(3)).await;
+        assert!(
+            slice.contains("line2") && slice.contains("line3"),
+            "got: {slice}"
+        );
+        assert!(
+            !slice.contains("line1") && !slice.contains("line4"),
+            "got: {slice}"
+        );
+        // A missing file is a recoverable error string, not a panic.
+        let missing = t.read_file("nope.rs", None, None).await;
+        assert!(missing.starts_with("error:"), "got: {missing}");
+        // Traversal is rejected at dispatch too.
+        let escaped = t.read_file("../escape.rs", None, None).await;
+        assert!(escaped.contains("traversal"), "got: {escaped}");
     }
 
     // ── Positive: a search call embeds the query, hits the control plane, returns the hits ──────

@@ -239,6 +239,7 @@ async fn run(
                 client,
                 &embedder,
                 config.task_id,
+                &checkout,
                 &mut transcript,
             )
             .await;
@@ -263,7 +264,15 @@ async fn run(
                     "review posted".to_string()
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "review run failed (non-fatal; nothing posted)");
+                    // The review run failed (abort / exhausted turns / transport). It stays non-fatal
+                    // — indexing already landed and nothing is posted (crash-safe) — but the reason
+                    // used to be dropped after a bare warn. Surface it: log the full reason at warn,
+                    // and send it to the control plane as the status `detail` so the failure is
+                    // legible end-to-end (epic #137). Persisting/showing that detail is a separate
+                    // control-plane/web PR; here we only SEND it. Not posted to GitHub (trust boundary).
+                    let detail = format!("review run failed: {error:#}");
+                    tracing::warn!(%detail, "review run failed (non-fatal; nothing posted)");
+                    report(client, config, "running", Some(&detail)).await;
                     "review failed".to_string()
                 }
             }
