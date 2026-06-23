@@ -1,0 +1,50 @@
+# Workspace-wide Rust lint gate: `cargo fmt --check` + `cargo clippy -D warnings`.
+#
+# Why this exists: the other CI (build-images, control-plane-tests) compiles and tests but never
+# checked formatting or lints, so `cargo fmt` drift and clippy warnings landed on `main` unnoticed
+# (e.g. an over-width assert merged in #169 — it only surfaced when a later branch ran `fmt --check`
+# locally). This job closes that gap for the whole Cargo workspace (control-plane, agent-runner,
+# config, xtask). No services needed — fmt is text-only and clippy compiles without a database
+# (the code uses runtime `sqlx::query`, not the compile-time-checked macros).
+name: Rust lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-lint.yml"
+  pull_request:
+    paths:
+      - "services/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-lint.yml"
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: rust-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: cargo fmt --all --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy --workspace -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
