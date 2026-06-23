@@ -238,7 +238,7 @@ required for any phase before Phase 3 and the system is correct without it.
 ### Deployment
 
 Replica counts live in the external `ADORSYS-GIS/ai-helm` GitOps chart, not in this repo
-(`deploy/envs/production/values.yaml` only pins image tags). The "control plane = 1 replica" setting
+(image tags live in `adorsys-gis/ai-helm-values`). The "control plane = 1 replica" setting
 there is the operational expression of the code constraint above. Once Phase 0 lands, that value can
 be raised; workers/dispatchers can later get an HPA on queue depth (`COUNT(*) WHERE status='queued'`).
 

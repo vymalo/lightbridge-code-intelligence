@@ -226,7 +226,7 @@ A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust autom
 | `xtask` | Rust | Cargo `xtask` workspace automation — the Rust side of `just` (`cargo xtask ci\|fmt\|lint\|test\|build`) |
 | `tools/dashboard-gen` | Python | Generates the Grafana dashboards-as-code into the Helm chart. [README](tools/dashboard-gen/README.md) |
 | `docs/` | — | Documentation set, ADRs, RFCs, ways of working |
-| `deploy/` | — | Per-environment Helm values (`deploy/envs/`) consumed by the `ai-helm` chart; image tags promoted by argocd-image-updater (GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
+| `deploy/` | — | Observability dashboards/chart + Keycloak realm export for the `ai-helm` deployment. Production image tags live in [`adorsys-gis/ai-helm-values`](https://github.com/adorsys-gis/ai-helm-values) (promoted by argocd-image-updater, GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
 
 ### Kubernetes layout
 
