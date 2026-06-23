@@ -58,3 +58,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0036](0036-auto-read-agent-instruction-files.md) | Auto-read conventional agent instruction files (AGENTS.md → CLAUDE.md → …) as review context, ranked, untrusted | Proposed |
 | [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Proposed |
 | [0038](0038-per-repo-review-model.md) | Per-repository review model selected in the admin UI from an operator allowlist (admin-owned, not the author-owned repo file) | Proposed |
+| [0039](0039-agent-llm-resilience-and-observability.md) | Agent LLM resilience & observability: generous per-request timeout (180s, eaig reality), bounded retry/backoff on transient errors, per-run circuit breaker, optional model failover, captured HTTP error body, structured per-turn logging | Proposed |

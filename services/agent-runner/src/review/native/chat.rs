@@ -11,7 +11,8 @@
 //! dispatches. It deliberately knows nothing about *which* tools exist or *how* to run them; that is
 //! the dispatcher's job (a later PR).
 
-use anyhow::Context;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// A single message in the Chat Completions `messages` array.
@@ -194,6 +195,61 @@ struct ResponseMessage {
     tool_calls: Vec<ToolCall>,
 }
 
+/// Retry/backoff policy for one chat turn (ADR-0039). Retries fire **only** on transient failures
+/// (connect/timeout, HTTP 429, HTTP 5xx); a 4xx other than 429 is deterministic and never retried.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Retries on a transient failure (total attempts = `max_retries + 1`).
+    pub max_retries: u32,
+    /// Base backoff; attempt *n* (0-indexed) sleeps roughly `base * 2^n` plus deterministic jitter.
+    pub base_backoff: Duration,
+    /// Ceiling on a single backoff so a high attempt count can't sleep absurdly long.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            base_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(8),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Backoff for `attempt` (0 = the wait *before* the first retry). Exponential, capped at
+    /// `max_backoff`, plus a small **deterministic** jitter seeded by the attempt index — so the
+    /// schedule is reproducible in tests (no clock, no RNG) yet de-synchronises retries a little.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u64 << attempt.min(16); // 2^attempt, clamped so the shift can't overflow
+        let base = self
+            .base_backoff
+            .saturating_mul(factor.min(u32::MAX as u64) as u32);
+        let capped = base.min(self.max_backoff);
+        // Deterministic jitter in [0, 250ms): a cheap hash of the attempt index, no SystemTime/RNG.
+        let jitter_ms = (attempt as u64).wrapping_mul(2_654_435_761) % 250;
+        capped.saturating_add(Duration::from_millis(jitter_ms))
+    }
+}
+
+/// Why a turn failed, so the loop can decide whether a transient error is worth a retry/failover vs.
+/// a deterministic one that should fail fast.
+#[derive(Debug)]
+pub struct ChatError {
+    pub error: anyhow::Error,
+    /// `true` for connect/timeout, HTTP 429, or HTTP 5xx — the loop retries/fails over on these only.
+    pub transient: bool,
+    /// `Retry-After` seconds parsed off a 429, when present — the loop honours it over its own backoff.
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
 /// Chat Completions client for the review model.
 pub struct ChatClient {
     url: String,
@@ -207,15 +263,49 @@ pub struct ChatClient {
 
 impl ChatClient {
     /// `base_url` is the LLM gateway base **including** the `/v1` segment (`LLM_BASE_URL`); the model
-    /// is the chat model id (`LLM_MODEL`).
+    /// is the chat model id (`LLM_MODEL`). Uses the default per-request timeout
+    /// ([`DEFAULT_REQUEST_TIMEOUT_SECS`](crate::bootstrap::config::DEFAULT_REQUEST_TIMEOUT_SECS)).
     pub fn new(base_url: &str, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_timeout(
+            base_url,
+            api_key,
+            model,
+            Duration::from_secs(crate::bootstrap::config::DEFAULT_REQUEST_TIMEOUT_SECS),
+        )
+    }
+
+    /// Like [`new`](Self::new) but with an explicit per-request timeout (ADR-0039). eaig can take
+    /// ~2 minutes per turn, so callers pass a generous value (default 180s).
+    pub fn with_timeout(
+        base_url: &str,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             api_key: api_key.into(),
             model: model.into(),
-            http: build_http_client(),
+            http: build_http_client(request_timeout),
             attribution: reqwest::header::HeaderMap::new(),
         }
+    }
+
+    /// Return a copy of this client that targets a different model id (same gateway/key/timeout) — used
+    /// for failover to the secondary model (ADR-0039). Cheap: clones the shared `reqwest::Client`.
+    pub fn for_model(&self, model: impl Into<String>) -> Self {
+        Self {
+            url: self.url.clone(),
+            api_key: self.api_key.clone(),
+            model: model.into(),
+            http: self.http.clone(),
+            attribution: self.attribution.clone(),
+        }
+    }
+
+    /// The model id this client targets.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Attach gateway attribution headers (epic #89). Unparseable header names/values are skipped (the
@@ -238,12 +328,68 @@ impl ChatClient {
 
     /// One completion turn: send the conversation so far + the advertised `tools`, return the
     /// assistant's reply. `tools` may be empty for a plain completion.
+    ///
+    /// On a non-2xx response the **response body** is read (bounded) and folded into the error, so a
+    /// gateway rejection (bad model, quota, validation) surfaces a real reason instead of a bare
+    /// status code — this is the key fix for "the review failed without saying why" (ADR-0039).
     pub async fn complete(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDef],
         params: ChatParams,
     ) -> anyhow::Result<Completion> {
+        self.complete_inner(messages, tools, params)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    /// [`complete`](Self::complete) with retry/backoff on transient failures (ADR-0039). Retries up to
+    /// `policy.max_retries` times on connect/timeout, HTTP 429, or HTTP 5xx — honouring a 429's
+    /// `Retry-After` over the computed backoff — and returns immediately on success or a deterministic
+    /// 4xx. The returned [`ChatError`] tells the caller whether the *final* failure was transient (so
+    /// the loop can decide on failover).
+    pub async fn complete_with_retry(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        params: ChatParams,
+        policy: RetryPolicy,
+    ) -> Result<Completion, ChatError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.complete_inner(messages, tools, params).await {
+                Ok(completion) => return Ok(completion),
+                Err(err) => {
+                    if !err.transient || attempt >= policy.max_retries {
+                        return Err(err);
+                    }
+                    let wait = err
+                        .retry_after
+                        .map(|d| d.min(policy.max_backoff))
+                        .unwrap_or_else(|| policy.backoff(attempt));
+                    tracing::warn!(
+                        model = %self.model,
+                        attempt = attempt + 1,
+                        max_retries = policy.max_retries,
+                        backoff_ms = wait.as_millis() as u64,
+                        retry_after = err.retry_after.is_some(),
+                        error = %err,
+                        "transient chat failure; retrying after backoff"
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// The single-attempt request, returning a classified [`ChatError`] on failure.
+    async fn complete_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        params: ChatParams,
+    ) -> Result<Completion, ChatError> {
         let request = ChatRequest {
             model: &self.model,
             messages,
@@ -254,7 +400,7 @@ impl ChatClient {
             max_tokens: params.max_tokens,
         };
 
-        let response: ChatResponse = self
+        let response = self
             .http
             .post(&self.url)
             .bearer_auth(&self.api_key)
@@ -262,19 +408,58 @@ impl ChatClient {
             .json(&request)
             .send()
             .await
-            .context("chat completions request failed")?
-            .error_for_status()
-            .context("chat completions API returned error")?
-            .json()
-            .await
-            .context("parsing chat completions response")?;
+            .map_err(|e| {
+                // Only connect/timeout transport errors are worth a retry. A request-construction
+                // error (`is_request`: bad URL, invalid headers, serialization) is deterministic — it
+                // will fail identically every attempt, so don't burn retries on it.
+                let transient = e.is_timeout() || e.is_connect();
+                ChatError {
+                    error: anyhow::Error::new(e).context("chat completions request failed"),
+                    transient,
+                    retry_after: None,
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // Read the body (bounded) so the failure is legible. 429 + 5xx are transient; other 4xx
+            // are deterministic (bad request, auth, unknown model) and must NOT be retried.
+            let retry_after = retry_after_secs(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            let snippet = truncate_on_boundary(&body, 1024);
+            let transient =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            return Err(ChatError {
+                error: anyhow::anyhow!(
+                    "chat completions API returned {status}: {}",
+                    if snippet.is_empty() {
+                        "(empty body)"
+                    } else {
+                        snippet
+                    }
+                ),
+                transient,
+                retry_after: retry_after.filter(|_| transient),
+            });
+        }
+
+        let response: ChatResponse = response.json().await.map_err(|e| ChatError {
+            // A malformed 2xx body is not a transport problem — don't retry it.
+            error: anyhow::Error::new(e).context("parsing chat completions response"),
+            transient: false,
+            retry_after: None,
+        })?;
 
         let usage = response.usage;
         let choice = response
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("chat completions response had no choices"))?;
+            .ok_or_else(|| ChatError {
+                error: anyhow::anyhow!("chat completions response had no choices"),
+                transient: false,
+                retry_after: None,
+            })?;
 
         Ok(Completion {
             finish_reason: choice.finish_reason,
@@ -292,13 +477,41 @@ impl ChatClient {
     }
 }
 
+/// `s` truncated to at most `max` bytes, never slicing through a multi-byte char (mirrors the helper
+/// in the agent loop; kept local so the transport layer has no cross-module dep).
+fn truncate_on_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Parse a `Retry-After` header expressed as an integer number of seconds (the form gateways use for
+/// 429s). The HTTP-date form is ignored — we fall back to our own backoff then.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 /// Build the HTTP client, additionally trusting the internal CA PEM at `LLM_CA_CERT` (falling back to
 /// `EMBEDDINGS_CA_CERT`, since the chat and embeddings endpoints share the eaig gateway and its
 /// private CA — `ClusterIssuer/self-signed-ca`, which the default rustls/webpki roots don't include).
 /// Absent both, the default client (public roots) is used. `add_root_certificate` augments the default
 /// roots, it doesn't replace them.
-fn build_http_client() -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+fn build_http_client(request_timeout: Duration) -> reqwest::Client {
+    // Per-request timeout (ADR-0039): generous (default 180s) because eaig can legitimately take up to
+    // ~2 minutes per turn — an aggressive timeout would kill a slow-but-valid response.
+    let mut builder = reqwest::Client::builder().timeout(request_timeout);
     if let Some((path, cert)) = ca_cert() {
         match cert {
             Ok(cert) => {
@@ -460,7 +673,179 @@ mod tests {
             .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
             .await
             .expect_err("500 is an error");
-        assert!(format!("{err:#}").contains("returned error"));
+        assert!(format!("{err:#}").contains("returned 500"), "got: {err:#}");
+    }
+
+    // ── ADR-0039 resilience tests ───────────────────────────────────────────────────────────────
+
+    fn ok_reply() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{ "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "ok" } }]
+        })
+    }
+
+    fn fast_policy() -> RetryPolicy {
+        // Tiny backoff so tests don't actually sleep meaningfully.
+        RetryPolicy {
+            max_retries: 2,
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        }
+    }
+
+    // A 5xx is transient → retried; once the gateway recovers, the turn succeeds.
+    #[tokio::test]
+    async fn retries_on_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        // First call: 503. Then: 200.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_reply()))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let out = client
+            .complete_with_retry(
+                &[ChatMessage::user("hi")],
+                &[],
+                ChatParams::default(),
+                fast_policy(),
+            )
+            .await
+            .expect("recovers after a transient 503");
+        assert_eq!(out.message.content.as_deref(), Some("ok"));
+    }
+
+    // A 400 is deterministic → NOT retried (exactly one request hits the server) and the body surfaces.
+    #[tokio::test]
+    async fn does_not_retry_on_400_and_surfaces_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "message": "unknown model 'm'" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let err = client
+            .complete_with_retry(
+                &[ChatMessage::user("hi")],
+                &[],
+                ChatParams::default(),
+                fast_policy(),
+            )
+            .await
+            .expect_err("400 is deterministic");
+        assert!(!err.transient, "400 is not transient");
+        let msg = format!("{err}");
+        assert!(msg.contains("returned 400"), "status surfaced: {msg}");
+        assert!(msg.contains("unknown model"), "body surfaced: {msg}");
+
+        // Exactly one request — no retry.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "400 must not be retried");
+    }
+
+    // The HTTP error body is folded into the error returned by the plain `complete`.
+    #[tokio::test]
+    async fn error_body_is_surfaced_in_complete() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("upstream connect error or disconnect"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let err = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect_err("502");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("502"), "status: {msg}");
+        assert!(msg.contains("upstream connect error"), "body: {msg}");
+    }
+
+    // A per-request timeout aborts a slow response and classifies it transient.
+    #[tokio::test]
+    async fn times_out_a_slow_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ok_reply())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        // 50ms timeout < 300ms delay → times out.
+        let client = ChatClient::with_timeout(
+            &format!("{}/v1", server.uri()),
+            "key",
+            "m",
+            Duration::from_millis(50),
+        );
+        let err = client
+            .complete_inner(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect_err("should time out");
+        assert!(err.transient, "a timeout is transient");
+        assert!(format!("{err}").contains("request failed"), "got: {err}");
+    }
+
+    // `for_model` retargets the model id while sharing the gateway/key/timeout — the failover primitive.
+    #[tokio::test]
+    async fn for_model_retargets_the_model_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_reply()))
+            .mount(&server)
+            .await;
+
+        let primary = ChatClient::new(&format!("{}/v1", server.uri()), "key", "primary-model");
+        let secondary = primary.for_model("fallback-model");
+        assert_eq!(secondary.model(), "fallback-model");
+        secondary
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("fallback client works");
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["model"], "fallback-model");
+    }
+
+    // Backoff is exponential, capped, and jittered deterministically (no clock/RNG in tests).
+    #[test]
+    fn backoff_is_exponential_capped_and_deterministic() {
+        let p = RetryPolicy {
+            max_retries: 5,
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(2),
+        };
+        // attempt 0 ≈ 100ms, attempt 1 ≈ 200ms, attempt 2 ≈ 400ms (plus <250ms jitter).
+        assert!(p.backoff(0) >= Duration::from_millis(100));
+        assert!(p.backoff(0) < Duration::from_millis(350));
+        assert!(p.backoff(2) >= Duration::from_millis(400));
+        // High attempt is capped near max_backoff (+ jitter), never unbounded.
+        assert!(p.backoff(20) <= Duration::from_secs(2) + Duration::from_millis(250));
+        // Deterministic: same input → same output.
+        assert_eq!(p.backoff(3), p.backoff(3));
     }
 
     #[test]
