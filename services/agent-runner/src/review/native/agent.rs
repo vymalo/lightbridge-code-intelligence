@@ -556,11 +556,14 @@ fn build_messages(
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
-/// Normalize a repo-relative path for coverage comparison (B, #137): trim whitespace and a leading
-/// `./` or `/` so a `read_file` / `add_review_comment` path matches the diff's file list regardless of
-/// how the model wrote it. (The control plane normalizes the same way when anchoring findings.)
+/// Normalize a repo-relative path for coverage comparison (B, #137): fold backslashes to `/`, then trim
+/// whitespace and a leading `./` or `/`, so a `read_file` / `add_review_comment` path matches the diff's
+/// file list regardless of how the model wrote it. The backslash fold mirrors the control plane's
+/// `normalize_path` (used when anchoring findings) — without it, a model emitting a Windows-style
+/// `src\a.rs` against a forward-slash diff would read as un-engaged and draw a spurious coverage bounce.
 fn normalize_repo_path(path: &str) -> String {
-    path.trim()
+    path.replace('\\', "/")
+        .trim()
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_string()
@@ -766,6 +769,10 @@ mod tests {
         assert_eq!(normalize_repo_path("./src/a.rs"), "src/a.rs");
         assert_eq!(normalize_repo_path("/src/a.rs"), "src/a.rs");
         assert_eq!(normalize_repo_path("  src/a.rs  "), "src/a.rs");
+        // Windows-style backslashes fold to `/` (mirrors the control plane), so a `src\a.rs` tool arg
+        // still matches a forward-slash diff path instead of drawing a spurious bounce.
+        assert_eq!(normalize_repo_path("src\\a.rs"), "src/a.rs");
+        assert_eq!(normalize_repo_path(".\\src\\a.rs"), "src/a.rs");
 
         assert_eq!(
             arg_field(r#"{"file":"src/a.rs","line":7}"#, "file").as_deref(),
