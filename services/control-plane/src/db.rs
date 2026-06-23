@@ -463,6 +463,27 @@ impl PendingReview {
     }
 }
 
+/// Delete one buffered inline finding by `(task_id, file, line)` — the refute pass retracting a P0/P1
+/// that didn't survive verification before it is ever posted (Phase 2, ADR-0043). Idempotent: deleting
+/// a finding that isn't there is a no-op (the agent may retract speculatively).
+pub async fn delete_pending_inline(
+    pool: &PgPool,
+    task_id: Uuid,
+    file: &str,
+    line: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM pending_review_actions \
+         WHERE task_id = $1 AND action = 'inline' AND file = $2 AND line = $3",
+    )
+    .bind(task_id)
+    .bind(file)
+    .bind(line)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Clear a task's accumulation buffer. Called when a runner (re)starts the task so a retry begins from
 /// empty rather than appending to a partial buffer (ADR-0037 idempotency), and after a flush.
 pub async fn clear_pending_review(pool: &PgPool, task_id: Uuid) -> Result<(), sqlx::Error> {
@@ -2393,6 +2414,51 @@ mod tests {
         clear_pending_review(&pool, task_id).await.unwrap();
         let after = load_pending_review(&pool, task_id).await.unwrap();
         assert!(after.is_empty(), "buffer cleared on restart/flush");
+    }
+
+    /// Phase 2 (ADR-0043): the refute pass retracts one buffered inline finding by (file, line),
+    /// leaving the others; retracting a missing one is a no-op.
+    #[sqlx::test]
+    async fn delete_pending_inline_removes_one(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .unwrap();
+        for (line, body) in [(7, "keep"), (9, "drop me")] {
+            upsert_pending_inline(
+                &pool,
+                task_id,
+                "a.rs",
+                line,
+                Some("t"),
+                Some("P1"),
+                Some("correctness"),
+                None,
+                body,
+            )
+            .await
+            .unwrap();
+        }
+        // Retract the line-9 finding; line 7 stays.
+        delete_pending_inline(&pool, task_id, "a.rs", 9)
+            .await
+            .unwrap();
+        let pending = load_pending_review(&pool, task_id).await.unwrap();
+        assert_eq!(pending.inline.len(), 1, "only the retracted one is gone");
+        assert_eq!(pending.inline[0].line, 7);
+        // Retracting a non-existent finding is a harmless no-op.
+        delete_pending_inline(&pool, task_id, "a.rs", 999)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_pending_review(&pool, task_id)
+                .await
+                .unwrap()
+                .inline
+                .len(),
+            1
+        );
     }
 
     /// A terminal status stamps `completed_at` and clears the lease; `running` stamps `started_at`.

@@ -267,6 +267,10 @@ fn app(state: AppState) -> Router {
             post(internal::add_review_comment),
         )
         .route(
+            "/internal/tasks/{id}/review/inline/retract",
+            post(internal::retract_inline),
+        )
+        .route(
             "/internal/tasks/{id}/review/comment",
             post(internal::add_review_reply),
         )

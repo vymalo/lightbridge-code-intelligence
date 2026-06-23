@@ -31,6 +31,7 @@ pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
 pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
 pub const READ_FILE: &str = "read_file";
 pub const ADD_REVIEW_COMMENT: &str = "add_review_comment";
+pub const RETRACT_FINDING: &str = "retract_finding";
 pub const ADD_COMMENT: &str = "add_comment";
 pub const FINISH: &str = "finish";
 pub const REPORT_PROGRESS: &str = "report_progress";
@@ -92,8 +93,24 @@ struct AddReviewCommentArgs {
     priority: String,
     category: String,
     body: String,
+    /// The concrete evidence the finding rests on (Phase 2, ADR-0043): the exact lines / symbol the
+    /// claim is grounded in, folded into the rendered body so the citation is visible and the finding
+    /// can be verified/refuted. The prompt requires it, but parsing keeps it optional so a runner that
+    /// ships ahead of the evidence-aware prompt still records findings (rollout safety).
+    #[serde(default)]
+    evidence: Option<String>,
     #[serde(default)]
     suggestion: Option<String>,
+}
+
+/// Args for `retract_finding` (Phase 2, ADR-0043): drop a previously-recorded inline finding that did
+/// not survive verification, by its `(file, line)`.
+#[derive(Debug, Deserialize)]
+struct RetractFindingArgs {
+    file: String,
+    line: i32,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,9 +241,25 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
                 "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
                 "body": { "type": "string", "description": "Why it matters." },
+                "evidence": { "type": "string", "description": "REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding." },
                 "suggestion": { "type": "string", "description": "Optional exact replacement source for `line` (no diff markers)." },
             },
             "required": ["file", "line", "title", "priority", "category", "body"],
+        }),
+    ));
+    defs.push(ToolDef::function(
+        RETRACT_FINDING,
+        "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't \
+         hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings \
+         — a wrong finding costs more trust than a missed one.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "The finding's file (as recorded)." },
+                "line": { "type": "integer", "description": "The finding's line (as recorded)." },
+                "reason": { "type": "string", "description": "Why it didn't hold (optional)." },
+            },
+            "required": ["file", "line"],
         }),
     ));
     defs.push(ToolDef::function(
@@ -300,32 +333,61 @@ impl Tools<'_> {
                 Err(e) => ToolOutcome::Continue(e),
             },
             ADD_REVIEW_COMMENT => match parse::<AddReviewCommentArgs>(args) {
-                Ok(a) => match self
-                    .client
-                    .add_review_comment(
-                        self.task_id,
-                        &a.file,
-                        a.line,
-                        Some(&a.title),
-                        Some(&a.priority),
-                        Some(&a.category),
-                        a.suggestion.as_deref(),
-                        &a.body,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        ToolOutcome::Continue(format!("recorded finding at {}:{}", a.file, a.line))
+                Ok(a) => {
+                    // Fold the cited evidence into the rendered body (Phase 2, ADR-0043) so the proof is
+                    // visible to the human and stored with the finding — no schema change needed. Skipped
+                    // when absent (a pre-evidence prompt), so findings still record (rollout safety).
+                    let body = match a.evidence.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+                        Some(ev) => format!("{}\n\n**Evidence:** {ev}", a.body.trim_end()),
+                        None => a.body.clone(),
+                    };
+                    match self
+                        .client
+                        .add_review_comment(
+                            self.task_id,
+                            &a.file,
+                            a.line,
+                            Some(&a.title),
+                            Some(&a.priority),
+                            Some(&a.category),
+                            a.suggestion.as_deref(),
+                            &body,
+                        )
+                        .await
+                    {
+                        Ok(()) => ToolOutcome::Continue(format!(
+                            "recorded finding at {}:{}",
+                            a.file, a.line
+                        )),
+                        Err(e) => {
+                            ToolOutcome::Continue(format!("error: could not record finding: {e:#}"))
+                        }
                     }
-                    Err(e) => {
-                        ToolOutcome::Continue(format!("error: could not record finding: {e:#}"))
-                    }
-                },
+                }
                 Err(e) => ToolOutcome::Continue(format!(
                     "{e} Expected JSON like {{\"file\": \"path\", \"line\": 42, \"title\": \"…\", \
                      \"priority\": \"P0\", \"category\": \"security\", \"body\": \"…\", \
-                     \"suggestion\": \"optional\"}}. priority is P0|P1|P2; category is \
-                     security|correctness|quality|style|performance."
+                     \"evidence\": \"the lines this rests on\", \"suggestion\": \"optional\"}}. \
+                     priority is P0|P1|P2; category is security|correctness|quality|style|performance."
+                )),
+            },
+            RETRACT_FINDING => match parse::<RetractFindingArgs>(args) {
+                Ok(a) => match self.client.retract_finding(self.task_id, &a.file, a.line).await {
+                    Ok(()) => ToolOutcome::Continue(format!(
+                        "retracted finding at {}:{}{}",
+                        a.file,
+                        a.line,
+                        a.reason
+                            .as_deref()
+                            .map(|r| format!(" ({r})"))
+                            .unwrap_or_default()
+                    )),
+                    Err(e) => {
+                        ToolOutcome::Continue(format!("error: could not retract finding: {e:#}"))
+                    }
+                },
+                Err(e) => ToolOutcome::Continue(format!(
+                    "{e} Expected JSON like {{\"file\": \"path\", \"line\": 42, \"reason\": \"optional\"}}."
                 )),
             },
             ADD_COMMENT => match parse::<TextArgs>(args) {
@@ -564,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_defs_expose_the_nine_tools_in_order() {
+    fn tool_defs_expose_the_tools_in_order() {
         let names: Vec<_> = tool_defs()
             .iter()
             .map(|t| t.function.name.clone())
@@ -577,6 +639,7 @@ mod tests {
                 GRAPH_GET_CALLERS,
                 READ_FILE,
                 ADD_REVIEW_COMMENT,
+                RETRACT_FINDING,
                 ADD_COMMENT,
                 FINISH,
                 REPORT_PROGRESS,

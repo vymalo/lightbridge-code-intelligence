@@ -576,6 +576,33 @@ pub struct InlineActionBody {
     pub body: String,
 }
 
+/// Body for `POST /internal/tasks/{id}/review/inline/retract` (`retract_finding`, Phase 2 ADR-0043).
+#[derive(Debug, Deserialize)]
+pub struct RetractInlineBody {
+    pub file: String,
+    pub line: i32,
+}
+
+/// `POST /internal/tasks/{id}/review/inline/retract` — drop a buffered inline finding by `(file, line)`
+/// (Phase 2, ADR-0043): the refute pass removing a P0/P1 that didn't hold, before it is posted.
+pub async fn retract_inline(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(a): Json<RetractInlineBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::delete_pending_inline(pool, id, &a.file, a.line).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "retracting inline finding failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "retract error").into_response()
+        }
+    }
+}
+
 /// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`) and
 /// `POST /internal/tasks/{id}/review/summary` (`set_summary`).
 #[derive(Debug, Deserialize)]
