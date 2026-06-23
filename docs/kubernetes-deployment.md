@@ -181,7 +181,7 @@ spec:
 | Helm | Packaging, reusable chart values, release workflow | Use for app distribution |
 | Kustomize | Environment overlays and patching | Use for repo-local overlays |
 
-Deployment manifests live under `deploy/` (planned). Replica counts are set in the external
+Deployment manifests live under deploy/. Replica counts are set in the external
 `ADORSYS-GIS/ai-helm` GitOps chart; image tags live in the `adorsys-gis/ai-helm-values` repo
 (`environments/prod/values/lightbridge-code-intelligence.yaml`), promoted by argocd-image-updater.
 
