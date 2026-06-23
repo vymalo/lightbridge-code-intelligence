@@ -363,7 +363,7 @@ impl ChatClient {
                     if !err.transient || attempt >= policy.max_retries {
                         return Err(err);
                     }
-                    let wait = err.retry_after.unwrap_or_else(|| policy.backoff(attempt));
+                    let wait = err.retry_after.map(|d| d.min(policy.max_backoff)).unwrap_or_else(|| policy.backoff(attempt));
                     tracing::warn!(
                         model = %self.model,
                         attempt = attempt + 1,
