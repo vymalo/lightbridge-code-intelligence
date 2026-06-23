@@ -46,6 +46,16 @@ pub const DEFAULT_MAX_TURNS: usize = 40;
 /// handling. Operator-tunable via `review.max_batch_size` / `LLM_MAX_BATCH_SIZE`.
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 
+/// Default cumulative read budgets for risk-first review (ADR-0042): once a budget is spent the runner
+/// drops the matching tool from the offered set and nudges the model to converge — so a review reads
+/// *enough* to be confident, then stops, instead of grinding through the whole repo. `max_files_read`
+/// caps `read_file` calls, `max_searches` caps retrieval (vector + graph) calls, and `max_batches` caps
+/// investigation rounds (turns that issue ≥1 read-only call) before forcing the wind-down. Generous
+/// defaults; operator-tunable via `review.*` / `LLM_MAX_*`.
+pub const DEFAULT_MAX_FILES_READ: usize = 30;
+pub const DEFAULT_MAX_SEARCHES: usize = 15;
+pub const DEFAULT_MAX_BATCHES: usize = 6;
+
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
 /// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
@@ -98,6 +108,13 @@ pub struct ReviewFile {
     /// Max read-only tool calls run concurrently per turn (ADR-0042). Unset = [`DEFAULT_MAX_BATCH_SIZE`].
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_batch_size: Option<usize>,
+    /// Cumulative read budgets (ADR-0042). Unset = the `DEFAULT_MAX_*` constants.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_files_read: Option<usize>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_searches: Option<usize>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_batches: Option<usize>,
     /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
     /// (ADR-0039). Unset = single-model behaviour (unchanged).
     #[serde(default)]
@@ -211,6 +228,11 @@ pub struct ReviewConfig {
     /// Max read-only tool calls executed concurrently within one turn (ADR-0042); from
     /// `review.max_batch_size` (or `LLM_MAX_BATCH_SIZE`) or [`DEFAULT_MAX_BATCH_SIZE`]. Clamped to ≥1.
     pub max_batch_size: usize,
+    /// Cumulative read budgets (ADR-0042): once spent, the matching tool is dropped and the model is
+    /// nudged to converge. From `review.max_*` (or `LLM_MAX_*`) or the `DEFAULT_MAX_*` constants.
+    pub max_files_read: usize,
+    pub max_searches: usize,
+    pub max_batches: usize,
     /// Generation params for the review model. `None` = provider/model default.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -307,6 +329,15 @@ impl ReviewConfig {
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
                 .max(1),
+            max_files_read: parse_env_u64("LLM_MAX_FILES_READ")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_FILES_READ),
+            max_searches: parse_env_u64("LLM_MAX_SEARCHES")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_SEARCHES),
+            max_batches: parse_env_u64("LLM_MAX_BATCHES")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_BATCHES),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -341,6 +372,18 @@ impl ReviewConfig {
                 .or_else(|| parse_env_u64("LLM_MAX_BATCH_SIZE").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
                 .max(1),
+            max_files_read: r
+                .max_files_read
+                .or_else(|| parse_env_u64("LLM_MAX_FILES_READ").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_FILES_READ),
+            max_searches: r
+                .max_searches
+                .or_else(|| parse_env_u64("LLM_MAX_SEARCHES").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_SEARCHES),
+            max_batches: r
+                .max_batches
+                .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_BATCHES),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
@@ -439,6 +482,9 @@ mod tests {
                 circuit_breaker_threshold: None,
                 max_turns: None,
                 max_batch_size: None,
+                max_files_read: None,
+                max_searches: None,
+                max_batches: None,
                 fallback_model: None,
             }),
         };
