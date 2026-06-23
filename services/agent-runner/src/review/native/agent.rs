@@ -226,6 +226,20 @@ pub async fn run_native_agent(
     let mut engaged_files: HashSet<String> = HashSet::new();
     let mut coverage_bounced = false;
 
+    // Cumulative read budgets (ADR-0042): once a budget is spent we drop the matching tool from the
+    // offered set and nudge the model to converge — read *enough*, then stop, instead of grinding the
+    // whole repo. `max_batches` (investigation rounds) forces the wind-down; the finer `max_files_read`
+    // / `max_searches` drop just their tool category. Counters advance after each turn's dispatch, so a
+    // turn's offered tools reflect the budget spent through the *previous* turn.
+    let max_files_read = review.max_files_read;
+    let max_searches = review.max_searches;
+    let max_batches = review.max_batches;
+    let mut files_read = 0usize;
+    let mut searches = 0usize;
+    let mut batches = 0usize;
+    let mut files_budget_announced = false;
+    let mut searches_budget_announced = false;
+
     for turn in 0..max_turns {
         let turn_started = Instant::now();
 
@@ -233,25 +247,73 @@ pub async fn run_native_agent(
         // it (once) to stop investigating and converge. The reduced set drops retrieval/read_file, so
         // the model has no way to keep digging — it must record any last findings and `finish`. The
         // existing `Exhausted` path below stays as the ultimate backstop if it STILL doesn't finish.
-        let in_winddown = turn >= winddown;
-        let turn_defs: &[ToolDef] = if in_winddown { &winddown_defs } else { &defs };
+        // Wind-down is triggered by the turn budget OR by spending the investigation-batch budget
+        // (ADR-0042) — either way, drop the investigation tools so the model converges.
+        let batches_spent = batches >= max_batches;
+        let in_winddown = turn >= winddown || batches_spent;
+        // Finer read budgets (ADR-0042): before full wind-down, drop just the exhausted tool category
+        // (read_file / retrieval) so the model can still record findings and finish while it stops the
+        // kind of reading it has used up. Built per-turn only when a budget is spent (else borrow `defs`).
+        let files_spent = files_read >= max_files_read;
+        let searches_spent = searches >= max_searches;
+        let turn_defs_owned: Vec<ToolDef>;
+        let turn_defs: &[ToolDef] = if in_winddown {
+            &winddown_defs
+        } else if files_spent || searches_spent {
+            turn_defs_owned = defs
+                .iter()
+                .filter(|t| {
+                    let n = t.function.name.as_str();
+                    // Drop a tool only when its own budget is spent.
+                    let drop =
+                        (files_spent && n == READ_FILE) || (searches_spent && is_retrieval_tool(n));
+                    !drop
+                })
+                .cloned()
+                .collect();
+            &turn_defs_owned
+        } else {
+            &defs
+        };
         if in_winddown && !winddown_announced {
             winddown_announced = true;
+            let why = if batches_spent && turn < winddown {
+                format!("Investigation batch budget spent ({batches}/{max_batches} batches)")
+            } else {
+                format!("Turn budget almost spent (turn {turn}/{max_turns})")
+            };
             messages.push(ChatMessage::user(format!(
-                "⏳ Turn budget almost spent (turn {turn}/{max_turns}). Stop investigating — record \
-                 any remaining findings now with add_review_comment/add_comment, then call `finish` \
-                 with your overall verdict. (The investigation tools are no longer available.)"
+                "⏳ {why}. Stop investigating — record any remaining findings now with \
+                 add_review_comment/add_comment, then call `finish` with your overall verdict. (The \
+                 investigation tools are no longer available.)"
             )));
-        } else if !in_winddown && !halfway_nudged && halfway > 0 && turn >= halfway {
-            // Softer one-time nudge around the halfway mark — keep it light; the tool restriction at
-            // the wind-down boundary is the real lever. `!in_winddown` guards small budgets where
-            // `winddown <= halfway`: once we've announced wind-down ("finalize now"), we must NOT then
-            // push the softer "you're past halfway" message — that would be a conflicting instruction.
-            halfway_nudged = true;
-            messages.push(ChatMessage::user(
-                "You're past halfway on your turn budget — start converging: record what you've found \
-                 and head toward `finish`.",
-            ));
+        } else if !in_winddown {
+            // One-time notice when a single read budget is exhausted (the tool is already dropped above).
+            if files_spent && !files_budget_announced {
+                files_budget_announced = true;
+                messages.push(ChatMessage::user(format!(
+                    "📄 You've read {files_read} files (the read_file budget). Stop opening files — work \
+                     from what you have, record findings, and head toward `finish`."
+                )));
+            }
+            if searches_spent && !searches_budget_announced {
+                searches_budget_announced = true;
+                messages.push(ChatMessage::user(format!(
+                    "🔎 You've run {searches} searches (the retrieval budget). Stop searching — record \
+                     findings from what you've found and head toward `finish`."
+                )));
+            }
+            if !halfway_nudged && halfway > 0 && turn >= halfway {
+                // Softer one-time nudge around the halfway mark — keep it light; the tool restriction at
+                // the wind-down boundary is the real lever. `!in_winddown` guards small budgets where
+                // `winddown <= halfway`: once we've announced wind-down ("finalize now"), we must NOT then
+                // push the softer "you're past halfway" message — that would be a conflicting instruction.
+                halfway_nudged = true;
+                messages.push(ChatMessage::user(
+                    "You're past halfway on your turn budget — start converging: record what you've \
+                     found and head toward `finish`.",
+                ));
+            }
         }
 
         // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
@@ -420,6 +482,19 @@ pub async fn run_native_agent(
             .filter(|(_, c)| is_read_only_tool(c.function.name.as_str()))
             .map(|(i, _)| i)
             .collect();
+        // Advance the cumulative read budgets (ADR-0042) — a turn that issued any read-only call is one
+        // investigation batch; tally read_file vs retrieval separately. These feed the NEXT turn's
+        // tool-set decision (drop the exhausted tool / force wind-down).
+        if !read_only.is_empty() {
+            batches += 1;
+        }
+        for c in &calls {
+            match c.function.name.as_str() {
+                READ_FILE => files_read += 1,
+                n if is_retrieval_tool(n) => searches += 1,
+                _ => {}
+            }
+        }
         let mut batched: std::collections::HashMap<usize, ToolOutcome> =
             std::collections::HashMap::new();
         let tools_ref = &tools;
@@ -612,6 +687,15 @@ fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
+/// The retrieval tools (vector + graph search) — the `max_searches` budget category (ADR-0042).
+/// Distinct from `read_file`, which has its own `max_files_read` budget.
+fn is_retrieval_tool(name: &str) -> bool {
+    matches!(
+        name,
+        VECTOR_SEMANTIC_SEARCH | GRAPH_FIND_SYMBOL | GRAPH_GET_CALLERS
+    )
+}
+
 /// Extract a string field from a tool call's JSON arguments, or `None` if the arguments don't parse or
 /// the field is absent/non-string (B, #137). Used to read the `path` / `file` a tool call targeted.
 fn arg_field(arguments: &str, key: &str) -> Option<String> {
@@ -766,6 +850,9 @@ mod tests {
             max_diff_chars: 60_000,
             max_turns: crate::bootstrap::config::DEFAULT_MAX_TURNS,
             max_batch_size: crate::bootstrap::config::DEFAULT_MAX_BATCH_SIZE,
+            max_files_read: crate::bootstrap::config::DEFAULT_MAX_FILES_READ,
+            max_searches: crate::bootstrap::config::DEFAULT_MAX_SEARCHES,
+            max_batches: crate::bootstrap::config::DEFAULT_MAX_BATCHES,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -1112,6 +1199,84 @@ mod tests {
                 VECTOR_SEMANTIC_SEARCH
             ],
             "every batched call dispatched, results in call order"
+        );
+    }
+
+    // ── Search budget (ADR-0042): once max_searches is spent, the retrieval tools are dropped from the
+    // offered set on the next turn — while read_file (a different budget) stays. The model here always
+    // asks for a search and never finishes, so the run ends in `Exhausted`; we assert the offered set. ──
+    #[tokio::test]
+    async fn search_budget_drops_retrieval_tools_once_spent() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: Arc::new(std::sync::Mutex::new(Vec::new())),
+                // Always asks for retrieval; never finishes (so the budget is spent on turn 0).
+                response: tool_call_reply(VECTOR_SEMANTIC_SEARCH, r#"{"query":"auth"}"#),
+            })
+            .mount(&chat)
+            .await;
+
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_searches = 1; // spent after a single retrieval call (turn 0)
+        review.max_turns = 4; // keep it short; the model never finishes → Exhausted
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("exhaustion is a clean outcome");
+        assert!(
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "got: {outcome:?}"
+        );
+
+        let log = offered.lock().unwrap();
+        assert!(log.len() >= 2, "at least two turns recorded");
+        assert!(
+            log[0].iter().any(|n| n == VECTOR_SEMANTIC_SEARCH),
+            "turn 0 offers retrieval (budget not yet spent): {:?}",
+            log[0]
+        );
+        assert!(
+            !log[1].iter().any(|n| n == VECTOR_SEMANTIC_SEARCH),
+            "turn 1 drops retrieval once the search budget is spent: {:?}",
+            log[1]
+        );
+        assert!(
+            log[1].iter().any(|n| n == READ_FILE),
+            "read_file (a different budget) is still offered on turn 1: {:?}",
+            log[1]
         );
     }
 
