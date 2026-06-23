@@ -301,6 +301,32 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /internal/tasks/{id}/review/inline/retract` — drop a buffered inline finding by
+    /// `(file, line)` (Phase 2, ADR-0043): the refute pass removes a P0/P1 that didn't survive
+    /// verification before it is ever posted.
+    pub async fn retract_finding(
+        &self,
+        task_id: Uuid,
+        file: &str,
+        line: i32,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!(
+            "{}/internal/tasks/{task_id}/review/inline/retract",
+            self.base_url
+        );
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "file": file, "line": line }))
+            .send()
+            .await
+            .context("retracting inline finding")?
+            .error_for_status()
+            .context("control plane rejected the retract")?;
+        Ok(())
+    }
+
     /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (ADR-0037).
     pub async fn add_review_reply(&self, task_id: Uuid, body: &str) -> anyhow::Result<()> {
         use anyhow::Context;

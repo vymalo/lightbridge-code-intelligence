@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
 use super::tools::{
     tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH,
-    GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, VECTOR_SEMANTIC_SEARCH,
+    GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING, VECTOR_SEMANTIC_SEARCH,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
@@ -104,6 +104,9 @@ fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
             let name = t.function.name.as_str();
             match name {
                 ADD_REVIEW_COMMENT => diff_present,
+                // RETRACT_FINDING stays available so the pre-finish refute pass can drop a P0/P1 that
+                // didn't hold even in the wind-down tail (Phase 2, ADR-0043).
+                RETRACT_FINDING => diff_present,
                 ADD_COMMENT | FINISH | ABORT => true,
                 _ => false,
             }
@@ -225,6 +228,13 @@ pub async fn run_native_agent(
         .unwrap_or_default();
     let mut engaged_files: HashSet<String> = HashSet::new();
     let mut coverage_bounced = false;
+
+    // Refute pass (Phase 2, ADR-0043): the quality gap is confidently-wrong P0/P1s. Before the first
+    // `finish`, if any P0/P1 finding was recorded, bounce once to force the model to re-verify each
+    // against its cited evidence and `retract_finding` the ones that don't hold. Cost-gated to P0/P1
+    // (a wrong blocker costs the most trust), one-shot so it adds at most a single turn.
+    let mut p0p1_recorded = 0usize;
+    let mut refute_bounced = false;
 
     // Cumulative read budgets (ADR-0042): once a budget is spent we drop the matching tool from the
     // offered set and nudge the model to converge — read *enough*, then stop, instead of grinding the
@@ -526,6 +536,17 @@ pub async fn run_native_agent(
                     // `finish` (and only count the ones the control plane actually buffered).
                     if tool == ADD_REVIEW_COMMENT && result.starts_with("recorded finding") {
                         findings_recorded += 1;
+                        // Track P0/P1 findings so the refute pass (ADR-0043) knows whether to verify
+                        // before finishing. A retract removes one from the count.
+                        if matches!(
+                            arg_field(&call.function.arguments, "priority").as_deref(),
+                            Some("P0") | Some("P1")
+                        ) {
+                            p0p1_recorded += 1;
+                        }
+                    }
+                    if tool == RETRACT_FINDING && result.starts_with("retracted finding") {
+                        p0p1_recorded = p0p1_recorded.saturating_sub(1);
                     }
                     // Proof-of-work (epic #137): a result summary so empty retrievals are visible in
                     // the live log stream (the full result still goes to the DB transcript below).
@@ -579,6 +600,27 @@ pub async fn run_native_agent(
                     // is one-shot, so the next `finish` always goes through.
                     continue;
                 }
+            }
+            // Refute pass (Phase 2, ADR-0043): before the first finish with P0/P1 findings, force a
+            // verification turn — re-check each against its cited evidence and `retract_finding` the
+            // ones that don't hold. One-shot; this is the lever that kills confidently-wrong blockers
+            // (the actual quality gap), which a self-reported confidence label would not catch.
+            if !refute_bounced && p0p1_recorded > 0 {
+                refute_bounced = true;
+                tracing::info!(
+                    task_id = %task_id,
+                    turn,
+                    p0p1 = p0p1_recorded,
+                    "refute pass: verifying P0/P1 findings before finish"
+                );
+                messages.push(ChatMessage::user(
+                    "Before you finish: you recorded P0/P1 finding(s). Re-verify each one against the \
+                     exact evidence you cited — look at the real code, not your memory. For any whose \
+                     claim does NOT hold (the cited lines don't actually show the bug), call \
+                     `retract_finding(file, line)`. A confidently-wrong blocker costs more trust than a \
+                     missed nit. Keep only what you can prove, then call `finish`.",
+                ));
+                continue;
             }
             return Ok(ReviewOutcome::Finished);
         }
@@ -1100,6 +1142,82 @@ mod tests {
             run(vec!["a.rs".to_string()]).await,
             2,
             "no bounce when the whole change is covered"
+        );
+    }
+
+    // ── Refute pass (ADR-0043): a P0/P1 finding triggers one pre-finish verification bounce; a P2
+    // does not. The diff is fully covered (finding is on the only changed file) so the coverage gate
+    // doesn't fire — this isolates the refute bounce. ──
+    #[tokio::test]
+    async fn refute_pass_bounces_once_for_p0p1_findings() {
+        async fn run(priority: &str) -> usize {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let chat = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(Script {
+                    calls: calls.clone(),
+                    responses: vec![
+                        tool_call_reply(
+                            "add_review_comment",
+                            &format!(
+                                r#"{{"file":"a.rs","line":2,"title":"t","priority":"{priority}","category":"correctness","body":"b","evidence":"line 2 does X"}}"#
+                            ),
+                        ),
+                        tool_call_reply("finish", r#"{"summary":"done"}"#),
+                        tool_call_reply("finish", r#"{"summary":"done after verifying"}"#),
+                    ],
+                })
+                .mount(&chat)
+                .await;
+            let cp = MockServer::start().await;
+            for ep in ["review/inline", "review/summary"] {
+                Mock::given(method("POST"))
+                    .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&cp)
+                    .await;
+            }
+            let review = review_config(format!("{}/v1", chat.uri()));
+            let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+            let embc = EmbeddingsClient::new("http://unused", "key", "model");
+            let diff = PrDiff {
+                diff: "@@ -1,1 +1,2 @@\n a\n+b\n".to_string(),
+                files: vec!["a.rs".to_string()],
+            };
+            let outcome = run_native_agent(
+                &review,
+                "review",
+                Some(&diff),
+                None,
+                None,
+                &[],
+                &cpc,
+                &embc,
+                Uuid::nil(),
+                std::path::Path::new("/tmp"),
+                &mut Vec::new(),
+            )
+            .await
+            .expect("clean finish");
+            assert!(
+                matches!(outcome, ReviewOutcome::Finished),
+                "got: {outcome:?}"
+            );
+            calls.load(Ordering::SeqCst)
+        }
+
+        // A P1 finding → one refute bounce before finish → 3 round-trips.
+        assert_eq!(
+            run("P1").await,
+            3,
+            "P0/P1 finding triggers the refute bounce"
+        );
+        // A P2 finding → no refute bounce → 2 round-trips.
+        assert_eq!(
+            run("P2").await,
+            2,
+            "a P2 finding does not trigger the refute bounce"
         );
     }
 
