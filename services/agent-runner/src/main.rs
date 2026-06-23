@@ -301,9 +301,14 @@ async fn run(
                     "review posted (truncated at step budget)".to_string()
                 }
                 Ok(review::ReviewOutcome::Aborted(reason)) => {
-                    // The model couldn't complete the review. Post the reason as the summary then
-                    // finalize, so the PR gets an honest note rather than silence.
+                    // The model couldn't complete the review. An aborted run is incomplete and
+                    // unverified — its buffered findings never went through the refute pass — so clear
+                    // them first and post ONLY the honest note, never half-baked/placeholder findings
+                    // (a `placeholder` P1 reached a PR this way — run 7c15f9bb). Best-effort clear.
                     let note = format!("Couldn't complete this review: {reason}");
+                    if let Err(error) = client.clear_findings(config.task_id).await {
+                        tracing::warn!(%error, "clearing findings on abort failed (non-fatal)");
+                    }
                     if let Err(error) = client.set_review_summary(config.task_id, &note).await {
                         tracing::warn!(%error, "setting abort summary failed (non-fatal)");
                     }
