@@ -18,6 +18,7 @@
 //! failed run is legible. Cancellation comes for free: `run()` races the whole task against the
 //! self-cancel poll, so a cancelled task drops the in-flight future.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,9 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
-use super::tools::{tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH};
+use super::tools::{
+    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, READ_FILE,
+};
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
@@ -117,6 +120,10 @@ pub async fn run_native_agent(
     command: &str,
     diff: Option<&PrDiff>,
     repo_instructions: Option<&str>,
+    // The agent's own prior review of this target (A, #137), pre-formatted by the control plane. `Some`
+    // only on a re-review with an earlier review; injected so the run reconciles with its past output
+    // instead of contradicting itself across runs.
+    prior_reviews: Option<&str>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -181,7 +188,7 @@ pub async fn run_native_agent(
         max_tokens: review.max_tokens,
     };
 
-    let mut messages = build_messages(review, command, diff, repo_instructions);
+    let mut messages = build_messages(review, command, diff, repo_instructions, prior_reviews);
 
     // Per-run circuit breaker (ADR-0039): consecutive turn-failures. The Job is ephemeral, so this is
     // deliberately per-process — no cross-process state. Resets on the first turn that succeeds.
@@ -202,6 +209,19 @@ pub async fn run_native_agent(
     let halfway = max_turns / 2;
     let mut winddown_announced = false;
     let mut halfway_nudged = false;
+
+    // Full-diff coverage gate (B, #137). The whole diff is in the prompt, but a run tends to find ONE
+    // issue and `finish` — two runs on the same PR each surfaced a *different* real P1 (see ADR-0041).
+    // We track which changed files the agent has actually engaged (opened with `read_file` or recorded a
+    // finding on) and, the FIRST time it tries to `finish` before the wind-down boundary with changed
+    // files still untouched, bounce it once with the explicit list so it accounts for the whole change
+    // across all dimensions before converging. Gated to pre-wind-down so it never fights the #173
+    // convergence tail, and bounce-once so it costs at most a single extra turn.
+    let changed_files: HashSet<String> = diff
+        .map(|d| d.files.iter().map(|f| normalize_repo_path(f)).collect())
+        .unwrap_or_default();
+    let mut engaged_files: HashSet<String> = HashSet::new();
+    let mut coverage_bounced = false;
 
     for turn in 0..max_turns {
         let turn_started = Instant::now();
@@ -375,6 +395,22 @@ pub async fn run_native_agent(
                 ),
                 _ => tracing::info!(task_id = %task_id, turn, tool, args = %args, "tool dispatch"),
             }
+            // Coverage tracking (B, #137): note any changed file the agent engages this turn — opened
+            // with `read_file` (`path`) or recorded a finding on (`file`). The finish gate below uses
+            // this to tell whether the whole change was accounted for.
+            match tool {
+                READ_FILE => {
+                    if let Some(p) = arg_field(&call.function.arguments, "path") {
+                        engaged_files.insert(normalize_repo_path(&p));
+                    }
+                }
+                ADD_REVIEW_COMMENT => {
+                    if let Some(p) = arg_field(&call.function.arguments, "file") {
+                        engaged_files.insert(normalize_repo_path(&p));
+                    }
+                }
+                _ => {}
+            }
             match tools.dispatch(call).await {
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
@@ -412,6 +448,31 @@ pub async fn run_native_agent(
             return Ok(ReviewOutcome::Aborted(reason));
         }
         if should_finish {
+            // Full-diff coverage gate (B, #137): if the model wants to finish early (before the
+            // wind-down tail) with changed files it never opened or commented on, bounce it ONCE with
+            // the explicit list so a single run accounts for the whole change instead of finding one
+            // issue and stopping. After the wind-down boundary the #173 convergence wins — we never
+            // bounce there, so this can't reopen the rabbit-hole the wind-down exists to close.
+            if !coverage_bounced && turn < winddown {
+                let uncovered: Vec<&str> = changed_files
+                    .difference(&engaged_files)
+                    .map(String::as_str)
+                    .collect();
+                if !uncovered.is_empty() {
+                    coverage_bounced = true;
+                    tracing::info!(
+                        task_id = %task_id,
+                        turn,
+                        uncovered = uncovered.len(),
+                        changed = changed_files.len(),
+                        "coverage gate: bouncing early finish — changed files not yet engaged"
+                    );
+                    messages.push(ChatMessage::user(coverage_nudge(&uncovered)));
+                    // Don't finish: loop again so the model reviews the rest, then finishes. The bounce
+                    // is one-shot, so the next `finish` always goes through.
+                    continue;
+                }
+            }
             return Ok(ReviewOutcome::Finished);
         }
 
@@ -447,6 +508,7 @@ fn build_messages(
     command: &str,
     diff: Option<&PrDiff>,
     repo_instructions: Option<&str>,
+    prior_reviews: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
 
@@ -475,6 +537,15 @@ fn build_messages(
         ),
     }
 
+    // Prior-review context (A, #137): the agent's own most recent review of this target, so a re-review
+    // reconciles with — rather than contradicts — its past output. Placed after the diff (the thing under
+    // review) and before the repo's own instructions; the tool-protocol in the system message stays
+    // authoritative. `None` on a first review, so a fresh PR reads exactly as before.
+    if let Some(prior) = prior_reviews {
+        user.push_str("\n\n");
+        user.push_str(prior);
+    }
+
     // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
     // already labelled and the tool-protocol/mission in the system message stays authoritative).
     if let Some(instructions) = repo_instructions {
@@ -483,6 +554,55 @@ fn build_messages(
     }
 
     vec![ChatMessage::system(system), ChatMessage::user(user)]
+}
+
+/// Normalize a repo-relative path for coverage comparison (B, #137): fold backslashes to `/`, then trim
+/// whitespace and a leading `./` or `/`, so a `read_file` / `add_review_comment` path matches the diff's
+/// file list regardless of how the model wrote it. The backslash fold mirrors the control plane's
+/// `normalize_path` (used when anchoring findings) — without it, a model emitting a Windows-style
+/// `src\a.rs` against a forward-slash diff would read as un-engaged and draw a spurious coverage bounce.
+fn normalize_repo_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+/// Extract a string field from a tool call's JSON arguments, or `None` if the arguments don't parse or
+/// the field is absent/non-string (B, #137). Used to read the `path` / `file` a tool call targeted.
+fn arg_field(arguments: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The one-shot coverage nudge (B, #137): list the changed files the agent hasn't engaged yet and ask it
+/// to review each across all dimensions before finishing. The file list is capped so a large PR can't
+/// blow the prompt; the agent still has the full diff above.
+fn coverage_nudge(uncovered: &[&str]) -> String {
+    const MAX_LISTED: usize = 15;
+    let listed = uncovered
+        .iter()
+        .take(MAX_LISTED)
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if uncovered.len() > MAX_LISTED {
+        format!("\n- … and {} more", uncovered.len() - MAX_LISTED)
+    } else {
+        String::new()
+    };
+    format!(
+        "Before you finish: these changed files don't yet have a finding and you haven't opened them:\n\
+         {listed}{more}\n\n\
+         Make sure you've reviewed each one across all relevant dimensions — correctness, security, \
+         quality, style, performance — not only the first issue you found. Open any you're unsure about \
+         with read_file, record anything worth raising with add_review_comment, then call `finish`. If \
+         you've genuinely considered them and there's nothing to add, call `finish` again now."
+    )
 }
 
 /// A turn-level chat failure after retries (and failover, if configured), carrying whether the
@@ -606,7 +726,7 @@ mod tests {
     #[test]
     fn build_messages_carries_request_and_uses_operator_prompt() {
         let review = review_config("http://unused/v1".to_string());
-        let msgs = build_messages(&review, "propose a better implementation", None, None);
+        let msgs = build_messages(&review, "propose a better implementation", None, None, None);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         let system = msgs[0].content.as_deref().expect("system content");
@@ -620,6 +740,54 @@ mod tests {
             user.contains("propose a better implementation"),
             "request reaches prompt: {user}"
         );
+    }
+
+    // Prior-review context (A, #137) is injected into the user prompt when present, and absent when not.
+    #[test]
+    fn build_messages_injects_prior_review_context() {
+        let review = review_config("http://unused/v1".to_string());
+        let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
+
+        let with_prior = build_messages(&review, "review again", None, None, Some(prior));
+        let user = with_prior[1].content.as_deref().expect("user content");
+        assert!(
+            user.contains("Your previous review of this pull request"),
+            "prior-review block reaches prompt: {user}"
+        );
+
+        let without = build_messages(&review, "review again", None, None, None);
+        let user = without[1].content.as_deref().expect("user content");
+        assert!(
+            !user.contains("previous review"),
+            "no prior-review block on a first review: {user}"
+        );
+    }
+
+    // Coverage gate helpers (B, #137): path normalization, arg extraction, and the nudge shape.
+    #[test]
+    fn coverage_helpers_normalize_extract_and_phrase() {
+        assert_eq!(normalize_repo_path("./src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_repo_path("/src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_repo_path("  src/a.rs  "), "src/a.rs");
+        // Windows-style backslashes fold to `/` (mirrors the control plane), so a `src\a.rs` tool arg
+        // still matches a forward-slash diff path instead of drawing a spurious bounce.
+        assert_eq!(normalize_repo_path("src\\a.rs"), "src/a.rs");
+        assert_eq!(normalize_repo_path(".\\src\\a.rs"), "src/a.rs");
+
+        assert_eq!(
+            arg_field(r#"{"file":"src/a.rs","line":7}"#, "file").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(arg_field(r#"{"path":"x"}"#, "file"), None, "missing key");
+        assert_eq!(arg_field("not json", "file"), None, "malformed args");
+
+        let nudge = coverage_nudge(&["src/b.rs", "src/c.rs"]);
+        assert!(nudge.contains("src/b.rs") && nudge.contains("src/c.rs"));
+        assert!(nudge.contains("correctness") && nudge.contains("security"));
+        // The over-cap path elides the tail rather than dumping a huge list.
+        let many: Vec<String> = (0..30).map(|i| format!("f{i}.rs")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(coverage_nudge(&refs).contains("and 15 more"));
     }
 
     // ── Positive e2e: search → add_review_comment → finish → Ok(()) ─────────────────────────────
@@ -691,6 +859,7 @@ mod tests {
             "@lightbridge review",
             Some(&diff),
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -708,6 +877,85 @@ mod tests {
         assert!(
             transcript.iter().any(|e| e.role == "assistant"),
             "transcript records assistant turns"
+        );
+    }
+
+    // ── Coverage gate (B, #137): an early `finish` with a changed file never engaged is bounced ONCE,
+    // costing exactly one extra chat round-trip; the model then finishes. Shares the Script counter so
+    // we can assert on the round-trip count (the bounce isn't otherwise observable from the outcome). ──
+    #[tokio::test]
+    async fn coverage_gate_bounces_early_finish_then_finishes() {
+        async fn run(files: Vec<String>) -> usize {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let chat = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(Script {
+                    calls: calls.clone(),
+                    responses: vec![
+                        // Turn 0: a finding on a.rs only.
+                        tool_call_reply(
+                            "add_review_comment",
+                            r#"{"file":"a.rs","line":2,"title":"nit","priority":"P2","category":"quality","body":"b"}"#,
+                        ),
+                        // Turn 1: try to finish. Bounced iff a changed file is still un-engaged.
+                        tool_call_reply("finish", r#"{"summary":"done"}"#),
+                        // Turn 2 (only reached on a bounce): finish for real.
+                        tool_call_reply("finish", r#"{"summary":"done after reviewing the rest"}"#),
+                    ],
+                })
+                .mount(&chat)
+                .await;
+
+            let cp = MockServer::start().await;
+            for ep in ["review/inline", "review/summary"] {
+                Mock::given(method("POST"))
+                    .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                    .respond_with(ResponseTemplate::new(204))
+                    .mount(&cp)
+                    .await;
+            }
+
+            let review = review_config(format!("{}/v1", chat.uri()));
+            let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+            let embc = EmbeddingsClient::new("http://unused", "key", "model");
+            let diff = PrDiff {
+                diff: "@@ -1,1 +1,2 @@\n a\n+b\n".to_string(),
+                files,
+            };
+            let outcome = run_native_agent(
+                &review,
+                "review",
+                Some(&diff),
+                None,
+                None,
+                &[],
+                &cpc,
+                &embc,
+                Uuid::nil(),
+                std::path::Path::new("/tmp"),
+                &mut Vec::new(),
+            )
+            .await
+            .expect("clean finish");
+            assert!(
+                matches!(outcome, ReviewOutcome::Finished),
+                "got: {outcome:?}"
+            );
+            calls.load(Ordering::SeqCst)
+        }
+
+        // b.rs is changed but never engaged → the turn-1 finish is bounced → 3 round-trips.
+        assert_eq!(
+            run(vec!["a.rs".to_string(), "b.rs".to_string()]).await,
+            3,
+            "early finish bounced once for the un-engaged file"
+        );
+        // Every changed file (a.rs) is engaged by the finding → no bounce → 2 round-trips.
+        assert_eq!(
+            run(vec!["a.rs".to_string()]).await,
+            2,
+            "no bounce when the whole change is covered"
         );
     }
 
@@ -744,6 +992,7 @@ mod tests {
         let outcome = run_native_agent(
             &review,
             "review",
+            None,
             None,
             None,
             &[],
@@ -806,6 +1055,7 @@ mod tests {
             "review",
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -837,6 +1087,7 @@ mod tests {
             "review",
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -866,6 +1117,7 @@ mod tests {
         let outcome = run_native_agent(
             &review,
             "review",
+            None,
             None,
             None,
             &[],
@@ -1030,6 +1282,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             &[],
             &cpc,

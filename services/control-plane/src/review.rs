@@ -111,6 +111,68 @@ impl Finding {
     }
 }
 
+/// How many prior findings to carry into a re-review's context (A, #137). A bound keeps the injected
+/// block small even on a PR that has accumulated many findings over several runs; the most recent
+/// review's findings are the relevant ones to reconcile against.
+const PRIOR_FINDINGS_CAP: usize = 30;
+
+/// Format a prior review (its verdict + findings) as a compact, untrusted context block to feed into a
+/// re-review so the agent reconciles with its own past output instead of starting blind (A, #137).
+///
+/// Live observation that motivated this: two runs on the same PR each found a *different* real P1 and
+/// the second run's summary flatly **contradicted** the first ("opens a new connection every call and
+/// never closes it" vs. "carefully designed lazy singleton connection"). The agent had no memory of its
+/// prior review, so it could confidently praise exactly what the previous run had flagged. Feeding the
+/// prior verdict + findings back in lets the model confirm-resolved / restate / explain-the-change
+/// rather than reset.
+///
+/// `findings` is the JSON array persisted in `reviews.findings` (an array of [`Finding`]); a malformed
+/// or empty array degrades to "verdict only", never an error. Returns `None` when there is nothing
+/// useful to inject (empty summary and no findings) so the caller can leave the field unset.
+pub fn format_prior_review(summary: &str, findings: &serde_json::Value) -> Option<String> {
+    let parsed: Vec<Finding> = serde_json::from_value(findings.clone()).unwrap_or_default();
+    let summary = summary.trim();
+    if summary.is_empty() && parsed.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "## Your previous review of this pull request\n\n\
+         You already posted a review on an earlier run. Reconcile with it: for each prior finding, \
+         either confirm the current diff resolves it or restate it — do not silently drop it — and do \
+         NOT contradict a prior conclusion without saying what changed. Build on this review rather \
+         than starting from scratch.\n",
+    );
+
+    if !summary.is_empty() {
+        out.push_str("\nPrior verdict: ");
+        out.push_str(summary);
+        out.push('\n');
+    }
+
+    if !parsed.is_empty() {
+        out.push_str("\nPrior findings:\n");
+        for f in parsed.iter().take(PRIOR_FINDINGS_CAP) {
+            out.push_str(&format!(
+                "- [{}/{}] {}:{} — {}\n",
+                f.priority(),
+                f.category(),
+                f.file,
+                f.line,
+                f.title.trim(),
+            ));
+        }
+        if parsed.len() > PRIOR_FINDINGS_CAP {
+            out.push_str(&format!(
+                "- … and {} more (older/lower-priority) — re-derive from the diff if still relevant\n",
+                parsed.len() - PRIOR_FINDINGS_CAP,
+            ));
+        }
+    }
+
+    Some(out)
+}
+
 /// Sanitize a badge label for a shields.io URL path segment: spaces/underscores/dashes (which shields
 /// treats specially) collapse to a safe token, non-alphanumerics are dropped. Our categories are
 /// single ASCII words, so this is just defensive against an odd model value.
@@ -241,10 +303,12 @@ pub fn validate(
 /// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
 /// (Some vs None), not on emptiness.
 fn inline_body(finding: &Finding) -> String {
-    // Standardized finding format (epic #89): `<LEVEL>: <title>` → explanation → committable
-    // suggestion → resources.
+    // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
+    // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
+    // which GitHub renders as a line break in comments) so the level reads as a header, not a prefix
+    // crowding the title.
     let mut body = format!(
-        "{} **{}**\n\n{}",
+        "{}\n**{}**\n\n{}",
         finding.level_badges(),
         finding.title,
         finding.body
@@ -290,11 +354,13 @@ fn normalize_path(path: &str) -> String {
 pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]) -> String {
     let mut body = format!("## Lightbridge review\n\n{summary}");
 
-    // A finding as a `- badges **title** — `file:line`` bullet + indented resource links. Shared by
-    // the changed-files notes and the out-of-scope section so every finding reads the same.
+    // A finding as a bullet whose first line is the badge row, with the bold title + `file:line` on the
+    // next (indented) line and the body under that — so the badges never share a line with the title,
+    // matching the inline rendering. The 2-space indent keeps the continuation lines inside the list
+    // item (Gemini #153). Shared by the changed-files notes and the out-of-scope section.
     let render_finding = |body: &mut String, f: &Finding| {
         body.push_str(&format!(
-            "\n- {} **{}** — `{}:{}`\n  {}",
+            "\n- {}\n  **{}** — `{}:{}`\n  {}",
             f.level_badges(),
             f.title,
             f.file,
@@ -399,6 +465,11 @@ mod tests {
         );
         assert!(body.contains("![security](https://img.shields.io/badge/security-red)"));
         assert!(body.contains("**Null deref**"));
+        // The badge row sits on its own line, with the bold title on the next line (not crowding it).
+        assert!(
+            body.contains(")\n**Null deref**"),
+            "badges and title on separate lines: {body}"
+        );
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
         assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));
@@ -416,6 +487,42 @@ mod tests {
         assert_eq!(f.priority(), "P0");
         assert_eq!(f.category(), "correctness");
         assert!(inline_body(&f).contains("https://img.shields.io/badge/P0-red"));
+    }
+
+    #[test]
+    fn format_prior_review_lists_verdict_and_findings() {
+        let findings = serde_json::to_value(vec![
+            finding("src/store.ts", 65, "IndexedDB connection leak in tx()"),
+            finding(
+                "src/store.ts",
+                156,
+                "Non-numeric exp treated as never-expired",
+            ),
+        ])
+        .unwrap();
+        let block = format_prior_review("Sound change, one P1.", &findings).expect("some context");
+        assert!(block.contains("Your previous review of this pull request"));
+        assert!(block.contains("Prior verdict: Sound change, one P1."));
+        // Each finding renders as `[priority/category] file:line — title`.
+        assert!(
+            block.contains("[P1/correctness] src/store.ts:65 — IndexedDB connection leak in tx()")
+        );
+        assert!(block.contains("src/store.ts:156 — Non-numeric exp treated as never-expired"));
+        // Reconcile instruction is present so the model builds on the prior review.
+        assert!(block.contains("Reconcile with it"));
+    }
+
+    #[test]
+    fn format_prior_review_is_none_when_empty() {
+        // Nothing useful to inject (no verdict, no findings) → caller leaves the field unset.
+        assert!(format_prior_review("   ", &serde_json::json!([])).is_none());
+        // A verdict alone still yields a block (findings may legitimately be empty on a clean review).
+        assert!(format_prior_review("No issues found.", &serde_json::json!([])).is_some());
+        // A malformed findings blob degrades to verdict-only rather than erroring.
+        let block = format_prior_review("verdict", &serde_json::json!({"oops": true}))
+            .expect("verdict survives malformed findings");
+        assert!(block.contains("Prior verdict: verdict"));
+        assert!(!block.contains("Prior findings:"));
     }
 
     #[test]
@@ -512,6 +619,11 @@ mod tests {
         assert!(body.contains("Looks risky."));
         assert!(body.contains("Issue"));
         assert!(body.contains("`a.rs:5`"));
+        // The bullet's badge row is on its own line; the title + file:line follow on the next line.
+        assert!(
+            body.contains("\n  **Issue** — `a.rs:5`"),
+            "badges and title on separate lines in the bullet: {body}"
+        );
         // Out-of-scope findings are surfaced in a collapsible section (not dropped, ADR-0033) but
         // DEMOTED — informational header, terse title + file, and crucially NO severity badge (they
         // are pre-existing, not findings on this change).

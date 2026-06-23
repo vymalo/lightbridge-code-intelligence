@@ -30,6 +30,12 @@ pub struct TaskContext {
     /// (ADR-0025). Defaults to `false` (index) if an older control plane omits the field.
     #[serde(default)]
     pub repo_indexed: bool,
+    /// The agent's own prior review of this target, pre-formatted by the control plane (A, #137). Present
+    /// only on a re-review where an earlier review exists; injected into the prompt so the run reconciles
+    /// with its past output instead of contradicting itself. Defaults to `None` (blind re-review, the old
+    /// behavior) if an older control plane omits the field.
+    #[serde(default)]
+    pub prior_reviews: Option<String>,
 }
 
 /// Default run kind when the control plane omits it (back-compat): a diff-scoped review.
@@ -500,6 +506,7 @@ mod tests {
             base_sha: None,
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,
+            prior_reviews: None,
         }
     }
 
