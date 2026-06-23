@@ -25,6 +25,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # rustls everywhere (no OpenSSL in the runtime images).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Concurrent joins for batched read-only tool dispatch (ADR-0042).
+futures = "0.3"
 
 # --- control-plane: HTTP + auth ---
 axum = "0.8"

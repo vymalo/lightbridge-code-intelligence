@@ -39,6 +39,13 @@ pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// Operator-tunable via `review.max_turns` / `LLM_MAX_TURNS`. Overridable but defaults generously.
 pub const DEFAULT_MAX_TURNS: usize = 40;
 
+/// Default ceiling on how many read-only tool calls (search / graph / `read_file`) the runner executes
+/// **concurrently** within one turn — the batch size for risk-first review (ADR-0042). The model can
+/// emit many tool calls in a turn; we run up to this many in parallel so a batch of reads costs one
+/// round-trip's latency instead of N. Read-only only: write/finish/abort keep their ordered, sequential
+/// handling. Operator-tunable via `review.max_batch_size` / `LLM_MAX_BATCH_SIZE`.
+pub const DEFAULT_MAX_BATCH_SIZE: usize = 8;
+
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
 /// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
@@ -88,6 +95,9 @@ pub struct ReviewFile {
     /// Numeric-string tolerant for `{env:…}`-substituted values.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_turns: Option<usize>,
+    /// Max read-only tool calls run concurrently per turn (ADR-0042). Unset = [`DEFAULT_MAX_BATCH_SIZE`].
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_batch_size: Option<usize>,
     /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
     /// (ADR-0039). Unset = single-model behaviour (unchanged).
     #[serde(default)]
@@ -198,6 +208,9 @@ pub struct ReviewConfig {
     /// Ceiling on model turns before the run is cut off; from `review.max_turns` (or `LLM_MAX_TURNS`
     /// env) or [`DEFAULT_MAX_TURNS`]. Operator-tunable so a large PR isn't truncated by a tight budget.
     pub max_turns: usize,
+    /// Max read-only tool calls executed concurrently within one turn (ADR-0042); from
+    /// `review.max_batch_size` (or `LLM_MAX_BATCH_SIZE`) or [`DEFAULT_MAX_BATCH_SIZE`]. Clamped to ≥1.
+    pub max_batch_size: usize,
     /// Generation params for the review model. `None` = provider/model default.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -290,6 +303,10 @@ impl ReviewConfig {
             max_turns: parse_env_u64("LLM_MAX_TURNS")
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_TURNS),
+            max_batch_size: parse_env_u64("LLM_MAX_BATCH_SIZE")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
+                .max(1),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -319,6 +336,11 @@ impl ReviewConfig {
                 .max_turns
                 .or_else(|| parse_env_u64("LLM_MAX_TURNS").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_TURNS),
+            max_batch_size: r
+                .max_batch_size
+                .or_else(|| parse_env_u64("LLM_MAX_BATCH_SIZE").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
+                .max(1),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
@@ -416,6 +438,7 @@ mod tests {
                 max_retries: None,
                 circuit_breaker_threshold: None,
                 max_turns: None,
+                max_batch_size: None,
                 fallback_model: None,
             }),
         };
