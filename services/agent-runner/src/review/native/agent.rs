@@ -13,6 +13,7 @@
 //! finalized**, so a mid-run death posts nothing (crash-safe). Cancellation comes for free: `run()`
 //! races the whole task against the self-cancel poll, so a cancelled task drops the in-flight future.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -57,6 +58,9 @@ pub async fn run_native_agent(
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
     task_id: Uuid,
+    // The checked-out repo root (the working tree under review). `read_file` reads from here,
+    // path-sanitized to within it, so the model can open the actual source (epic #137).
+    checkout_root: &Path,
     // Accumulates the run transcript (ADR-0034) as the loop progresses. The caller owns it and submits
     // it afterwards (even on error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
@@ -95,6 +99,7 @@ pub async fn run_native_agent(
         client,
         embedder,
         task_id,
+        checkout_root,
     };
     // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
     // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
@@ -205,6 +210,21 @@ pub async fn run_native_agent(
             latency_ms = turn_latency_ms,
             "agent turn complete"
         );
+        // Proof-of-work (epic #137): log the model's reasoning for this turn (bounded) so a run is
+        // legible from a live log tail, not just the DB transcript. Skip when the turn was pure
+        // tool-calls with no prose.
+        if let Some(reasoning) = assistant
+            .content
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+        {
+            tracing::info!(
+                task_id = %task_id,
+                turn,
+                reasoning = %truncate_on_boundary(reasoning, 600),
+                "agent reasoning"
+            );
+        }
         // Record the assistant turn in the transcript (ADR-0034): its reasoning + tool calls + tokens.
         transcript.push(TranscriptEntry {
             role: "assistant".to_string(),
@@ -237,17 +257,30 @@ pub async fn run_native_agent(
         let mut abort_reason = None;
         for call in &calls {
             let tool = call.function.name.as_str();
-            // One concise line per tool dispatch; for the mediated write tools, note the buffer effect.
+            // One concise line per tool dispatch with the (bounded) call arguments — so a live log
+            // tail shows what the model actually asked for, not just the tool name (epic #137). For
+            // the mediated write tools, note the buffer effect.
+            let args = truncate_on_boundary(&call.function.arguments, 400);
             match tool {
                 ADD_REVIEW_COMMENT | "add_comment" => tracing::info!(
-                    task_id = %task_id, turn, tool, "tool dispatch (finding/reply buffered)"
+                    task_id = %task_id, turn, tool, args = %args, "tool dispatch (finding/reply buffered)"
                 ),
-                _ => tracing::info!(task_id = %task_id, turn, tool, "tool dispatch"),
+                _ => tracing::info!(task_id = %task_id, turn, tool, args = %args, "tool dispatch"),
             }
             match tools.dispatch(call).await {
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
+                    // Proof-of-work (epic #137): a result summary so empty retrievals are visible in
+                    // the live log stream (the full result still goes to the DB transcript below).
+                    tracing::info!(
+                        task_id = %task_id,
+                        turn,
+                        tool,
+                        result_len = result.len(),
+                        result = %result_summary(&result),
+                        "tool result"
+                    );
                     // Record the tool result in the transcript (bounded), then feed it back to the model.
                     transcript.push(TranscriptEntry {
                         role: "tool".to_string(),
@@ -339,6 +372,17 @@ fn base_url_host(base_url: &str) -> String {
         .next()
         .map(|hostport| hostport.to_string())
         .unwrap_or_else(|| "(unparseable)".to_string())
+}
+
+/// A short, log-friendly summary of a tool result for live tailing (epic #137). Calls out an empty
+/// retrieval explicitly (a pretty-printed empty JSON array renders as `[]`) — the common failure the
+/// model used to flail against blindly — and otherwise returns the leading bytes (bounded).
+fn result_summary(result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed == "[]" {
+        return "0 hits".to_string();
+    }
+    truncate_on_boundary(trimmed, 200).to_string()
 }
 
 /// `s` truncated to at most `max` bytes, never slicing through a multi-byte char.
@@ -518,6 +562,7 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            std::path::Path::new("/tmp"),
             &mut transcript,
         )
         .await
@@ -567,6 +612,7 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            std::path::Path::new("/tmp"),
             &mut Vec::new(),
         )
         .await
@@ -623,6 +669,7 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            std::path::Path::new("/tmp"),
             &mut Vec::new(),
         )
         .await
@@ -653,6 +700,7 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            std::path::Path::new("/tmp"),
             &mut Vec::new(),
         )
         .await
@@ -680,6 +728,7 @@ mod tests {
             &cpc,
             &embc,
             Uuid::nil(),
+            std::path::Path::new("/tmp"),
             &mut Vec::new(),
         )
         .await
