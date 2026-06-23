@@ -4,14 +4,19 @@
 //! (the operator-owned persona + the machine tool-protocol) and the request → model → (retrieval +
 //! mediated write actions) → … → `finish`. The agent **acts as it goes** — each `add_review_comment`
 //! / `add_comment` is buffered control-plane-side; `finish` ends the run and the caller flushes the
-//! buffer as one grouped review. The loop is bounded ([`MAX_TURNS`]) and treats a tool/argument error
-//! as a recoverable turn (the model gets the error text back and retries), only failing on `abort`, an
-//! exhausted turn budget, a deterministic transport error, or the per-run circuit breaker tripping. A
-//! transport layer (ADR-0039) wraps each turn with a generous timeout, bounded retry/backoff on
-//! transient failures, optional failover to a secondary model, and a per-run circuit breaker; the HTTP
-//! error body is folded into the error so a failed run is legible. A run that fails is **never
-//! finalized**, so a mid-run death posts nothing (crash-safe). Cancellation comes for free: `run()`
-//! races the whole task against the self-cancel poll, so a cancelled task drops the in-flight future.
+//! buffer as one grouped review. The loop is bounded (`review.max_turns`) and treats a tool/argument
+//! error as a recoverable turn (the model gets the error text back and retries).
+//!
+//! Outcome model (#137): the loop returns a [`ReviewOutcome`] — `Finished` (the model called `finish`),
+//! `Exhausted` (the turn budget ran out while findings may be buffered), or `Aborted(reason)` (the
+//! model called `abort`). **Only a true transport/chat failure returns `Err`.** This is the key
+//! behavioural fix: the buffer (which the control plane holds) is NEVER discarded on a clean exhaustion
+//! — the caller finalizes on `Finished` OR `Exhausted` so buffered findings are still posted, with a
+//! truncation note on `Exhausted` and an abort note on `Aborted`. A transport layer (ADR-0039) wraps
+//! each turn with a generous timeout, bounded retry/backoff on transient failures, optional failover to
+//! a secondary model, and a per-run circuit breaker; the HTTP error body is folded into the error so a
+//! failed run is legible. Cancellation comes for free: `run()` races the whole task against the
+//! self-cancel poll, so a cancelled task drops the in-flight future.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,9 +31,19 @@ use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
 
-/// Hard ceiling on model turns, so a model that never finishes can't loop forever (each turn is one
-/// chat round-trip; tool calls within a turn don't count separately).
-const MAX_TURNS: usize = 16;
+/// How the agent loop ended (#137). Distinct from `Err`, which is reserved for a transport/chat
+/// failure where the gateway was unreachable and nothing useful happened. The caller maps these to a
+/// visible artifact on the PR:
+/// - [`ReviewOutcome::Finished`] — the model called `finish`; finalize flushes the buffer.
+/// - [`ReviewOutcome::Exhausted`] — the turn budget ran out with findings possibly still buffered;
+///   the caller posts a truncation note then finalizes (so buffered findings are NOT discarded).
+/// - [`ReviewOutcome::Aborted`] — the model called `abort`; the caller posts the reason then finalizes.
+#[derive(Debug)]
+pub enum ReviewOutcome {
+    Finished,
+    Exhausted,
+    Aborted(String),
+}
 
 /// The machine **tool-protocol** appended after the operator's system prompt (ADR-0037). This is the
 /// only behaviour-shaping text that lives in code — it is factual and coupled to the tool API (names,
@@ -44,10 +59,10 @@ your overall verdict — call `finish` exactly once when you are done, even if y
 genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run \
 commands.";
 
-/// Run the native agent loop. The agent acts via the mediated write tools during the run; on a clean
-/// `finish` this returns `Ok(())` and the caller flushes the buffer (`finalize_review`). Any error
-/// (abort, exhausted budget, transport) returns `Err` and the caller does **not** finalize — so a
-/// failed/partial run posts nothing.
+/// Run the native agent loop. The agent acts via the mediated write tools during the run. Returns a
+/// [`ReviewOutcome`] describing how it ended (`Finished` / `Exhausted` / `Aborted`) — the caller turns
+/// each into a visible PR artifact and finalizes the buffer in all three cases (#137). Only a true
+/// transport/chat failure returns `Err`; in that case nothing is posted.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_agent(
     review: &ReviewConfig,
@@ -64,7 +79,7 @@ pub async fn run_native_agent(
     // Accumulates the run transcript (ADR-0034) as the loop progresses. The caller owns it and submits
     // it afterwards (even on error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ReviewOutcome> {
     let chat = ChatClient::with_timeout(
         &review.base_url,
         &review.api_key,
@@ -121,7 +136,15 @@ pub async fn run_native_agent(
     let mut consecutive_failures = 0u32;
     let breaker_threshold = review.resilience.circuit_breaker_threshold;
 
-    for turn in 0..MAX_TURNS {
+    // Operator-tunable turn budget (#137): a tight ceiling used to exhaust mid-PR with findings still
+    // buffered. Generous default lives in config; a turn is ~6s on the deepseek model.
+    let max_turns = review.max_turns;
+    // Once the model has recorded ≥1 finding we nudge it to call `finish` so a wandering run doesn't burn
+    // the budget after the useful work is already buffered (#137). Nudge once, lightly.
+    let mut findings_recorded = 0usize;
+    let mut nudged_to_finish = false;
+
+    for turn in 0..max_turns {
         let turn_started = Instant::now();
         // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
         // secondary model (when configured) once for this turn. The outcome is either a completion, or
@@ -271,6 +294,11 @@ pub async fn run_native_agent(
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
+                    // Count successful inline findings so we know when to nudge the model toward
+                    // `finish` (and only count the ones the control plane actually buffered).
+                    if tool == ADD_REVIEW_COMMENT && result.starts_with("recorded finding") {
+                        findings_recorded += 1;
+                    }
                     // Proof-of-work (epic #137): a result summary so empty retrievals are visible in
                     // the live log stream (the full result still goes to the DB transcript below).
                     tracing::info!(
@@ -294,17 +322,36 @@ pub async fn run_native_agent(
                 }
             }
         }
-        // Abort wins over finish if the model somehow asked for both — it's the safer outcome (a
-        // failed run posts nothing).
+        // Abort wins over finish if the model somehow asked for both — it's the safer signal.
         if let Some(reason) = abort_reason {
-            anyhow::bail!("review agent aborted: {reason}");
+            return Ok(ReviewOutcome::Aborted(reason));
         }
         if should_finish {
-            return Ok(());
+            return Ok(ReviewOutcome::Finished);
+        }
+
+        // Light nudge (#137): once useful work is buffered, remind the model to wrap up with `finish`
+        // so it doesn't wander and exhaust the budget after the findings are already recorded. Once.
+        if findings_recorded > 0 && !nudged_to_finish {
+            nudged_to_finish = true;
+            messages.push(ChatMessage::user(
+                "You have recorded at least one finding. When your investigation is complete, call \
+                 `finish` with your overall verdict to post everything you've buffered — don't keep \
+                 investigating past the point of useful work.",
+            ));
         }
     }
 
-    anyhow::bail!("review agent did not finish within {MAX_TURNS} turns")
+    // Turn budget exhausted. CRITICAL (#137): do NOT bail — that would discard the buffered findings
+    // the control plane is holding. Return `Exhausted` so the caller posts a truncation note and
+    // finalizes, leaving a visible artifact (a real prod run lost 5 findings this way at turn 16).
+    tracing::warn!(
+        task_id = %task_id,
+        max_turns,
+        findings_recorded,
+        "review agent hit its turn budget without calling finish — finalizing buffered findings"
+    );
+    Ok(ReviewOutcome::Exhausted)
 }
 
 /// Assemble the system (operator prompt + tool-protocol) and user (request + diff) messages. The
@@ -456,6 +503,7 @@ mod tests {
             model: "m".to_string(),
             system_prompt: "You are a reviewer.".to_string(),
             max_diff_chars: 60_000,
+            max_turns: crate::bootstrap::config::DEFAULT_MAX_TURNS,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -553,7 +601,7 @@ mod tests {
             files: vec!["a.rs".to_string()],
         };
         let mut transcript = Vec::new();
-        run_native_agent(
+        let outcome = run_native_agent(
             &review,
             "@lightbridge review",
             Some(&diff),
@@ -567,6 +615,10 @@ mod tests {
         )
         .await
         .expect("agent finishes cleanly");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "got: {outcome:?}"
+        );
         // The transcript captured the assistant turns (search → add_review_comment → finish).
         assert!(
             transcript.iter().any(|e| e.role == "assistant"),
@@ -591,9 +643,10 @@ mod tests {
         assert!(offered.iter().any(|n| n == "finish"));
     }
 
-    // ── Negative e2e: abort surfaces as an error (caller does not finalize) ─────────────────────
+    // ── e2e: abort returns ReviewOutcome::Aborted(reason) — NOT an Err (#137). The caller posts the
+    // reason as the review summary then finalizes, so the PR gets an honest abort note, not silence. ──
     #[tokio::test]
-    async fn native_loop_abort_is_an_error() {
+    async fn native_loop_abort_returns_aborted_outcome() {
         let chat = MockServer::start().await;
         mount_chat(
             &chat,
@@ -603,7 +656,7 @@ mod tests {
         let review = review_config(format!("{}/v1", chat.uri()));
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(
+        let outcome = run_native_agent(
             &review,
             "review",
             None,
@@ -616,8 +669,11 @@ mod tests {
             &mut Vec::new(),
         )
         .await
-        .expect_err("abort is an error");
-        assert!(format!("{err:#}").contains("aborted"), "got: {err:#}");
+        .expect("abort is a clean outcome, not an Err");
+        match outcome {
+            ReviewOutcome::Aborted(reason) => assert_eq!(reason, "diff unreadable"),
+            other => panic!("expected Aborted, got {other:?}"),
+        }
     }
 
     // ── Failover: the primary model 5xx's; the configured secondary model handles the turn and the
@@ -711,15 +767,18 @@ mod tests {
         );
     }
 
-    // ── Negative e2e: a model that never finishes is cut off by the turn budget ─────────────────
+    // ── e2e: a model that never finishes is cut off by the turn budget and returns Exhausted — NOT an
+    // Err (#137). The buffered findings the control plane holds must survive so the caller can finalize
+    // (a real prod run lost 5 findings when this used to bail). ──────────────────────────────────────
     #[tokio::test]
-    async fn native_loop_gives_up_after_max_turns() {
+    async fn native_loop_exhausts_budget_without_discarding() {
         let chat = MockServer::start().await;
         mount_chat(&chat, vec![text_reply("Thinking out loud forever.")]).await;
-        let review = review_config(format!("{}/v1", chat.uri()));
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_turns = 3; // keep the test fast; the model never calls finish
         let cpc = ControlPlaneClient::new("http://unused", "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        let err = run_native_agent(
+        let outcome = run_native_agent(
             &review,
             "review",
             None,
@@ -732,10 +791,10 @@ mod tests {
             &mut Vec::new(),
         )
         .await
-        .expect_err("should give up");
+        .expect("exhaustion is a clean outcome, not an Err");
         assert!(
-            format!("{err:#}").contains("did not finish"),
-            "got: {err:#}"
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "got: {outcome:?}"
         );
     }
 }
