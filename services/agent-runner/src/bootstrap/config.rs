@@ -324,20 +324,24 @@ impl ReviewConfig {
             max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
             max_turns: parse_env_u64("LLM_MAX_TURNS")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_TURNS),
+                .unwrap_or(DEFAULT_MAX_TURNS)
+                .max(1),
             max_batch_size: parse_env_u64("LLM_MAX_BATCH_SIZE")
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
                 .max(1),
             max_files_read: parse_env_u64("LLM_MAX_FILES_READ")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_FILES_READ),
+                .unwrap_or(DEFAULT_MAX_FILES_READ)
+                .max(1),
             max_searches: parse_env_u64("LLM_MAX_SEARCHES")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_SEARCHES),
+                .unwrap_or(DEFAULT_MAX_SEARCHES)
+                .max(1),
             max_batches: parse_env_u64("LLM_MAX_BATCHES")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_BATCHES),
+                .unwrap_or(DEFAULT_MAX_BATCHES)
+                .max(1),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -366,7 +370,8 @@ impl ReviewConfig {
             max_turns: r
                 .max_turns
                 .or_else(|| parse_env_u64("LLM_MAX_TURNS").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_TURNS),
+                .unwrap_or(DEFAULT_MAX_TURNS)
+                .max(1),
             max_batch_size: r
                 .max_batch_size
                 .or_else(|| parse_env_u64("LLM_MAX_BATCH_SIZE").map(|n| n as usize))
@@ -375,15 +380,18 @@ impl ReviewConfig {
             max_files_read: r
                 .max_files_read
                 .or_else(|| parse_env_u64("LLM_MAX_FILES_READ").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_FILES_READ),
+                .unwrap_or(DEFAULT_MAX_FILES_READ)
+                .max(1),
             max_searches: r
                 .max_searches
                 .or_else(|| parse_env_u64("LLM_MAX_SEARCHES").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_SEARCHES),
+                .unwrap_or(DEFAULT_MAX_SEARCHES)
+                .max(1),
             max_batches: r
                 .max_batches
                 .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_BATCHES),
+                .unwrap_or(DEFAULT_MAX_BATCHES)
+                .max(1),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
@@ -494,5 +502,47 @@ mod tests {
             format!("{err:#}").contains("system prompt"),
             "error names the missing prompt: {err:#}"
         );
+    }
+
+    // A zero turn/budget (explicitly set in config or env) must clamp to ≥1, not silently no-op the
+    // run (`for turn in 0..0`) or pre-disable a tool (`count >= 0`). #180 dogfood-review catch.
+    #[test]
+    fn turn_and_read_budgets_clamp_to_at_least_one() {
+        // A temp prompt file so resolve() succeeds without touching env (parallel-safe).
+        let prompt = std::env::temp_dir().join(format!("lci-clamp-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let file = FileConfig {
+            embeddings: None,
+            review: Some(ReviewFile {
+                base_url: "https://gw/v1".to_string(),
+                api_key: "k".to_string(),
+                model: "m".to_string(),
+                system_prompt_file: Some(prompt.to_string_lossy().into_owned()),
+                max_diff_chars: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                request_timeout_secs: None,
+                max_retries: None,
+                circuit_breaker_threshold: None,
+                // Every count knob explicitly 0 — `Some(0)` short-circuits the env fallback, so this is
+                // deterministic regardless of the test environment.
+                max_turns: Some(0),
+                max_batch_size: Some(0),
+                max_files_read: Some(0),
+                max_searches: Some(0),
+                max_batches: Some(0),
+                fallback_model: None,
+            }),
+        };
+        let cfg = ReviewConfig::resolve(Some(&file))
+            .expect("resolves with a prompt file")
+            .expect("review enabled");
+        assert_eq!(cfg.max_turns, 1, "max_turns clamped");
+        assert_eq!(cfg.max_batch_size, 1, "max_batch_size clamped");
+        assert_eq!(cfg.max_files_read, 1, "max_files_read clamped");
+        assert_eq!(cfg.max_searches, 1, "max_searches clamped");
+        assert_eq!(cfg.max_batches, 1, "max_batches clamped");
+        std::fs::remove_file(&prompt).ok();
     }
 }
