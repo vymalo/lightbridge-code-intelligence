@@ -27,7 +27,8 @@ use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
 use super::tools::{
-    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, READ_FILE,
+    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH,
+    GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, VECTOR_SEMANTIC_SEARCH,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
@@ -198,6 +199,8 @@ pub async fn run_native_agent(
     // Operator-tunable turn budget (#137): a tight ceiling used to exhaust mid-PR with findings still
     // buffered. Generous default lives in config; a turn is ~6s on the deepseek model.
     let max_turns = review.max_turns;
+    // Risk-first batching (ADR-0042): how many read-only tool calls we run concurrently per turn.
+    let max_batch_size = review.max_batch_size.max(1);
     // Once the model has recorded ≥1 finding we nudge it to call `finish` so a wandering run doesn't burn
     // the budget after the useful work is already buffered (#137). Nudge once, lightly.
     let mut findings_recorded = 0usize;
@@ -377,27 +380,19 @@ pub async fn run_native_agent(
             continue;
         }
 
-        // Dispatch every call in the turn before acting on a terminal outcome: a model may emit
-        // parallel tool calls (e.g. a last `add_review_comment` alongside `finish`), and we must not
-        // drop the others just because `finish` appeared first. Each dispatch still runs its side
-        // effect (the write tools buffer immediately); we only defer the loop-control decision.
-        let mut should_finish = false;
-        let mut abort_reason = None;
+        // Pre-pass (no awaits): one concise log line per tool call with the (bounded) arguments — so a
+        // live log tail shows what the model asked for — plus coverage tracking (B, #137): note any
+        // changed file the agent engages this turn (opened with `read_file`, or commented on). Done up
+        // front so it's identical whether the call runs in the concurrent batch or the ordered pass.
         for call in &calls {
             let tool = call.function.name.as_str();
-            // One concise line per tool dispatch with the (bounded) call arguments — so a live log
-            // tail shows what the model actually asked for, not just the tool name (epic #137). For
-            // the mediated write tools, note the buffer effect.
             let args = truncate_on_boundary(&call.function.arguments, 400);
             match tool {
-                ADD_REVIEW_COMMENT | "add_comment" => tracing::info!(
+                ADD_REVIEW_COMMENT | ADD_COMMENT => tracing::info!(
                     task_id = %task_id, turn, tool, args = %args, "tool dispatch (finding/reply buffered)"
                 ),
                 _ => tracing::info!(task_id = %task_id, turn, tool, args = %args, "tool dispatch"),
             }
-            // Coverage tracking (B, #137): note any changed file the agent engages this turn — opened
-            // with `read_file` (`path`) or recorded a finding on (`file`). The finish gate below uses
-            // this to tell whether the whole change was accounted for.
             match tool {
                 READ_FILE => {
                     if let Some(p) = arg_field(&call.function.arguments, "path") {
@@ -411,7 +406,44 @@ pub async fn run_native_agent(
                 }
                 _ => {}
             }
-            match tools.dispatch(call).await {
+        }
+
+        // Risk-first batching (ADR-0042): run the turn's **read-only** calls (search / graph /
+        // `read_file`) concurrently, up to `max_batch_size` at a time, so a batch of reads costs one
+        // round-trip's latency instead of N. Only pure reads are parallelised: the write tools buffer
+        // control-plane-side and dedup by `(file,line)` last-write-wins, so they keep their original
+        // order; `finish`/`abort` are terminal. Results are keyed by call index and consumed in call
+        // order below, so the transcript and the messages echoed back to the model stay ordered.
+        let read_only: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| is_read_only_tool(c.function.name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let mut batched: std::collections::HashMap<usize, ToolOutcome> =
+            std::collections::HashMap::new();
+        let tools_ref = &tools;
+        let calls_ref = &calls;
+        for chunk in read_only.chunks(max_batch_size) {
+            let futs = chunk
+                .iter()
+                .map(|&i| async move { (i, tools_ref.dispatch(&calls_ref[i]).await) });
+            for (i, outcome) in futures::future::join_all(futs).await {
+                batched.insert(i, outcome);
+            }
+        }
+
+        // Ordered pass: consume each call in the model's original order. Read-only calls reuse the
+        // result computed concurrently above; write/terminal/progress calls dispatch inline (in order).
+        let mut should_finish = false;
+        let mut abort_reason = None;
+        for (i, call) in calls.iter().enumerate() {
+            let tool = call.function.name.as_str();
+            let outcome = match batched.remove(&i) {
+                Some(o) => o,
+                None => tools.dispatch(call).await,
+            };
+            match outcome {
                 ToolOutcome::Finish => should_finish = true,
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
@@ -569,6 +601,17 @@ fn normalize_repo_path(path: &str) -> String {
         .to_string()
 }
 
+/// Whether a tool call is pure read-only — no control-plane buffer side-effect, so it is safe to run
+/// concurrently in a batch (ADR-0042): the retrieval tools and `read_file`. `report_progress` is
+/// excluded (it posts), and the write/terminal tools (`add_review_comment` / `add_comment` / `finish` /
+/// `abort`) are excluded by design so their ordering and buffer semantics are preserved.
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        VECTOR_SEMANTIC_SEARCH | GRAPH_FIND_SYMBOL | GRAPH_GET_CALLERS | READ_FILE
+    )
+}
+
 /// Extract a string field from a tool call's JSON arguments, or `None` if the arguments don't parse or
 /// the field is absent/non-string (B, #137). Used to read the `path` / `file` a tool call targeted.
 fn arg_field(arguments: &str, key: &str) -> Option<String> {
@@ -690,6 +733,19 @@ mod tests {
             "message": { "role": "assistant", "content": text } }]})
     }
 
+    // An assistant turn that emits several tool calls at once (a batch). `calls` is (id, name, args).
+    fn batch_reply(calls: &[(&str, &str, &str)]) -> serde_json::Value {
+        let tool_calls: Vec<_> = calls
+            .iter()
+            .map(|(id, name, args)| {
+                json!({ "id": id, "type": "function",
+                    "function": { "name": name, "arguments": args } })
+            })
+            .collect();
+        json!({ "choices": [{ "finish_reason": "tool_calls",
+            "message": { "role": "assistant", "tool_calls": tool_calls } }]})
+    }
+
     async fn mount_chat(server: &MockServer, responses: Vec<serde_json::Value>) {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -709,6 +765,7 @@ mod tests {
             system_prompt: "You are a reviewer.".to_string(),
             max_diff_chars: 60_000,
             max_turns: crate::bootstrap::config::DEFAULT_MAX_TURNS,
+            max_batch_size: crate::bootstrap::config::DEFAULT_MAX_BATCH_SIZE,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -956,6 +1013,105 @@ mod tests {
             run(vec!["a.rs".to_string()]).await,
             2,
             "no bounce when the whole change is covered"
+        );
+    }
+
+    // Read-only classifier (ADR-0042): retrieval + read_file are batchable; write/terminal/progress not.
+    #[test]
+    fn read_only_tool_classification() {
+        for t in [
+            VECTOR_SEMANTIC_SEARCH,
+            GRAPH_FIND_SYMBOL,
+            GRAPH_GET_CALLERS,
+            READ_FILE,
+        ] {
+            assert!(is_read_only_tool(t), "{t} should be read-only");
+        }
+        for t in [
+            ADD_REVIEW_COMMENT,
+            ADD_COMMENT,
+            FINISH,
+            ABORT,
+            "report_progress",
+        ] {
+            assert!(!is_read_only_tool(t), "{t} must not be batched");
+        }
+    }
+
+    // ── Batched read-only dispatch (ADR-0042): a turn that emits several read-only calls at once runs
+    // them all and echoes their results back in the model's original call order, then finishes. ──
+    #[tokio::test]
+    async fn batched_read_only_calls_all_dispatch_in_order() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                // One turn, three read-only calls at once (a batch).
+                batch_reply(&[
+                    ("c1", VECTOR_SEMANTIC_SEARCH, r#"{"query":"auth"}"#),
+                    ("c2", GRAPH_FIND_SYMBOL, r#"{"symbol":"validate"}"#),
+                    ("c3", VECTOR_SEMANTIC_SEARCH, r#"{"query":"tokens"}"#),
+                ]),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+        )
+        .await;
+
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        for ep in ["search", "graph/find-symbol", "review/summary"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&cp)
+                .await;
+        }
+
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let mut transcript = Vec::new();
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut transcript,
+        )
+        .await
+        .expect("clean finish");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "got: {outcome:?}"
+        );
+
+        // All three batched read-only calls produced a tool result, in the original call order.
+        let tool_names: Vec<&str> = transcript
+            .iter()
+            .filter(|e| e.role == "tool")
+            .filter_map(|e| e.tool_name.as_deref())
+            .collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                VECTOR_SEMANTIC_SEARCH,
+                GRAPH_FIND_SYMBOL,
+                VECTOR_SEMANTIC_SEARCH
+            ],
+            "every batched call dispatched, results in call order"
         );
     }
 
