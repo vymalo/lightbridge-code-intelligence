@@ -631,6 +631,11 @@ pub struct TaskRow {
     /// The Kubernetes Job name (set once dispatched), so the console can stream the run's logs. `None`
     /// before dispatch or after the Job is reaped/TTL'd. Already selected by `TASK_SELECT` (`t.*`).
     pub job_name: Option<String>,
+    /// The runner's free-text status `detail` (#137), persisted on the last status report that carried
+    /// one. `None` for a genuine clean success / runs that predate migration 0016; `Some` records why
+    /// a run did not post a review (e.g. a failure reason, or a "posted nothing" no-op), so the console
+    /// can tell a silent no-op apart from a real clean review. Selected by `TASK_SELECT` (`t.*`).
+    pub error_detail: Option<String>,
 }
 
 /// `SELECT` projection shared by the list and detail queries: every `tasks` column plus the joined
@@ -1288,7 +1293,17 @@ pub async fn get_task_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, 
 /// `cancelled`) stamp `completed_at` and clear the dispatcher lease so the reaper (Phase 2) won't
 /// reclaim a finished task; `running` stamps `started_at` if unset. Returns `false` if no task
 /// matched the id. The caller validates `status` with [`is_runner_reportable_status`] first.
-pub async fn set_task_status(pool: &PgPool, id: Uuid, status: &str) -> Result<bool, sqlx::Error> {
+///
+/// `detail` is the runner's free-text status reason (#137): when `Some` it is persisted to
+/// `error_detail` so the console can surface why a run did not post a review (and tell a silent no-op
+/// apart from a real clean success). `None` leaves any existing `error_detail` untouched — a later
+/// report without a detail must not erase a reason an earlier one recorded.
+pub async fn set_task_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let terminal = matches!(status, "succeeded" | "failed" | "timed_out" | "cancelled");
     let result = sqlx::query(
         "UPDATE tasks SET \
@@ -1296,12 +1311,14 @@ pub async fn set_task_status(pool: &PgPool, id: Uuid, status: &str) -> Result<bo
              started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, now()) ELSE started_at END, \
              completed_at = CASE WHEN $3 THEN now() ELSE completed_at END, \
              lease_owner = CASE WHEN $3 THEN NULL ELSE lease_owner END, \
-             lease_expires_at = CASE WHEN $3 THEN NULL ELSE lease_expires_at END \
+             lease_expires_at = CASE WHEN $3 THEN NULL ELSE lease_expires_at END, \
+             error_detail = CASE WHEN $2 = 'running' THEN NULL ELSE COALESCE($4, error_detail) END \
          WHERE id = $1",
     )
     .bind(id)
     .bind(status)
     .bind(terminal)
+    .bind(detail)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
@@ -2211,7 +2228,9 @@ mod tests {
         let repo_id = seed(&pool).await;
         let task = claim_after_create(&pool, repo_id, "head1").await;
 
-        assert!(set_task_status(&pool, task, "succeeded").await.unwrap());
+        assert!(set_task_status(&pool, task, "succeeded", None)
+            .await
+            .unwrap());
 
         let row: (String, Option<OffsetDateTime>, Option<String>) =
             sqlx::query_as("SELECT status, completed_at, lease_owner FROM tasks WHERE id = $1")
@@ -2224,9 +2243,66 @@ mod tests {
         assert!(row.2.is_none(), "terminal status clears the lease");
 
         assert!(
-            !set_task_status(&pool, Uuid::nil(), "failed").await.unwrap(),
+            !set_task_status(&pool, Uuid::nil(), "failed", None)
+                .await
+                .unwrap(),
             "unknown id reports no row updated"
         );
+    }
+
+    /// #137: a reported `detail` is persisted to `error_detail`, and a later report without one does
+    /// not erase it (so a "posted nothing" reason recorded on success survives).
+    #[sqlx::test]
+    async fn set_task_status_persists_and_preserves_detail(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head1").await;
+
+        // A report carrying a detail records it.
+        assert!(set_task_status(
+            &pool,
+            task,
+            "succeeded",
+            Some("Review produced no comments to post.")
+        )
+        .await
+        .unwrap());
+        let detail: Option<String> =
+            sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            detail.as_deref(),
+            Some("Review produced no comments to post.")
+        );
+
+        // A later report without a detail must not erase the recorded reason.
+        assert!(set_task_status(&pool, task, "succeeded", None)
+            .await
+            .unwrap());
+        let preserved: Option<String> =
+            sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            preserved.as_deref(),
+            Some("Review produced no comments to post."),
+            "a detail-less report preserves the earlier reason"
+        );
+
+        // A retry/restart transitions back to `running` — it must CLEAR the stale reason so a
+        // now-succeeding attempt isn't still flagged with the previous failure's detail.
+        assert!(set_task_status(&pool, task, "running", None).await.unwrap());
+        let cleared: Option<String> =
+            sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, None, "a fresh `running` transition clears error_detail");
     }
 
     /// Create then claim a task (claim sets it `running` with a lease) so status-transition tests

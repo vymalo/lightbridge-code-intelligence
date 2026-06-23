@@ -101,7 +101,7 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
                 crate::http::metrics::reap_outcome("renewed");
             }),
             ReapAction::MarkSucceeded => {
-                db::set_task_status(pool, task.id, "succeeded").await.map(|_| {
+                db::set_task_status(pool, task.id, "succeeded", None).await.map(|_| {
                     crate::http::metrics::reap_outcome("succeeded");
                     tracing::info!(task_id = %task.id, "reaper: Job completed but report was lost; marked succeeded");
                 })
@@ -119,7 +119,14 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
             }
             ReapAction::Fail => {
                 delete_dead_job(launcher, &task).await;
-                db::set_task_status(pool, task.id, "failed").await.map(|_| {
+                db::set_task_status(
+                    pool,
+                    task.id,
+                    "failed",
+                    Some("Stuck task exhausted retries; failed by the reaper after its Job stopped reporting."),
+                )
+                .await
+                .map(|_| {
                     crate::http::metrics::reap_outcome("failed");
                     tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
                 })

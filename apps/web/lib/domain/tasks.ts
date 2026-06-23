@@ -26,6 +26,10 @@ export interface Task {
   /** The dispatched Kubernetes Job name, used to stream the run's logs. `null` before dispatch or
    * after the Job is cleaned up. */
   job_name: string | null;
+  /** The runner's free-text status reason (#137). `null` for a genuine clean success / runs from
+   * before this was persisted; non-null records why a run did not post a review (a failure reason,
+   * or a "posted nothing" no-op) so a silent no-op is tellable apart from a real clean review. */
+  error_detail: string | null;
 }
 
 /** One finding from the agent's review (mirrors `review::Finding`). */
