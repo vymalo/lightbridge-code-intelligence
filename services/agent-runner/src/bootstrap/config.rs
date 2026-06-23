@@ -331,13 +331,16 @@ impl ReviewConfig {
                 .max(1),
             max_files_read: parse_env_u64("LLM_MAX_FILES_READ")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_FILES_READ),
+                .unwrap_or(DEFAULT_MAX_FILES_READ)
+                .max(1),
             max_searches: parse_env_u64("LLM_MAX_SEARCHES")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_SEARCHES),
+                .unwrap_or(DEFAULT_MAX_SEARCHES)
+                .max(1),
             max_batches: parse_env_u64("LLM_MAX_BATCHES")
                 .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_BATCHES),
+                .unwrap_or(DEFAULT_MAX_BATCHES)
+                .max(1),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -375,15 +378,18 @@ impl ReviewConfig {
             max_files_read: r
                 .max_files_read
                 .or_else(|| parse_env_u64("LLM_MAX_FILES_READ").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_FILES_READ),
+                .unwrap_or(DEFAULT_MAX_FILES_READ)
+                .max(1),
             max_searches: r
                 .max_searches
                 .or_else(|| parse_env_u64("LLM_MAX_SEARCHES").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_SEARCHES),
+                .unwrap_or(DEFAULT_MAX_SEARCHES)
+                .max(1),
             max_batches: r
                 .max_batches
                 .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
-                .unwrap_or(DEFAULT_MAX_BATCHES),
+                .unwrap_or(DEFAULT_MAX_BATCHES)
+                .max(1),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
