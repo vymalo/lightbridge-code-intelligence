@@ -1312,7 +1312,7 @@ pub async fn set_task_status(
              completed_at = CASE WHEN $3 THEN now() ELSE completed_at END, \
              lease_owner = CASE WHEN $3 THEN NULL ELSE lease_owner END, \
              lease_expires_at = CASE WHEN $3 THEN NULL ELSE lease_expires_at END, \
-             error_detail = COALESCE($4, error_detail) \
+             error_detail = CASE WHEN $2 = 'running' THEN NULL ELSE COALESCE($4, error_detail) END \
          WHERE id = $1",
     )
     .bind(id)
@@ -2292,6 +2292,17 @@ mod tests {
             Some("Review produced no comments to post."),
             "a detail-less report preserves the earlier reason"
         );
+
+        // A retry/restart transitions back to `running` — it must CLEAR the stale reason so a
+        // now-succeeding attempt isn't still flagged with the previous failure's detail.
+        assert!(set_task_status(&pool, task, "running", None).await.unwrap());
+        let cleared: Option<String> =
+            sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, None, "a fresh `running` transition clears error_detail");
     }
 
     /// Create then claim a task (claim sets it `running` with a lease) so status-transition tests
