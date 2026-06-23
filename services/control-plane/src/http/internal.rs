@@ -99,6 +99,12 @@ pub struct TaskContextResponse {
     /// Whether the repo already has a semantic index. The runner skips the full re-index on a review
     /// when this is true (reuses the base index + the PR diff) — ADR-0025.
     pub repo_indexed: bool,
+    /// The agent's own prior review of this target, formatted as a context block (A, #137), present only
+    /// for `review`-kind tasks on a target that already has an earlier posted review. The runner injects
+    /// it into the prompt so a re-review reconciles with — rather than contradicts — its past output.
+    /// `None` for the first review of a target, for `ask`/`index` runs, or if the lookup failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_reviews: Option<String>,
 }
 
 /// `GET /internal/tasks/{id}` — task context + a freshly-minted installation token for the runner.
@@ -138,6 +144,33 @@ pub async fn get_context(
         .await
         .unwrap_or(false);
 
+    // Prior-review context (A, #137): on a re-review, feed the agent its own most recent review of this
+    // target so it reconciles instead of contradicting itself across runs. Only for `review` kind (an
+    // `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup error degrades to a
+    // blind re-review (the old behavior), never a failed task.
+    let prior_reviews = if context.kind == "review" {
+        match crate::db::latest_prior_review_for_target(
+            pool,
+            context.repository_id,
+            &context.target_type,
+            context.target_id,
+            context.id,
+        )
+        .await
+        {
+            Ok(Some((summary, findings))) => {
+                crate::review::format_prior_review(&summary, &findings)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, task_id = %id, "prior-review lookup failed (non-fatal)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Json(TaskContextResponse {
         task_id: context.id,
         repository_id: context.repository_id,
@@ -153,6 +186,7 @@ pub async fn get_context(
         base_sha: context.base_sha,
         head_sha: context.head_sha,
         repo_indexed,
+        prior_reviews,
     })
     .into_response()
 }

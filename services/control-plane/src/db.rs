@@ -168,6 +168,35 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
         .await
 }
 
+/// The summary + findings of the most recent prior review on the same target (A, #137) — used to feed a
+/// re-review its own past output so it reconciles instead of starting blind. Joins `reviews` to `tasks`
+/// to match the same `(repository_id, target_type, target_id)` as the current task, excluding the
+/// current task itself, newest first. Returns `None` when this target has no earlier posted review
+/// (e.g. the first review on a freshly opened PR). Best-effort context: the caller treats a query error
+/// as "no prior review" so a DB hiccup degrades to the old blind re-review rather than failing the task.
+pub async fn latest_prior_review_for_target(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    current_task_id: Uuid,
+) -> Result<Option<(String, Value)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Value)>(
+        "SELECT r.summary, r.findings \
+         FROM reviews r JOIN tasks t ON t.id = r.task_id \
+         WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+           AND r.task_id <> $4 \
+         ORDER BY r.created_at DESC \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(current_task_id)
+    .fetch_optional(pool)
+    .await
+}
+
 // ── ADR-0034 agent run transcript ──────────────────────────────────────────────────────────────
 
 /// One transcript entry submitted by the runner (the ingest shape; mirrors
@@ -2053,6 +2082,65 @@ mod tests {
         );
 
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    /// A (#137): a re-review on the same target finds the earlier review's summary + findings, scoped to
+    /// the same `(repository_id, target_type, target_id)` and excluding the current task.
+    #[sqlx::test]
+    async fn latest_prior_review_is_target_scoped_and_excludes_current(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        // Two tasks on the SAME PR (#7), different heads — the original review and the re-review.
+        let first = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let rereview = create_task(&pool, &pr_task(repo_id, "h2"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let findings = serde_json::json!([{ "file": "a.rs", "line": 3, "priority": "P1",
+            "category": "quality", "title": "leak", "body": "b" }]);
+        upsert_review(
+            &pool,
+            first,
+            "first verdict",
+            "body",
+            1,
+            0,
+            0,
+            &findings,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The re-review sees the first review (excludes itself, which has no review yet).
+        let prior = latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, rereview)
+            .await
+            .unwrap()
+            .expect("prior review found");
+        assert_eq!(prior.0, "first verdict");
+        assert_eq!(prior.1[0]["title"], "leak");
+
+        // From the first task's own perspective there is no *other* review → None.
+        assert!(
+            latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, first)
+                .await
+                .unwrap()
+                .is_none(),
+            "a task is never its own prior review"
+        );
+
+        // A different target on the same repo doesn't leak across.
+        assert!(
+            latest_prior_review_for_target(&pool, repo_id, "pull_request", 999, rereview)
+                .await
+                .unwrap()
+                .is_none(),
+            "scoped to the target id"
+        );
     }
 
     /// ADR-0035: reconcile reactions on a comment — new ones are inserted, vanished ones (un-react)
