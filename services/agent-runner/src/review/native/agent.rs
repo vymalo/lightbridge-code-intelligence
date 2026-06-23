@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use uuid::Uuid;
 
-use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy};
-use super::tools::{tool_defs, ToolOutcome, Tools, ADD_REVIEW_COMMENT};
+use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
+use super::tools::{tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH};
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
@@ -58,6 +58,54 @@ to a diff line (e.g. answering a question). Nothing you record is posted until y
 your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you \
 genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run \
 commands.";
+
+/// Wind-down convergence (#137): how many turns before the budget ceiling we switch the model onto a
+/// reduced tool set so it stops investigating and converges to a `finish`. Computed per-run as a
+/// fraction of `max_turns` (see [`winddown_turn`]) so a tiny budget still leaves a turn or two to wrap
+/// up and a generous budget gets a proportional tail. Observed in prod (izhub#205/#207): the agent ran
+/// the full budget with **0** `finish` calls — endless retrieval/`read_file` rabbit holes — and the
+/// `Exhausted` safety-net fired instead of a real verdict. The lever is removing the investigation
+/// tools near the end: with only the write/finish/abort tools left, the model must record any last
+/// findings and finish.
+const WINDDOWN_MIN_TURNS: usize = 2;
+
+/// The first turn index at which the wind-down (reduced tool set + budget message) kicks in. Reserves
+/// `max(WINDDOWN_MIN_TURNS, max_turns / 10)` turns at the tail of the budget, clamped so it never lands
+/// before turn 1 (we always allow at least one full-toolset turn). A `max_turns=1` budget is degenerate
+/// — one turn can't both investigate AND wind down — so it returns `1`, which the single turn (`turn=0`)
+/// never reaches: that run gets no wind-down and the `Exhausted` backstop catches it (fine for a
+/// one-turn budget).
+fn winddown_turn(max_turns: usize) -> usize {
+    if max_turns <= WINDDOWN_MIN_TURNS {
+        // Tiny budgets: wind down on the final turn so there's still one investigation turn first.
+        // (`max_turns=1` → `1`, unreachable by the only turn → no wind-down; the backstop handles it.)
+        return max_turns.saturating_sub(1).max(1);
+    }
+    let reserve = WINDDOWN_MIN_TURNS.max(max_turns / 10);
+    // Keep at least one full-toolset turn at the start, and at least one wind-down turn at the end.
+    max_turns
+        .saturating_sub(reserve)
+        .clamp(1, max_turns.saturating_sub(1))
+}
+
+/// The reduced tool set offered once the run enters its wind-down (#137): the write tools (so the model
+/// can record any last findings), plus `finish`/`abort` (so it can converge). **Drops** the retrieval
+/// tools, `read_file`, and `report_progress` — with no way to keep investigating, the model must wrap
+/// up. `add_review_comment` is only kept when a diff is present (mirrors the full-set gating, so a
+/// no-diff run never offers an inline tool that can't anchor).
+fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
+    tool_defs()
+        .into_iter()
+        .filter(|t| {
+            let name = t.function.name.as_str();
+            match name {
+                ADD_REVIEW_COMMENT => diff_present,
+                ADD_COMMENT | FINISH | ABORT => true,
+                _ => false,
+            }
+        })
+        .collect()
+}
 
 /// Run the native agent loop. The agent acts via the mediated write tools during the run. Returns a
 /// [`ReviewOutcome`] describing how it ended (`Finished` / `Exhausted` / `Aborted`) — the caller turns
@@ -119,10 +167,14 @@ pub async fn run_native_agent(
     // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
     // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
     // replies via `add_comment` instead of hallucinating inline comments that go nowhere.
+    let diff_present = diff.is_some();
     let mut defs = tool_defs();
-    if diff.is_none() {
+    if !diff_present {
         defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
     }
+    // Reduced tool set for the wind-down tail (#137): write/finish/abort only, retrieval/read_file
+    // dropped so the model can no longer keep investigating once the budget is nearly spent.
+    let winddown_defs = winddown_tool_defs(diff_present);
     let params = ChatParams {
         temperature: review.temperature,
         top_p: review.top_p,
@@ -143,14 +195,47 @@ pub async fn run_native_agent(
     // the budget after the useful work is already buffered (#137). Nudge once, lightly.
     let mut findings_recorded = 0usize;
     let mut nudged_to_finish = false;
+    // Wind-down convergence (#137): the turn at which we restrict the tool set + inject the budget
+    // message, plus a one-time soft nudge around the halfway mark. The tool restriction is the real
+    // lever — the messages just explain why the tools changed.
+    let winddown = winddown_turn(max_turns);
+    let halfway = max_turns / 2;
+    let mut winddown_announced = false;
+    let mut halfway_nudged = false;
 
     for turn in 0..max_turns {
         let turn_started = Instant::now();
+
+        // Wind-down (#137): as the budget depletes, switch the model onto the reduced tool set and tell
+        // it (once) to stop investigating and converge. The reduced set drops retrieval/read_file, so
+        // the model has no way to keep digging — it must record any last findings and `finish`. The
+        // existing `Exhausted` path below stays as the ultimate backstop if it STILL doesn't finish.
+        let in_winddown = turn >= winddown;
+        let turn_defs: &[ToolDef] = if in_winddown { &winddown_defs } else { &defs };
+        if in_winddown && !winddown_announced {
+            winddown_announced = true;
+            messages.push(ChatMessage::user(format!(
+                "⏳ Turn budget almost spent (turn {turn}/{max_turns}). Stop investigating — record \
+                 any remaining findings now with add_review_comment/add_comment, then call `finish` \
+                 with your overall verdict. (The investigation tools are no longer available.)"
+            )));
+        } else if !in_winddown && !halfway_nudged && halfway > 0 && turn >= halfway {
+            // Softer one-time nudge around the halfway mark — keep it light; the tool restriction at
+            // the wind-down boundary is the real lever. `!in_winddown` guards small budgets where
+            // `winddown <= halfway`: once we've announced wind-down ("finalize now"), we must NOT then
+            // push the softer "you're past halfway" message — that would be a conflicting instruction.
+            halfway_nudged = true;
+            messages.push(ChatMessage::user(
+                "You're past halfway on your turn budget — start converging: record what you've found \
+                 and head toward `finish`.",
+            ));
+        }
+
         // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
         // secondary model (when configured) once for this turn. The outcome is either a completion, or
         // a turn-level error we classify before deciding whether to keep going.
         let turn_result = match chat
-            .complete_with_retry(&messages, &defs, params, retry_policy)
+            .complete_with_retry(&messages, turn_defs, params, retry_policy)
             .await
         {
             Ok(c) => Ok(c),
@@ -164,7 +249,7 @@ pub async fn run_native_agent(
                         error = %primary_err,
                         "primary model exhausted retries; failing over to secondary model"
                     );
-                    fb.complete_with_retry(&messages, &defs, params, retry_policy)
+                    fb.complete_with_retry(&messages, turn_defs, params, retry_policy)
                         .await
                         .map_err(|fb_err| ChatTurnError {
                             error: fb_err
@@ -795,6 +880,217 @@ mod tests {
         assert!(
             matches!(outcome, ReviewOutcome::Exhausted),
             "got: {outcome:?}"
+        );
+    }
+
+    // ── Wind-down helpers (#137): the boundary reserves a proportional tail and never lands before the
+    // first turn or at/after the ceiling; the reduced set keeps only write/finish/abort. ────────────
+    #[test]
+    fn winddown_turn_reserves_a_proportional_tail() {
+        // Generous budget: reserve max(2, 150/10) = 15 → wind down at 135.
+        assert_eq!(winddown_turn(150), 135);
+        // Mid budget: reserve max(2, 40/10) = 4 → wind down at 36.
+        assert_eq!(winddown_turn(40), 36);
+        // Small budget: reserve max(2, 5/10)=2 → wind down at 3 (turns 3,4 reduced; 0,1,2 full).
+        assert_eq!(winddown_turn(5), 3);
+        // Tiny budgets still leave one full-toolset turn first and never land at/after the ceiling.
+        assert_eq!(winddown_turn(2), 1);
+        assert_eq!(winddown_turn(1), 1);
+        assert!(winddown_turn(0) >= 1);
+    }
+
+    #[test]
+    fn winddown_tool_defs_drops_investigation_tools() {
+        let names: Vec<String> = winddown_tool_defs(true)
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        // Kept: the write tools + finish + abort.
+        for kept in [ADD_REVIEW_COMMENT, ADD_COMMENT, FINISH, ABORT] {
+            assert!(names.iter().any(|n| n == kept), "{kept} should be kept");
+        }
+        // Dropped: every investigation/progress tool.
+        for dropped in [
+            super::super::tools::VECTOR_SEMANTIC_SEARCH,
+            super::super::tools::GRAPH_FIND_SYMBOL,
+            super::super::tools::GRAPH_GET_CALLERS,
+            super::super::tools::READ_FILE,
+            super::super::tools::REPORT_PROGRESS,
+        ] {
+            assert!(
+                !names.iter().any(|n| n == dropped),
+                "{dropped} should be dropped in wind-down"
+            );
+        }
+        // No diff → `add_review_comment` is not even offered in the reduced set.
+        let no_diff: Vec<String> = winddown_tool_defs(false)
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(!no_diff.iter().any(|n| n == ADD_REVIEW_COMMENT));
+        assert!(no_diff.iter().any(|n| n == ADD_COMMENT));
+    }
+
+    /// A scripted chat endpoint that also records, per call, the tool names offered in the request body
+    /// `tools` array — so a test can assert the wind-down restricted the surface on the late turns.
+    struct RecordingScript {
+        calls: Arc<AtomicUsize>,
+        offered: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        // The concatenated user-message text seen in each request body (lets a test assert the budget
+        // message was injected into the conversation by the time the wind-down turn fires).
+        user_text: Arc<std::sync::Mutex<Vec<String>>>,
+        response: serde_json::Value,
+    }
+    impl Respond for RecordingScript {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let names = body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            t.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.offered.lock().unwrap().push(names);
+            let user_text = body
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            self.user_text.lock().unwrap().push(user_text);
+            ResponseTemplate::new(200).set_body_json(self.response.clone())
+        }
+    }
+
+    // ── e2e wind-down (#137): a model that keeps requesting retrieval and never finishes. Once the
+    // wind-down turn is reached the offered tool set must drop the retrieval/read_file tools (only
+    // write/finish/abort remain), and a budget message must have been injected. The run still ends in
+    // `Exhausted` (the backstop) because this model never calls `finish`. ────────────────────────────
+    #[tokio::test]
+    async fn native_loop_restricts_tools_in_winddown() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let user_text = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: user_text.clone(),
+                // Always asks for retrieval; never finishes.
+                response: tool_call_reply(
+                    "lightbridge_vector_semantic_search",
+                    r#"{"query":"anything"}"#,
+                ),
+            })
+            .mount(&chat)
+            .await;
+
+        // The control plane only needs to answer the search calls (no finalize — the loop never
+        // finishes; the caller would finalize, not the loop). Return 0 hits each time.
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&cp)
+            .await;
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_turns = 5; // winddown_turn(5) == 3 → turns 0,1,2 full; 3,4 reduced.
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        // A diff is present so `add_review_comment` is part of the (reduced) set.
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("exhaustion is a clean outcome");
+        assert!(
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "model never finishes → backstop fires; got {outcome:?}"
+        );
+
+        let offered = offered.lock().unwrap();
+        assert_eq!(offered.len(), 5, "one chat call per turn");
+        // Early turns (full set) still offer retrieval.
+        assert!(
+            offered[0]
+                .iter()
+                .any(|n| n == super::super::tools::VECTOR_SEMANTIC_SEARCH),
+            "turn 0 offers retrieval: {:?}",
+            offered[0]
+        );
+        // Wind-down turns (3, 4) must have dropped retrieval/read_file and kept only write/finish/abort.
+        for late in [3usize, 4] {
+            let set = &offered[late];
+            for dropped in [
+                super::super::tools::VECTOR_SEMANTIC_SEARCH,
+                super::super::tools::GRAPH_FIND_SYMBOL,
+                super::super::tools::GRAPH_GET_CALLERS,
+                super::super::tools::READ_FILE,
+                super::super::tools::REPORT_PROGRESS,
+            ] {
+                assert!(
+                    !set.iter().any(|n| n == dropped),
+                    "turn {late} must drop {dropped}: {set:?}"
+                );
+            }
+            assert!(
+                set.iter().any(|n| n == FINISH),
+                "turn {late} keeps finish: {set:?}"
+            );
+            assert!(
+                set.iter().any(|n| n == ADD_REVIEW_COMMENT),
+                "turn {late} keeps add_review_comment (diff present): {set:?}"
+            );
+        }
+
+        // The budget message is injected at the wind-down boundary (turn 3), so by turn 4's request the
+        // conversation carries it. (Turn 0's request, before any wind-down, must not.)
+        let user_text = user_text.lock().unwrap();
+        assert!(
+            !user_text[0].contains("Turn budget almost spent"),
+            "no budget message before wind-down"
+        );
+        assert!(
+            user_text[4].contains("Turn budget almost spent"),
+            "budget message injected by the wind-down turn: {:?}",
+            user_text[4]
         );
     }
 }
