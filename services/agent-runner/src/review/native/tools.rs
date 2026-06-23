@@ -384,9 +384,31 @@ impl Tools<'_> {
             Ok(p) => p,
             Err(e) => return e,
         };
+        // SECURITY (Gemini, #167 follow-up): the lexical check above rejects `..`/absolute paths but
+        // does NOT follow symlinks — a malicious PR can plant an in-repo symlink pointing at, say,
+        // `/etc/passwd` or the SA token and have the model read it. Canonicalize BOTH the checkout root
+        // and the resolved path (resolving every symlink) and verify the real target is still inside
+        // the real root; reject otherwise. A non-existent file fails canonicalize → a clean "not found".
+        let canonical_root = match tokio::fs::canonicalize(self.checkout_root).await {
+            Ok(p) => p,
+            Err(_) => {
+                return format!("error: could not open {rel:?} (file not found or unreadable).")
+            }
+        };
+        let canonical = match tokio::fs::canonicalize(&resolved).await {
+            Ok(p) => p,
+            Err(_) => {
+                return format!("error: could not open {rel:?} (file not found or unreadable).")
+            }
+        };
+        if !canonical.starts_with(&canonical_root) {
+            return format!(
+                "error: {rel:?} resolves outside the repository (symlink escape rejected)."
+            );
+        }
         // Bounded read: open + `take(cap + 1)` so a huge/hostile file can't exhaust memory, and the
         // extra byte lets us tell that the file was longer than the budget (→ a truncation note).
-        let Ok(file) = tokio::fs::File::open(&resolved).await else {
+        let Ok(file) = tokio::fs::File::open(&canonical).await else {
             return format!("error: could not open {rel:?} (file not found or unreadable).");
         };
         let mut buf = Vec::new();
@@ -433,7 +455,16 @@ impl Tools<'_> {
                 }
                 let last = end.min(total);
                 let slice = lines[start - 1..last].join("\n");
-                format!("{rel} lines {start}-{last} (of {total}):\n{slice}")
+                if over_cap {
+                    // The file exceeded the byte cap, so `total` was computed from truncated content and
+                    // would lie about the real file length — say so instead of quoting a bogus total.
+                    format!(
+                        "{rel} lines {start}-{last} of a file truncated at {READ_FILE_CAP} bytes \
+                         (read past the cap to see more is not possible):\n{slice}"
+                    )
+                } else {
+                    format!("{rel} lines {start}-{last} (of {total}):\n{slice}")
+                }
             }
         }
     }
@@ -613,6 +644,45 @@ mod tests {
         // Traversal is rejected at dispatch too.
         let escaped = t.read_file("../escape.rs", None, None).await;
         assert!(escaped.contains("traversal"), "got: {escaped}");
+    }
+
+    // ── read_file symlink escape (SECURITY): an in-repo symlink that points OUTSIDE the checkout root
+    // passes the lexical `resolve_in_root` check but must be rejected after canonicalization, while a
+    // normal in-root file still reads (Gemini #167 follow-up). ───────────────────────────────────────
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_symlink_escape() {
+        // A "secret" outside the checkout, and the checkout containing an in-repo symlink to it.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        tokio::fs::write(&secret, "TOP SECRET").await.unwrap();
+
+        let checkout = tempfile::tempdir().unwrap();
+        // An honest in-root file should still read after the canonicalization gate.
+        tokio::fs::write(checkout.path().join("ok.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+        // A symlink planted inside the repo pointing at the outside secret — the attack the lexical
+        // check misses (no `..`, no leading `/`).
+        std::os::unix::fs::symlink(&secret, checkout.path().join("evil.txt")).unwrap();
+
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let t = Tools {
+            client: &cp,
+            embedder: &emb,
+            task_id: Uuid::nil(),
+            checkout_root: checkout.path(),
+        };
+
+        // The symlink escape is rejected and the secret is NOT leaked.
+        let escaped = t.read_file("evil.txt", None, None).await;
+        assert!(escaped.starts_with("error:"), "got: {escaped}");
+        assert!(!escaped.contains("TOP SECRET"), "leaked secret: {escaped}");
+
+        // A normal in-root file still reads through the canonicalization gate.
+        let ok = t.read_file("ok.rs", None, None).await;
+        assert!(ok.contains("fn main"), "got: {ok}");
     }
 
     // ── Positive: a search call embeds the query, hits the control plane, returns the hits ──────

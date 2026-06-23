@@ -94,9 +94,15 @@ async fn main() -> std::process::ExitCode {
         }
     };
     match outcome {
-        Ok(summary) => {
+        Ok(RunResult {
+            summary,
+            review_detail,
+        }) => {
             tracing::info!(task_id = %config.task_id, summary, "task succeeded");
-            report(&client, &config, "succeeded", None).await;
+            // Carry the review-failure/exhaustion/abort detail (if any) onto the FINAL terminal status,
+            // not a mid-run `running` report (#137): the control plane clears `error_detail` on every
+            // `running` transition (so retries start clean), which would erase a detail reported there.
+            report(&client, &config, "succeeded", review_detail.as_deref()).await;
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {
@@ -158,13 +164,22 @@ fn is_terminal_status(status: &str) -> bool {
     matches!(status, "cancelled" | "failed" | "timed_out" | "succeeded")
 }
 
-/// The task lifecycle. Returns a human summary on success; any error is reported as `failed`.
+/// What `run()` returns on success: a human summary, plus an optional review-failure/exhaustion/abort
+/// detail to attach to the FINAL terminal status (#137). The review step is non-fatal (indexing already
+/// landed), so its failure does NOT make the task `Err` — but the reason is still surfaced on the
+/// terminal status rather than dropped or reported via a transient `running` (which the control plane clears).
+struct RunResult {
+    summary: String,
+    review_detail: Option<String>,
+}
+
+/// The task lifecycle. Returns a [`RunResult`] on success; any error is reported as `failed`.
 async fn run(
     config: &RunnerConfig,
     client: &ControlPlaneClient,
     embeddings_config: &EmbeddingsConfig,
     review_config: Option<&ReviewConfig>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunResult> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
     // re-affirms it from the pod and is a no-op if already set).
     report(client, config, "running", None).await;
@@ -221,6 +236,8 @@ async fn run(
     // `REVIEW_AGENT=opencode` falls back to the legacy terminal-payload subprocess (retires in #140).
     // Runs only when the LLM is configured; non-fatal (indexing already landed). A standalone `index`
     // task (target_type `repository`, Epic #75) has no PR, so skip review regardless of LLM config.
+    // Tracks an optional review-failure/exhaustion/abort detail to attach to the FINAL status (#137).
+    let mut review_detail: Option<String> = None;
     let review_summary = match review_config.filter(|_| context.command != "index") {
         Some(review) => {
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
@@ -250,29 +267,58 @@ async fn run(
                     tracing::warn!(%error, "submitting transcript failed (non-fatal)");
                 }
             }
+            // Net invariant (#137): every review run leaves a VISIBLE artifact unless the gateway was
+            // unreachable. We finalize on Finished AND Exhausted AND Aborted — finalize flushes the
+            // buffered findings, and its empty-run backstop posts a clean "no issues" review for a PR
+            // when the buffer is empty. The old code bailed on exhaustion and dropped the buffer; a real
+            // prod run lost 5 findings that way at turn 16. Only a true transport `Err` posts nothing.
+            //
+            // Finalize failure IS fatal (unlike the rest of review, which is best-effort): the review is
+            // ready and the failure is almost always transient (GitHub/network), so the task fails +
+            // retries rather than being silently marked succeeded with nothing posted. A retry re-runs
+            // the agent from a cleared buffer; the single-artifact case re-posts cleanly, the rare mixed
+            // reply+review case may duplicate the part that posted — proper fix is GitHub-side idempotency
+            // via posted IDs (ADR-0035).
             match outcome {
-                // Clean finish → flush the buffer as one grouped review (ADR-0037). A failed run is
-                // NOT finalized, so a mid-run death posts nothing (crash-safe). Finalize failure IS
-                // fatal (unlike the rest of review, which is best-effort): the review is ready and the
-                // failure is almost always transient (GitHub/network), so the task fails + retries
-                // rather than being silently marked succeeded with nothing posted. A retry re-runs the
-                // agent from a cleared buffer; the single-artifact case re-posts cleanly (the failed
-                // attempt posted nothing), the rare mixed reply+review case may duplicate the part that
-                // did post — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
-                Ok(()) => {
+                Ok(review::ReviewOutcome::Finished) => {
                     client.finalize_review(config.task_id).await?;
                     "review posted".to_string()
                 }
+                Ok(review::ReviewOutcome::Exhausted) => {
+                    // Be honest about truncation: set a summary note BEFORE finalize so the posted review
+                    // says some areas may be unreviewed, then flush whatever was buffered.
+                    let note = format!(
+                        "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
+                         far; some areas may be unreviewed.",
+                        review.max_turns
+                    );
+                    if let Err(error) = client.set_review_summary(config.task_id, &note).await {
+                        tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
+                    }
+                    client.finalize_review(config.task_id).await?;
+                    review_detail = Some(note);
+                    "review posted (truncated at step budget)".to_string()
+                }
+                Ok(review::ReviewOutcome::Aborted(reason)) => {
+                    // The model couldn't complete the review. Post the reason as the summary then
+                    // finalize, so the PR gets an honest note rather than silence.
+                    let note = format!("Couldn't complete this review: {reason}");
+                    if let Err(error) = client.set_review_summary(config.task_id, &note).await {
+                        tracing::warn!(%error, "setting abort summary failed (non-fatal)");
+                    }
+                    client.finalize_review(config.task_id).await?;
+                    review_detail = Some(note);
+                    "review aborted (note posted)".to_string()
+                }
                 Err(error) => {
-                    // The review run failed (abort / exhausted turns / transport). It stays non-fatal
-                    // — indexing already landed and nothing is posted (crash-safe) — but the reason
-                    // used to be dropped after a bare warn. Surface it: log the full reason at warn,
-                    // and send it to the control plane as the status `detail` so the failure is
-                    // legible end-to-end (epic #137). Persisting/showing that detail is a separate
-                    // control-plane/web PR; here we only SEND it. Not posted to GitHub (trust boundary).
+                    // A true transport/chat failure — the gateway was unreachable and nothing useful
+                    // happened. Stays non-fatal (indexing already landed; nothing is posted), but carry
+                    // the reason to the FINAL terminal status (#137) rather than a mid-run `running`
+                    // report — the control plane clears `error_detail` on every `running` transition, so
+                    // a detail reported there would be erased before a human or retry could see it.
                     let detail = format!("review run failed: {error:#}");
                     tracing::warn!(%detail, "review run failed (non-fatal; nothing posted)");
-                    report(client, config, "running", Some(&detail)).await;
+                    review_detail = Some(detail);
                     "review failed".to_string()
                 }
             }
@@ -280,15 +326,18 @@ async fn run(
         None => "review disabled".to_string(),
     };
 
-    Ok(format!(
-        "indexed {}/{} at {} — {chunk_count} chunks, {graph_summary}; {review_summary}",
-        context.owner,
-        context.name,
-        context
-            .head_sha
-            .as_deref()
-            .unwrap_or(&context.default_branch),
-    ))
+    Ok(RunResult {
+        summary: format!(
+            "indexed {}/{} at {} — {chunk_count} chunks, {graph_summary}; {review_summary}",
+            context.owner,
+            context.name,
+            context
+                .head_sha
+                .as_deref()
+                .unwrap_or(&context.default_branch),
+        ),
+        review_detail,
+    })
 }
 
 /// Best-effort status report: a failed report must not mask the task's real outcome, so we log and

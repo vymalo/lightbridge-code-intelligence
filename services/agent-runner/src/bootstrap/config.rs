@@ -33,6 +33,12 @@ pub const DEFAULT_MAX_RETRIES: u32 = 2;
 /// `LLM_CIRCUIT_BREAKER_THRESHOLD` / `review.circuit_breaker_threshold`.
 pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
+/// Default ceiling on model turns before the run is cut off (each turn is one chat round-trip). On the
+/// deepseek model a turn is ~6s and the agent records roughly one finding per turn, so the old ceiling
+/// of 16 was far too tight for a real PR — a run could exhaust its budget with findings still buffered.
+/// Operator-tunable via `review.max_turns` / `LLM_MAX_TURNS`. Overridable but defaults generously.
+pub const DEFAULT_MAX_TURNS: usize = 40;
+
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
 /// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
@@ -78,6 +84,10 @@ pub struct ReviewFile {
     pub max_retries: Option<u64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub circuit_breaker_threshold: Option<u64>,
+    /// Ceiling on model turns before the run is cut off (operator-tunable). Unset = [`DEFAULT_MAX_TURNS`].
+    /// Numeric-string tolerant for `{env:…}`-substituted values.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_turns: Option<usize>,
     /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
     /// (ADR-0039). Unset = single-model behaviour (unchanged).
     #[serde(default)]
@@ -185,6 +195,9 @@ pub struct ReviewConfig {
     pub system_prompt: String,
     /// Ceiling on the diff pasted into the prompt; from `review.max_diff_chars` or the default.
     pub max_diff_chars: usize,
+    /// Ceiling on model turns before the run is cut off; from `review.max_turns` (or `LLM_MAX_TURNS`
+    /// env) or [`DEFAULT_MAX_TURNS`]. Operator-tunable so a large PR isn't truncated by a tight budget.
+    pub max_turns: usize,
     /// Generation params for the review model. `None` = provider/model default.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -274,6 +287,9 @@ impl ReviewConfig {
             model: require("LLM_MODEL")?,
             system_prompt: require_system_prompt(None)?,
             max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
+            max_turns: parse_env_u64("LLM_MAX_TURNS")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_TURNS),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -297,6 +313,12 @@ impl ReviewConfig {
             model: require_field("review", "model", &r.model)?,
             system_prompt: require_system_prompt(r.system_prompt_file.as_deref())?,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
+            // File config wins when set, else env (an operator can still tune via env with a
+            // ConfigMap mounted), else the generous default.
+            max_turns: r
+                .max_turns
+                .or_else(|| parse_env_u64("LLM_MAX_TURNS").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_TURNS),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
@@ -393,6 +415,7 @@ mod tests {
                 request_timeout_secs: None,
                 max_retries: None,
                 circuit_breaker_threshold: None,
+                max_turns: None,
                 fallback_model: None,
             }),
         };
