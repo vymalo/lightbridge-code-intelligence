@@ -50,6 +50,19 @@ def dashboard_builder() -> dashboard.Dashboard:
         )
         .grid_pos(layout.place(6, 4))
     )
+    tokens_24h = (
+        stat.Panel()
+        .title("Tokens (24h)")
+        .datasource(POSTGRES)
+        .with_target(
+            sql(
+                "SELECT coalesce(sum(tr.prompt_tokens + tr.completion_tokens), 0) "
+                "FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id "
+                "WHERE t.created_at > now() - interval '24 hours'"
+            )
+        )
+        .grid_pos(layout.place(6, 4))
+    )
 
     created = (
         timeseries.Panel()
@@ -72,6 +85,25 @@ def dashboard_builder() -> dashboard.Dashboard:
             sql("SELECT status AS metric, count(*) AS value FROM tasks GROUP BY status ORDER BY value DESC")
         )
         .grid_pos(layout.place(12, 8))
+    )
+
+    duration_p95 = (
+        timeseries.Panel()
+        .title("Run duration p95 by command")
+        .datasource(POSTGRES)
+        .unit("s")
+        .with_target(
+            sql(
+                "SELECT $__timeGroupAlias(completed_at, $__interval), command_text AS \"command\", "
+                "percentile_cont(0.95) WITHIN GROUP "
+                "(ORDER BY extract(epoch FROM (completed_at - started_at))) AS \"p95\" "
+                "FROM tasks WHERE $__timeFilter(completed_at) "
+                "AND started_at IS NOT NULL AND completed_at IS NOT NULL "
+                "GROUP BY 1, 2 ORDER BY 1",
+                fmt="time_series",
+            )
+        )
+        .grid_pos(layout.place(24, 8))
     )
 
     recent = (
@@ -100,7 +132,9 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_panel(running)
         .with_panel(failed)
         .with_panel(deliveries)
+        .with_panel(tokens_24h)
         .with_panel(created)
         .with_panel(by_status)
+        .with_panel(duration_p95)
         .with_panel(recent)
     )

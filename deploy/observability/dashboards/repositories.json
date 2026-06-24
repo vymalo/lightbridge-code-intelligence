@@ -73,6 +73,76 @@
       "transformations": [],
       "transparent": false,
       "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH latest AS (  SELECT DISTINCT ON (repository_id) repository_id, commit_sha   FROM code_chunks ORDER BY repository_id, created_at DESC) SELECT r.owner || '/' || r.name AS \"repository\", left(cc.commit_sha, 8) AS \"commit\", count(*) AS \"chunks\", count(DISTINCT cc.file_path) AS \"files\" FROM code_chunks cc JOIN latest l ON l.repository_id = cc.repository_id AND l.commit_sha = cc.commit_sha JOIN repositories r ON r.id = cc.repository_id GROUP BY r.id, r.owner, r.name, cc.commit_sha ORDER BY count(*) DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Index size (latest commit)",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT language AS metric, count(*) AS value FROM code_chunks GROUP BY language ORDER BY value DESC LIMIT 25",
+          "refId": "A"
+        }
+      ],
+      "title": "Indexed chunks by language",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
     }
   ],
   "refresh": "1m",

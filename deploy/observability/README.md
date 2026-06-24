@@ -24,13 +24,18 @@ names, and the operator resolves them to UIDs at import.
 
 | File | Forwards | Datasource |
 |---|---|---|
-| `overview.json` | UI landing KPIs | Postgres |
+| `overview.json` | UI landing KPIs (+ tokens, run-duration p95) | Postgres |
 | `task-runs.json` | runs list + detail (+ Loki drill-down) | Postgres, Loki |
-| `repositories.json` | repositories view | Postgres |
+| `repositories.json` | repositories view (+ index size, languages) | Postgres |
+| `review-quality.json` | findings by priority/category, tokens, reactions | Postgres |
 | `ingress-dispatcher.json` | webhook + queue/dispatch health | Postgres, Loki |
 | `operations.json` | RED metrics | Prometheus |
 
-`operations.json` needs the control plane's `/metrics` scraped into Prometheus (Alloy). The `serve`
-and `dispatcher` pods expose `/metrics`; annotate them for Alloy discovery (defaults
-`prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path` — adjust to your Alloy relabel
-config).
+Most dashboards are **Postgres**-sourced: the review agent runs as a one-shot Kubernetes Job, so its
+output (findings, token usage, turns) can't be pull-scraped — it's persisted to Postgres and read
+from there. That's why a read-only Postgres datasource matters (see `postgresDatasource` above).
+
+`operations.json` needs the control plane's `/metrics` scraped into Prometheus/Mimir. Scraping is
+done with **`PodMonitor` CRs in the workload namespace** (Alloy discovers Prometheus-Operator CRs),
+NOT pod annotations — the `serve` role exposes `/metrics` on `:8080` and the `dispatcher` role on
+`:9090`. The PodMonitors live with the workload deployment (in `ai-helm`), not in this chart.
