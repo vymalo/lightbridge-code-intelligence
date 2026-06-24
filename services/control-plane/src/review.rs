@@ -321,6 +321,51 @@ pub fn validate(
 /// ```suggestion block when the finding proposes a replacement. A *present but empty* suggestion is
 /// kept — on GitHub an empty suggestion block is a valid "delete this line" — so we gate on presence
 /// (Some vs None), not on emptiness.
+/// Strip model-internal artifacts before text is posted to GitHub (run 7c15f9bb): `<think>…</think>`
+/// reasoning and tool-call control tokens (`<｜…｜>` / `<|…|>`) that some models (deepseek) leak into
+/// `content` instead of the structured fields. Defensive last line — even if the gateway/model
+/// misbehaves, raw reasoning / control tokens never reach a PR.
+pub fn strip_model_artifacts(text: &str) -> String {
+    let mut s = text.to_string();
+    // Leading orphan reasoning ("reasoning… </think> answer" with no opener) → drop through the close.
+    if let Some(i) = s.find("</think>") {
+        if !s[..i].contains("<think>") {
+            s = s[i + "</think>".len()..].to_string();
+        }
+    }
+    s = remove_spans(&s, "<think>", "</think>"); // paired blocks (unclosed → drop remainder)
+    s = remove_spans(&s, "<｜", "｜>"); // deepseek special tokens (fullwidth pipe)
+    s = remove_spans(&s, "<|", "|>"); // ASCII-pipe variant
+    s.replace("<think>", "")
+        .replace("</think>", "")
+        .trim()
+        .to_string()
+}
+
+/// Remove every `open…close` span (inclusive); an unclosed `open` drops the remainder. `open`/`close`
+/// are whole substrings, so the byte offsets from `find` are always on char boundaries.
+fn remove_spans(input: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        match rest.find(open) {
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                let after = &rest[i + open.len()..];
+                match after.find(close) {
+                    Some(j) => rest = &after[j + close.len()..],
+                    None => break, // unclosed → drop the remainder
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn inline_body(finding: &Finding) -> String {
     // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
     // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
@@ -329,8 +374,8 @@ fn inline_body(finding: &Finding) -> String {
     let mut body = format!(
         "{}\n**{}**\n\n{}",
         finding.level_badges(),
-        finding.title,
-        finding.body
+        strip_model_artifacts(&finding.title),
+        strip_model_artifacts(&finding.body)
     );
     if let Some(suggestion) = finding.suggestion.as_deref().map(str::trim_end) {
         body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
@@ -371,7 +416,10 @@ fn normalize_path(path: &str) -> String {
 /// outside the PR's diff (surfaced, not silently dropped — ADR-0033), and the working-agreement
 /// disclosure (AI output is untrusted; a human owns the decision).
 pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]) -> String {
-    let mut body = format!("## Lightbridge review\n\n{summary}");
+    let mut body = format!(
+        "## Lightbridge review\n\n{}",
+        strip_model_artifacts(summary)
+    );
 
     // A finding as a bullet whose first line is the badge row, with the bold title + `file:line` on the
     // next (indented) line and the body under that — so the badges never share a line with the title,
@@ -381,11 +429,11 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
         body.push_str(&format!(
             "\n- {}\n  **{}** — `{}:{}`\n  {}",
             f.level_badges(),
-            f.title,
+            strip_model_artifacts(&f.title),
             f.file,
             f.line,
             // Indent continuation lines so a multi-line body stays inside the list item (Gemini #153).
-            f.body.replace('\n', "\n  ")
+            strip_model_artifacts(&f.body).replace('\n', "\n  ")
         ));
         for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
             body.push_str(&format!("\n  - {link}"));
@@ -432,7 +480,7 @@ pub fn render_answer_body(answer: &str) -> String {
         "## Lightbridge answer\n\n{}\n\n---\n_🤖 AI-generated answer — treat it as untrusted, \
          verify before acting; a human owns the final decision \
          ([AI governance](https://adorsys-gis.github.io/ai-governance/))._",
-        answer.trim()
+        strip_model_artifacts(answer)
     )
 }
 
@@ -506,6 +554,25 @@ mod tests {
         assert_eq!(f.priority(), "P0");
         assert_eq!(f.category(), "correctness");
         assert!(inline_body(&f).contains("https://img.shields.io/badge/P0-red"));
+    }
+
+    #[test]
+    fn strip_model_artifacts_removes_reasoning_and_tool_tokens() {
+        // Leading orphan reasoning + a leaked deepseek tool-call token (run 7c15f9bb).
+        let leaked = "Let me check the type...</think>\n\nThe fix is correct. \
+                      <｜DSML｜tool_calls｜><｜DSML｜invoke name=\"read_file\"｜>";
+        let clean = strip_model_artifacts(leaked);
+        assert_eq!(clean, "The fix is correct.", "got: {clean:?}");
+        // Paired think block + ASCII-pipe token.
+        assert_eq!(
+            strip_model_artifacts("<think>noisy</think>real answer <|tool|>"),
+            "real answer"
+        );
+        // Clean text is untouched (and a lone `<` in prose survives).
+        assert_eq!(
+            strip_model_artifacts("a < b is a real comparison"),
+            "a < b is a real comparison"
+        );
     }
 
     #[test]
