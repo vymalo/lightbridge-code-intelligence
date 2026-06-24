@@ -128,6 +128,9 @@ pub async fn run_native_agent(
     // only on a re-review with an earlier review; injected so the run reconciles with its past output
     // instead of contradicting itself across runs.
     prior_reviews: Option<&str>,
+    // Per-repo feedback memory (M1, ADR-0044): findings rejected (👎) here before, injected so the run
+    // doesn't re-raise known false positives.
+    repo_memory: Option<&str>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -192,7 +195,14 @@ pub async fn run_native_agent(
         max_tokens: review.max_tokens,
     };
 
-    let mut messages = build_messages(review, command, diff, repo_instructions, prior_reviews);
+    let mut messages = build_messages(
+        review,
+        command,
+        diff,
+        repo_instructions,
+        prior_reviews,
+        repo_memory,
+    );
 
     // Per-run circuit breaker (ADR-0039): consecutive turn-failures. The Job is ephemeral, so this is
     // deliberately per-process — no cross-process state. Resets on the first turn that succeeds.
@@ -708,6 +718,7 @@ fn build_messages(
     diff: Option<&PrDiff>,
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
+    repo_memory: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
 
@@ -743,6 +754,14 @@ fn build_messages(
     if let Some(prior) = prior_reviews {
         user.push_str("\n\n");
         user.push_str(prior);
+    }
+
+    // Per-repo feedback memory (M1, ADR-0044): findings rejected (👎) here before — untrusted context,
+    // same as the prior review; the tool-protocol stays authoritative. `None` keeps a clean-repo run
+    // reading exactly as before.
+    if let Some(memory) = repo_memory {
+        user.push_str("\n\n");
+        user.push_str(memory);
     }
 
     // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
@@ -962,7 +981,14 @@ mod tests {
     #[test]
     fn build_messages_carries_request_and_uses_operator_prompt() {
         let review = review_config("http://unused/v1".to_string());
-        let msgs = build_messages(&review, "propose a better implementation", None, None, None);
+        let msgs = build_messages(
+            &review,
+            "propose a better implementation",
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         let system = msgs[0].content.as_deref().expect("system content");
@@ -984,14 +1010,31 @@ mod tests {
         let review = review_config("http://unused/v1".to_string());
         let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
 
-        let with_prior = build_messages(&review, "review again", None, None, Some(prior));
+        let with_prior = build_messages(&review, "review again", None, None, Some(prior), None);
         let user = with_prior[1].content.as_deref().expect("user content");
         assert!(
             user.contains("Your previous review of this pull request"),
             "prior-review block reaches prompt: {user}"
         );
+        // M1 repo memory (ADR-0044) is injected when present.
+        let with_mem = build_messages(
+            &review,
+            "review",
+            None,
+            None,
+            None,
+            Some("## Memory: findings rejected here before (👎)\n- a.rs:1 — bogus nit"),
+        );
+        assert!(
+            with_mem[1]
+                .content
+                .as_deref()
+                .expect("user")
+                .contains("findings rejected here before"),
+            "repo-memory block reaches prompt"
+        );
 
-        let without = build_messages(&review, "review again", None, None, None);
+        let without = build_messages(&review, "review again", None, None, None, None);
         let user = without[1].content.as_deref().expect("user content");
         assert!(
             !user.contains("previous review"),
@@ -1096,6 +1139,7 @@ mod tests {
             Some(&diff),
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1163,6 +1207,7 @@ mod tests {
                 &review,
                 "review",
                 Some(&diff),
+                None,
                 None,
                 None,
                 &[],
@@ -1241,6 +1286,7 @@ mod tests {
                 Some(&diff),
                 None,
                 None,
+                None,
                 &[],
                 &cpc,
                 &embc,
@@ -1313,6 +1359,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             &[],
@@ -1408,6 +1455,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1484,6 +1532,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1553,6 +1602,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1614,6 +1664,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1646,6 +1697,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1675,6 +1727,7 @@ mod tests {
         let outcome = run_native_agent(
             &review,
             "review",
+            None,
             None,
             None,
             None,
@@ -1840,6 +1893,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             &[],
