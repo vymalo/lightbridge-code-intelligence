@@ -2761,6 +2761,8 @@ mod tests {
         // case the repo-level check used to miss).
         assert!(!repo_has_index(&pool, repo_id, "othersha").await.unwrap());
         // A different repo is unaffected.
-        assert!(!repo_has_index(&pool, repo_id + 9999, "headsha").await.unwrap());
+        assert!(!repo_has_index(&pool, repo_id + 9999, "headsha")
+            .await
+            .unwrap());
     }
 }
