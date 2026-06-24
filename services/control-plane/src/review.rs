@@ -173,6 +173,25 @@ pub fn format_prior_review(summary: &str, findings: &serde_json::Value) -> Optio
     Some(out)
 }
 
+/// Format the repo's previously-rejected findings (👎) as an untrusted context block (M1 memory,
+/// ADR-0044) — fed into a review so the agent doesn't re-raise false positives a human already shot
+/// down. `rejected` is `(file, line, title)`; returns `None` when there's nothing to inject.
+pub fn format_repo_memory(rejected: &[(String, i32, String)]) -> Option<String> {
+    if rejected.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "## Memory: findings rejected here before (👎)\n\n\
+         A human marked these past findings on this repo as wrong / not useful. Do NOT raise them \
+         again unless the code has materially changed and you can prove the issue now holds — treat a \
+         match here as a strong signal to drop the finding.\n",
+    );
+    for (file, line, title) in rejected {
+        out.push_str(&format!("- {file}:{line} — {}\n", title.trim()));
+    }
+    Some(out)
+}
+
 /// Sanitize a badge label for a shields.io URL path segment: spaces/underscores/dashes (which shields
 /// treats specially) collapse to a safe token, non-alphanumerics are dropped. Our categories are
 /// single ASCII words, so this is just defensive against an odd model value.
@@ -487,6 +506,19 @@ mod tests {
         assert_eq!(f.priority(), "P0");
         assert_eq!(f.category(), "correctness");
         assert!(inline_body(&f).contains("https://img.shields.io/badge/P0-red"));
+    }
+
+    #[test]
+    fn format_repo_memory_lists_rejected_or_none() {
+        assert!(format_repo_memory(&[]).is_none(), "empty → no block");
+        let block = format_repo_memory(&[
+            ("src/a.rs".into(), 12, "Bogus null-deref".into()),
+            ("src/b.rs".into(), 3, "Style nit".into()),
+        ])
+        .expect("some");
+        assert!(block.contains("rejected here before"));
+        assert!(block.contains("src/a.rs:12 — Bogus null-deref"));
+        assert!(block.contains("src/b.rs:3 — Style nit"));
     }
 
     #[test]
