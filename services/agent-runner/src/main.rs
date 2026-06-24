@@ -253,6 +253,7 @@ async fn run(
                 diff.as_ref(),
                 repo_instructions.as_deref(),
                 context.prior_reviews.as_deref(),
+                context.repo_memory.as_deref(),
                 &attribution,
                 client,
                 &embedder,

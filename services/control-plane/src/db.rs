@@ -416,6 +416,36 @@ pub struct FeedbackRow {
     pub line: Option<i32>,
 }
 
+/// Findings in this repo that a human **rejected** with a 👎 (`-1`) reaction (M1 feedback memory,
+/// ADR-0044): joins the reaction → the inline comment's `(file, line)` → the matching finding in that
+/// run's `reviews.findings` to recover its title. Fed back into future reviews as "previously rejected
+/// here — don't repeat" so the agent stops re-raising the same false positives. Bounded; best-effort
+/// (a path-normalization mismatch just misses a row). Returns `(file, line, title)`.
+pub async fn rejected_findings_for_repo(
+    pool: &PgPool,
+    repository_id: i64,
+    limit: i64,
+) -> Result<Vec<(String, i32, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, i32, String)>(
+        "SELECT DISTINCT rc.file, rc.line, finding->>'title' AS title \
+         FROM review_feedback f \
+         JOIN review_comments rc \
+           ON rc.github_comment_id = f.github_comment_id AND rc.kind = f.comment_kind \
+         JOIN tasks t ON t.id = f.task_id \
+         JOIN reviews r ON r.task_id = f.task_id \
+         JOIN LATERAL jsonb_array_elements(r.findings) finding \
+           ON finding->>'file' = rc.file AND (finding->>'line')::int = rc.line \
+         WHERE t.repository_id = $1 AND f.reaction = '-1' AND rc.kind = 'inline' \
+           AND finding->>'title' IS NOT NULL \
+         ORDER BY rc.file, rc.line \
+         LIMIT $2",
+    )
+    .bind(repository_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// All feedback recorded for a task (ADR-0035), for the dashboard.
 pub async fn get_feedback(pool: &PgPool, task_id: Uuid) -> Result<Vec<FeedbackRow>, sqlx::Error> {
     sqlx::query_as::<_, FeedbackRow>(
@@ -2161,6 +2191,73 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "scoped to the target id"
+        );
+    }
+
+    /// M1 feedback memory (ADR-0044): a 👎 (`-1`) on an inline finding surfaces it as rejected (joined
+    /// to its title via the findings JSON); a 👍 (`+1`) does not.
+    #[sqlx::test]
+    async fn rejected_findings_for_repo_returns_thumbs_down_only(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let findings = serde_json::json!([
+            { "file": "a.rs", "line": 7, "priority": "P1", "category": "correctness", "title": "Bogus nit", "body": "b" },
+            { "file": "a.rs", "line": 9, "priority": "P2", "category": "style", "title": "Liked nit", "body": "b" }
+        ]);
+        upsert_review(
+            &pool, task_id, "sum", "body", 2, 0, 0, &findings, None, None,
+        )
+        .await
+        .unwrap();
+        store_review_comments(
+            &pool,
+            task_id,
+            &[
+                ReviewCommentRef {
+                    github_comment_id: 555,
+                    kind: "inline".to_string(),
+                    file: Some("a.rs".to_string()),
+                    line: Some(7),
+                },
+                ReviewCommentRef {
+                    github_comment_id: 556,
+                    kind: "inline".to_string(),
+                    file: Some("a.rs".to_string()),
+                    line: Some(9),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        reconcile_comment_feedback(
+            &pool,
+            task_id,
+            555,
+            "inline",
+            &[("alice".into(), "-1".into())],
+        )
+        .await
+        .unwrap();
+        reconcile_comment_feedback(
+            &pool,
+            task_id,
+            556,
+            "inline",
+            &[("bob".into(), "+1".into())],
+        )
+        .await
+        .unwrap();
+
+        let rejected = rejected_findings_for_repo(&pool, repo_id, 30)
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected,
+            vec![("a.rs".to_string(), 7, "Bogus nit".to_string())],
+            "only the 👎'd finding, with its title"
         );
     }
 

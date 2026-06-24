@@ -36,6 +36,11 @@ pub struct TaskContext {
     /// behavior) if an older control plane omits the field.
     #[serde(default)]
     pub prior_reviews: Option<String>,
+    /// Per-repo feedback memory (M1, ADR-0044): findings a human rejected (👎) here, pre-formatted by
+    /// the control plane, injected so the agent doesn't re-raise known false positives. `None` when the
+    /// repo has no rejected findings, on non-review runs, or from an older control plane.
+    #[serde(default)]
+    pub repo_memory: Option<String>,
 }
 
 /// Default run kind when the control plane omits it (back-compat): a diff-scoped review.
@@ -553,6 +558,7 @@ mod tests {
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,
             prior_reviews: None,
+            repo_memory: None,
         }
     }
 

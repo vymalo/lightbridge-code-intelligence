@@ -105,6 +105,11 @@ pub struct TaskContextResponse {
     /// `None` for the first review of a target, for `ask`/`index` runs, or if the lookup failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prior_reviews: Option<String>,
+    /// Per-repo feedback memory (M1, ADR-0044): findings a human rejected (👎) on this repo, formatted
+    /// as a "don't repeat these" context block. Present only for `review`-kind tasks when the repo has
+    /// rejected findings. The runner injects it so the agent stops re-raising known false positives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_memory: Option<String>,
 }
 
 /// `GET /internal/tasks/{id}` — task context + a freshly-minted installation token for the runner.
@@ -171,6 +176,21 @@ pub async fn get_context(
         None
     };
 
+    // Feedback memory (M1, ADR-0044): rejected-finding memory for this repo, so the agent doesn't
+    // re-raise known false positives. `review` kind only; best-effort (a lookup error degrades to no
+    // memory, never a failed task). Cap the list so the prompt stays bounded.
+    let repo_memory = if context.kind == "review" {
+        match crate::db::rejected_findings_for_repo(pool, context.repository_id, 30).await {
+            Ok(rejected) => crate::review::format_repo_memory(&rejected),
+            Err(error) => {
+                tracing::warn!(%error, task_id = %id, "repo-memory lookup failed (non-fatal)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Json(TaskContextResponse {
         task_id: context.id,
         repository_id: context.repository_id,
@@ -187,6 +207,7 @@ pub async fn get_context(
         head_sha: context.head_sha,
         repo_indexed,
         prior_reviews,
+        repo_memory,
     })
     .into_response()
 }
