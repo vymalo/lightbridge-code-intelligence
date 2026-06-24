@@ -96,8 +96,10 @@ pub struct TaskContextResponse {
     pub kind: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
-    /// Whether the repo already has a semantic index. The runner skips the full re-index on a review
-    /// when this is true (reuses the base index + the PR diff) — ADR-0025.
+    /// Whether the repo already has a semantic index **at the commit retrieval will query** (head SHA
+    /// else default branch). The runner skips the full re-index on a review when this is true (reuses
+    /// that index + the PR diff) — ADR-0025. Commit-scoped so a stale-commit index doesn't get reused
+    /// into zero search hits (the hollow-index trap, run `7c15f9bb`).
     pub repo_indexed: bool,
     /// The agent's own prior review of this target, formatted as a context block (A, #137), present only
     /// for `review`-kind tasks on a target that already has an earlier posted review. The runner injects
@@ -145,7 +147,10 @@ pub async fn get_context(
 
     // A missing/failed index check is treated as "not indexed" (fail safe → the runner indexes),
     // so a transient DB hiccup degrades to the old always-index behavior rather than skipping.
-    let repo_indexed = crate::db::repo_has_index(pool, context.repository_id)
+    // Scoped to the SAME commit retrieval will query (`retrieval_commit`) — a repo-level check would
+    // skip the re-index while searches at this commit return nothing (hollow index, run `7c15f9bb`).
+    let retrieval_commit = retrieval_commit(context.head_sha.as_deref(), &context.default_branch);
+    let repo_indexed = crate::db::repo_has_index(pool, context.repository_id, &retrieval_commit)
         .await
         .unwrap_or(false);
 
@@ -438,12 +443,21 @@ pub async fn ingest_graph(
     }
 }
 
+/// The commit every retrieval query — and the index-skip decision in [`get_context`] — pins to: the
+/// head SHA the index was built at, else the default branch. **Single source of truth on purpose:**
+/// if `repo_has_index` checked a different commit than `search_code_chunks` queries, "is it indexed?"
+/// could answer yes while every search returns zero hits (a hollow index, run `7c15f9bb`). Both call
+/// here so they can never drift.
+fn retrieval_commit(head_sha: Option<&str>, default_branch: &str) -> String {
+    head_sha.unwrap_or(default_branch).to_string()
+}
+
 /// Resolve a task's `(repository_id, commit_sha)` — the scope every retrieval query is pinned to.
 /// `commit_sha` is the head SHA the index was built at (or the default branch). Returns `None` for
 /// an unknown task. The caller never supplies the scope, so a task can only read its own repo.
 async fn task_scope(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<(i64, String)>, sqlx::Error> {
     Ok(crate::db::get_task_context(pool, id).await?.map(|ctx| {
-        let commit = ctx.head_sha.unwrap_or(ctx.default_branch);
+        let commit = retrieval_commit(ctx.head_sha.as_deref(), &ctx.default_branch);
         (ctx.repository_id, commit)
     }))
 }
