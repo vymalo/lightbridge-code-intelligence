@@ -46,7 +46,7 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 ### Platform engineer path
 1. [Architecture overview](architecture.md)
 2. [Kubernetes and deployment](kubernetes-deployment.md)
-3. [Security, observability, testing, rollout](security-observability-testing-rollout.md)
+3. [Security, observability, testing, rollout](security-observability-testing-rollout.md) + [ADR-0046](adr/0046-observability-dashboard-deployment.md) (how the Grafana dashboards deploy; most read Postgres, not Prometheus)
 
 ### Web & auth path
 1. [Architecture overview — Web & auth tier](architecture.md#web--auth-tier)

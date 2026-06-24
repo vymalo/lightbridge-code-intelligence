@@ -21,8 +21,12 @@ resyncPeriod: 10m
 
 # Names of the Grafana datasources the dashboards resolve to. The operator substitutes the
 # ${DS_*} placeholders baked into the dashboard JSON with these datasources' UIDs.
+#
+# IMPORTANT: these are matched by datasource NAME (not UID). Use the `name:` field of the datasource
+# as Grafana shows it — e.g. a Mimir datasource provisioned as `name: Mimir` is referenced here as
+# `prometheus: Mimir`, even though its uid is `mimir`.
 datasources:
-  # CHANGEME — name of your read-replica Postgres datasource (created below if create=true).
+  # CHANGEME — name of the read-only Postgres datasource (created below if create=true).
   postgres: lci-postgres
   # CHANGEME — name of your existing Loki datasource.
   loki: loki
@@ -34,8 +38,11 @@ datasources:
 postgresDatasource:
   create: true
   name: lci-postgres
-  # CHANGEME — read-replica connection.
-  host: "lightbridge-postgres-ro.lightbridge.svc.cluster.local:5432"
+  # CHANGEME — the control-plane database, reached via the CNPG `*-rw` (or `*-r`) Service in the
+  # workload namespace. Use a least-privilege read-only role (e.g. a `grafana_ro` CNPG managed role
+  # with SELECT only), NOT the application role — this datasource should never be able to write.
+  # e.g. "lightbridge-main-db-rw.converse.svc.cluster.local:5432"
+  host: "CHANGEME-db-rw.NAMESPACE.svc.cluster.local:5432"
   database: lightbridge
   user: grafana_ro
   sslmode: require
@@ -51,5 +58,6 @@ dashboards:
   overview: true
   task-runs: true
   repositories: true
+  review-quality: true
   ingress-dispatcher: true
   operations: true

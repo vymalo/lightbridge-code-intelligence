@@ -30,11 +30,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM tasks WHERE status = 'queued'",
+          "rawSql": "SELECT count(*) FROM reviews WHERE $__timeFilter(created_at)",
           "refId": "A"
         }
       ],
-      "title": "Queued",
+      "title": "Reviews finalized",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -65,11 +65,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM tasks WHERE status = 'running'",
+          "rawSql": "SELECT count(*) FROM reviews rv, jsonb_array_elements(rv.findings) f WHERE $__timeFilter(rv.created_at)",
           "refId": "A"
         }
       ],
-      "title": "Running",
+      "title": "Findings",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -100,11 +100,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM tasks WHERE status = 'failed' AND created_at > now() - interval '24 hours'",
+          "rawSql": "SELECT count(*) FROM (WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT 1 FROM rf WHERE $__timeFilter(rf.created_at) AND CASE WHEN upper(coalesce(f->>'priority','')) IN ('P0','P1','P2') THEN upper(f->>'priority') WHEN lower(coalesce(f->>'severity','')) IN ('error','critical') THEN 'P0' WHEN lower(coalesce(f->>'severity','')) = 'warning' THEN 'P1' ELSE 'P2' END = 'P0') s",
           "refId": "A"
         }
       ],
-      "title": "Failed (24h)",
+      "title": "P0 findings",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -135,46 +135,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM github_deliveries WHERE received_at > now() - interval '24 hours'",
+          "rawSql": "SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at)",
           "refId": "A"
         }
       ],
-      "title": "Deliveries (24h)",
-      "transformations": [],
-      "transparent": false,
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 4
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT coalesce(sum(tr.prompt_tokens + tr.completion_tokens), 0) FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE t.created_at > now() - interval '24 hours'",
-          "refId": "A"
-        }
-      ],
-      "title": "Tokens (24h)",
+      "title": "Tokens (range)",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -191,7 +156,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 6,
+        "x": 0,
         "y": 4
       },
       "options": null,
@@ -205,14 +170,49 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(created_at, $__interval), count(*) AS \"tasks\" FROM tasks WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 1",
+          "rawSql": "WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT $__timeGroupAlias(rf.created_at, $__interval), CASE WHEN upper(coalesce(f->>'priority','')) IN ('P0','P1','P2') THEN upper(f->>'priority') WHEN lower(coalesce(f->>'severity','')) IN ('error','critical') THEN 'P0' WHEN lower(coalesce(f->>'severity','')) = 'warning' THEN 'P1' ELSE 'P2' END AS \"priority\", count(*) AS \"findings\" FROM rf WHERE $__timeFilter(rf.created_at) GROUP BY 1, 2 ORDER BY 1",
           "refId": "A"
         }
       ],
-      "title": "Tasks created",
+      "title": "Findings by priority",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT coalesce(nullif(f->>'category',''), 'correctness') AS metric, count(*) AS value FROM rf WHERE $__timeFilter(rf.created_at) GROUP BY 1 ORDER BY value DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Findings by category",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
     },
     {
       "datasource": {
@@ -238,50 +238,13 @@
             "uid": "${DS_POSTGRES}"
           },
           "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT status AS metric, count(*) AS value FROM tasks GROUP BY status ORDER BY value DESC",
-          "refId": "A"
-        }
-      ],
-      "title": "Tasks by status",
-      "transformations": [],
-      "transparent": false,
-      "type": "bargauge"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 20
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(completed_at, $__interval), command_text AS \"command\", percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM (completed_at - started_at))) AS \"p95\" FROM tasks WHERE $__timeFilter(completed_at) AND started_at IS NOT NULL AND completed_at IS NOT NULL GROUP BY 1, 2 ORDER BY 1",
+          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), sum(tr.prompt_tokens) AS \"prompt\", sum(tr.completion_tokens) AS \"completion\" FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at) GROUP BY 1 ORDER BY 1",
           "refId": "A"
         }
       ],
-      "title": "Run duration p95 by command",
+      "title": "Token usage",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"
@@ -296,10 +259,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 9,
-        "w": 24,
-        "x": 0,
-        "y": 28
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
       },
       "options": null,
       "repeatDirection": "h",
@@ -312,17 +275,52 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT t.created_at AS \"created\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_type AS \"target\", t.target_id AS \"number\", t.status, t.attempts FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id ORDER BY t.created_at DESC LIMIT 20",
+          "rawSql": "SELECT reaction AS metric, count(*) AS value FROM review_feedback rf JOIN tasks t ON t.id = rf.task_id WHERE $__timeFilter(t.created_at) GROUP BY reaction ORDER BY value DESC",
           "refId": "A"
         }
       ],
-      "title": "Recent runs",
+      "title": "Reviewer reactions",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT rv.created_at AS \"reviewed\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_id AS \"pr\", jsonb_array_length(rv.findings) AS \"findings\", rv.inline_count AS \"inline\", rv.deferred_count AS \"deferred\", rv.out_of_scope_count AS \"out_of_scope\", (SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"tokens\", (SELECT coalesce(max(seq) + 1, 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"turns\" FROM reviews rv JOIN tasks t ON t.id = rv.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(rv.created_at) ORDER BY rv.created_at DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent reviews",
       "transformations": [],
       "transparent": false,
       "type": "table"
     }
   ],
-  "refresh": "30s",
+  "refresh": "1m",
   "schemaVersion": 36,
   "style": "dark",
   "tags": [
@@ -331,10 +329,10 @@
   ],
   "templating": {},
   "time": {
-    "from": "now-24h",
+    "from": "now-30d",
     "to": "now"
   },
   "timezone": "browser",
-  "title": "Lightbridge \u2014 Overview",
-  "uid": "lci-overview"
+  "title": "Lightbridge \u2014 Review quality",
+  "uid": "lci-review-quality"
 }
