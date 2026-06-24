@@ -940,13 +940,27 @@ pub async fn cancel_task_by_id(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Er
     Ok(result.rows_affected() > 0)
 }
 
-/// Whether a repository already has a semantic index (any `code_chunks` rows). The runner uses this
-/// to skip the full re-index on a review when a base index already exists (ADR-0025).
-pub async fn repo_has_index(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM code_chunks WHERE repository_id = $1)")
-        .bind(repository_id)
-        .fetch_one(pool)
-        .await
+/// Whether a repository already has a semantic index **at `commit_sha`** — i.e. `code_chunks` rows
+/// scoped to the exact commit the runner's retrieval queries will be pinned to. The runner uses this
+/// to skip the full re-index on a review when a reusable index already exists (ADR-0025).
+///
+/// This MUST be checked at the same commit `search_code_chunks` queries (see
+/// [`crate::http::internal`]'s retrieval-commit resolution). A repo-level "any rows?" check is a
+/// trap: an index built at commit *A* would answer "yes, indexed", the re-index gets skipped, but a
+/// search pinned to commit *B* then returns **zero** hits — a "hollow index" that silently starves
+/// the agent (dogfood run `7c15f9bb`). Keying both on the same commit keeps the skip decision honest.
+pub async fn repo_has_index(
+    pool: &PgPool,
+    repository_id: i64,
+    commit_sha: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM code_chunks WHERE repository_id = $1 AND commit_sha = $2)",
+    )
+    .bind(repository_id)
+    .bind(commit_sha)
+    .fetch_one(pool)
+    .await
 }
 
 /// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo
@@ -2725,5 +2739,30 @@ mod tests {
             3,
             "scoped to (repo, headsha) — othersha not included"
         );
+    }
+
+    /// `repo_has_index` is commit-scoped: an index at commit *A* must NOT count as "indexed" when the
+    /// retrieval will query commit *B*. This is the hollow-index guard (run `7c15f9bb`) — keep it in
+    /// lockstep with `search_code_chunks`'s `(repo, commit)` scoping above.
+    #[sqlx::test]
+    async fn repo_has_index_is_commit_scoped(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        // No chunks at all → not indexed at any commit.
+        assert!(!repo_has_index(&pool, repo_id, "headsha").await.unwrap());
+
+        upsert_code_chunks(&pool, repo_id, "headsha", &[chunk_at("a.rs", 1, 0)])
+            .await
+            .unwrap();
+
+        // Indexed at the queried commit → reuse it.
+        assert!(repo_has_index(&pool, repo_id, "headsha").await.unwrap());
+        // Indexed, but at a DIFFERENT commit than retrieval will query → must re-index (the hollow
+        // case the repo-level check used to miss).
+        assert!(!repo_has_index(&pool, repo_id, "othersha").await.unwrap());
+        // A different repo is unaffected.
+        assert!(!repo_has_index(&pool, repo_id + 9999, "headsha")
+            .await
+            .unwrap());
     }
 }
