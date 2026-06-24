@@ -76,6 +76,7 @@ pub async fn github_webhook(
     //   pull_request               opened                  → review task (the automatic FIRST review)
     //   pull_request               closed                  → cancel the PR's active tasks
     //   pull_request               synchronize | reopened  → nothing (re-review via @mention)
+    //   push                       to the default branch    → re-index task (keep the base index fresh)
     //   issue_comment              created, body @<handle> → task: PR re-review, or an issue answer
     //   installation               created                 → register the installed repos as pending
     //   installation               deleted                 → disable the installation's repos
@@ -86,6 +87,7 @@ pub async fn github_webhook(
     if state.db.is_some() {
         match event.as_str() {
             "pull_request" => handle_pull_request(&state, &payload, &delivery_id).await,
+            "push" => handle_push(&state, &payload, &delivery_id).await,
             "issue_comment" => handle_issue_comment(&state, &payload, &delivery_id).await,
             "installation" => handle_installation(&state, &payload, &delivery_id).await,
             "installation_repositories" => {
@@ -206,6 +208,74 @@ async fn handle_pull_request(
             }
         }
         _ => {}
+    }
+}
+
+/// `push` events: re-index the repo when its **default branch** moves (e.g. a merged PR), so the
+/// semantic + graph index stays fresh instead of going stale and returning 0 hits (dogfood run
+/// 7c15f9bb — reviews reused a hollow base index). Only the default branch (feature/PR-branch pushes
+/// don't change the base index), only approved repos, and `create_index_task` dedups against an
+/// in-flight index so a burst of pushes can't pile up.
+async fn handle_push(state: &crate::AppState, payload: &serde_json::Value, delivery_id: &str) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    // A branch/tag deletion carries no commits to index.
+    if payload["deleted"].as_bool() == Some(true) {
+        return;
+    }
+    let repo = &payload["repository"];
+    let (Some(github_repo_id), Some(owner), Some(name), Some(default_branch), Some(git_ref)) = (
+        repo["id"].as_i64(),
+        repo["owner"]["login"].as_str(),
+        repo["name"].as_str(),
+        repo["default_branch"].as_str(),
+        payload["ref"].as_str(),
+    ) else {
+        tracing::warn!(
+            delivery_id,
+            "push payload missing repo/ref fields; skipping"
+        );
+        return;
+    };
+    // Only the default branch matters for the base index.
+    if git_ref != format!("refs/heads/{default_branch}") {
+        return;
+    }
+    let Some(installation_id) = payload["installation"]["id"].as_i64() else {
+        return;
+    };
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        github_repo_id,
+        owner,
+        name,
+        default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "push: failed to upsert repository");
+            return;
+        }
+    };
+    // Approval gate (Epic #75): same as reviews — nothing runs on an unapproved repo. (`pr = 0`: this
+    // is a push, not a PR; the arg is only used for the skip log line.)
+    if !approved_or_skip(pool, repository_id, delivery_id, 0).await {
+        return;
+    }
+    match crate::db::create_index_task(pool, repository_id, installation_id).await {
+        Ok(Some(task_id)) => tracing::info!(
+            delivery_id, repo = %format!("{owner}/{name}"), %task_id,
+            "default-branch push → re-index queued"
+        ),
+        Ok(None) => tracing::info!(
+            delivery_id, repo = %format!("{owner}/{name}"),
+            "default-branch push → index already in flight; skipped"
+        ),
+        Err(error) => tracing::error!(%error, delivery_id, "push: failed to create index task"),
     }
 }
 
