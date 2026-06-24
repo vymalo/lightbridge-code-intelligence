@@ -115,6 +115,11 @@ pub struct ReviewFile {
     pub max_searches: Option<usize>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_batches: Option<usize>,
+    /// Model context window in tokens (ADR-0045). When set, the agent budgets its conversation against
+    /// it — winding down before overflow and trimming old tool output — instead of failing a 400 when
+    /// the history grows too large. Unset = no budgeting (unchanged behaviour).
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub context_window: Option<usize>,
     /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
     /// (ADR-0039). Unset = single-model behaviour (unchanged).
     #[serde(default)]
@@ -233,6 +238,11 @@ pub struct ReviewConfig {
     pub max_files_read: usize,
     pub max_searches: usize,
     pub max_batches: usize,
+    /// Model context window in tokens (ADR-0045). `Some(n)` enables conversation budgeting: the loop
+    /// winds down + trims old tool output as the estimate nears `n`, and finalizes (never discards
+    /// findings) on an overflow error. `None` = no budgeting. From `review.context_window` /
+    /// `LLM_CONTEXT_WINDOW`; a 0 is treated as unset.
+    pub context_window: Option<usize>,
     /// Generation params for the review model. `None` = provider/model default.
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -342,6 +352,9 @@ impl ReviewConfig {
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_BATCHES)
                 .max(1),
+            context_window: parse_env_u64("LLM_CONTEXT_WINDOW")
+                .map(|n| n as usize)
+                .filter(|&n| n > 0),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -392,6 +405,10 @@ impl ReviewConfig {
                 .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_BATCHES)
                 .max(1),
+            context_window: r
+                .context_window
+                .or_else(|| parse_env_u64("LLM_CONTEXT_WINDOW").map(|n| n as usize))
+                .filter(|&n| n > 0),
             temperature: r.temperature,
             top_p: r.top_p,
             max_tokens: r.max_tokens,
@@ -493,6 +510,7 @@ mod tests {
                 max_files_read: None,
                 max_searches: None,
                 max_batches: None,
+                context_window: None,
                 fallback_model: None,
             }),
         };
@@ -532,6 +550,9 @@ mod tests {
                 max_files_read: Some(0),
                 max_searches: Some(0),
                 max_batches: Some(0),
+                // A 0 context window is meaningless — it must resolve to "disabled" (None), not a
+                // window of zero that would force wind-down on turn 0 (ADR-0045).
+                context_window: Some(0),
                 fallback_model: None,
             }),
         };
@@ -540,6 +561,10 @@ mod tests {
             .expect("review enabled");
         assert_eq!(cfg.max_turns, 1, "max_turns clamped");
         assert_eq!(cfg.max_batch_size, 1, "max_batch_size clamped");
+        assert_eq!(
+            cfg.context_window, None,
+            "a 0 context window resolves to disabled"
+        );
         assert_eq!(cfg.max_files_read, 1, "max_files_read clamped");
         assert_eq!(cfg.max_searches, 1, "max_searches clamped");
         assert_eq!(cfg.max_batches, 1, "max_batches clamped");

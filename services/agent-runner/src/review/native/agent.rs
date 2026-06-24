@@ -114,6 +114,85 @@ fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
         .collect()
 }
 
+/// Enter wind-down once the conversation reaches this fraction of the configured context window
+/// (ADR-0045), leaving headroom for estimator error and the final verdict turn.
+const WINDDOWN_TOKEN_FRACTION: f64 = 0.75;
+
+/// A deliberately conservative token estimate for the messages + advertised tools (ADR-0045). The
+/// gateway model isn't OpenAI-tokenized, so an exact tokenizer would be false precision and a heavy
+/// dependency; ~chars/4 plus a small per-message overhead over-estimates slightly — which is exactly
+/// what a safety budget wants. Used only to decide when to wind down / trim, never reported as truth.
+fn estimate_tokens(messages: &[ChatMessage], tools: &[ToolDef]) -> usize {
+    const PER_MESSAGE_OVERHEAD: usize = 4;
+    let msgs: usize = messages
+        .iter()
+        .map(|m| {
+            let content = m.content.as_deref().map_or(0, str::len);
+            let calls: usize = m
+                .tool_calls
+                .iter()
+                .map(|c| c.function.name.len() + c.function.arguments.len())
+                .sum();
+            PER_MESSAGE_OVERHEAD + (content + calls) / 4
+        })
+        .sum();
+    // The tool schemas are re-sent every turn, so they count against the window too.
+    let tools: usize = tools
+        .iter()
+        .map(|t| {
+            (t.function.name.len()
+                + t.function.description.len()
+                + t.function.parameters.to_string().len())
+                / 4
+        })
+        .sum();
+    msgs + tools
+}
+
+/// Whether a deterministic chat error is the gateway rejecting the request for exceeding the context
+/// window (ADR-0045) — distinct from a genuine bad-request we should fail on. Matched on the surfaced
+/// error text (ADR-0039 folds the response body into the error message).
+fn is_context_overflow(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    [
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "maximum number of tokens",
+        "too many tokens",
+        "reduce the length",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+}
+
+/// Shrink the content of the OLDEST `tool`-result messages to a stub until the estimate fits `target`
+/// tokens (ADR-0045). Keeps each message and its `tool_call_id` so the assistant↔tool-result pairing
+/// the protocol requires stays valid; leaves the most recent few messages untouched (the agent may
+/// still be acting on them). Returns how many messages were trimmed. Tool-result bodies (file/search
+/// output the agent has already reasoned over) are the bulk and the safe thing to drop as we converge.
+fn trim_tool_history(messages: &mut [ChatMessage], tools: &[ToolDef], target: usize) -> usize {
+    const KEEP_RECENT: usize = 2;
+    const STUB: &str = "[earlier tool output elided to fit the context budget]";
+    let cutoff = messages.len().saturating_sub(KEEP_RECENT);
+    let mut trimmed = 0usize;
+    for i in 0..cutoff {
+        if estimate_tokens(messages, tools) <= target {
+            break;
+        }
+        let is_trimmable_tool = messages[i].role == "tool"
+            && messages[i]
+                .content
+                .as_deref()
+                .is_some_and(|c| c.len() > STUB.len() && c != STUB);
+        if is_trimmable_tool {
+            messages[i].content = Some(STUB.to_string());
+            trimmed += 1;
+        }
+    }
+    trimmed
+}
+
 /// Run the native agent loop. The agent acts via the mediated write tools during the run. Returns a
 /// [`ReviewOutcome`] describing how it ended (`Finished` / `Exhausted` / `Aborted`) — the caller turns
 /// each into a visible PR artifact and finalizes the buffer in all three cases (#137). Only a true
@@ -270,6 +349,12 @@ pub async fn run_native_agent(
     let mut files_budget_announced = false;
     let mut searches_budget_announced = false;
 
+    // Context-window budget (ADR-0045). When `context_window` is set we estimate the conversation size
+    // each turn and converge before overflow; `overflow_finalize` records that an overflow error cut the
+    // run short so the tail can finalize (flush findings) rather than fail. `None` = no budgeting.
+    let context_window = review.context_window;
+    let mut overflow_finalize = false;
+
     for turn in 0..max_turns {
         let turn_started = Instant::now();
 
@@ -280,7 +365,27 @@ pub async fn run_native_agent(
         // Wind-down is triggered by the turn budget OR by spending the investigation-batch budget
         // (ADR-0042) — either way, drop the investigation tools so the model converges.
         let batches_spent = batches >= max_batches;
-        let in_winddown = turn >= winddown || batches_spent;
+        // Context-window budget (ADR-0045): estimate the conversation size and, if it nears the window,
+        // first trim old consumed tool output to reclaim space, then (if still near) wind down so the
+        // agent converges before the gateway rejects an over-length request. Disabled when unset.
+        let tokens_spent = if let Some(window) = context_window {
+            let target = (window as f64 * WINDDOWN_TOKEN_FRACTION) as usize;
+            let mut est = estimate_tokens(&messages, &defs);
+            if est > target {
+                let trimmed = trim_tool_history(&mut messages, &defs, target);
+                if trimmed > 0 {
+                    est = estimate_tokens(&messages, &defs);
+                    tracing::warn!(
+                        task_id = %task_id, turn, trimmed, est_tokens = est, window,
+                        "context budget: trimmed old tool output to fit the window"
+                    );
+                }
+            }
+            est >= target
+        } else {
+            false
+        };
+        let in_winddown = turn >= winddown || batches_spent || tokens_spent;
         // Finer read budgets (ADR-0042): before full wind-down, drop just the exhausted tool category
         // (read_file / retrieval) so the model can still record findings and finish while it stops the
         // kind of reading it has used up. Built per-turn only when a budget is spent (else borrow `defs`).
@@ -311,7 +416,9 @@ pub async fn run_native_agent(
         suppress_record = false;
         if in_winddown && !winddown_announced {
             winddown_announced = true;
-            let why = if batches_spent && turn < winddown {
+            let why = if tokens_spent && turn < winddown && !batches_spent {
+                "Context budget nearly full".to_string()
+            } else if batches_spent && turn < winddown {
                 format!("Investigation batch budget spent ({batches}/{max_batches} batches)")
             } else {
                 format!("Turn budget almost spent (turn {turn}/{max_turns})")
@@ -396,6 +503,18 @@ pub async fn run_native_agent(
                 // toward the per-run circuit breaker: keep going until it trips or the budget runs out,
                 // rather than wasting the whole budget against a chain that's clearly down.
                 if !turn_err.transient {
+                    // Context overflow is deterministic, but failing would discard every buffered
+                    // finding (ADR-0045 tier 1). Instead, stop investigating and finalize what we have
+                    // — the same graceful path as the turn-budget backstop. A genuine bad-request (any
+                    // other 4xx) still fails fast with the legible reason.
+                    if is_context_overflow(&turn_err.error) {
+                        tracing::warn!(
+                            task_id = %task_id, turn, findings_recorded, error = %turn_err.error,
+                            "context overflow on a chat turn — finalizing buffered findings instead of failing"
+                        );
+                        overflow_finalize = true;
+                        break;
+                    }
                     return Err(turn_err.error).with_context(|| format!("agent chat turn {turn}"));
                 }
                 consecutive_failures += 1;
@@ -697,15 +816,23 @@ pub async fn run_native_agent(
         }
     }
 
-    // Turn budget exhausted. CRITICAL (#137): do NOT bail — that would discard the buffered findings
-    // the control plane is holding. Return `Exhausted` so the caller posts a truncation note and
-    // finalizes, leaving a visible artifact (a real prod run lost 5 findings this way at turn 16).
-    tracing::warn!(
-        task_id = %task_id,
-        max_turns,
-        findings_recorded,
-        "review agent hit its turn budget without calling finish — finalizing buffered findings"
-    );
+    // Budget exhausted (turns or context window). CRITICAL (#137/ADR-0045): do NOT bail — that would
+    // discard the buffered findings the control plane is holding. Return `Exhausted` so the caller posts
+    // a truncation note and finalizes (a real prod run lost 5 findings this way at turn 16).
+    if overflow_finalize {
+        tracing::warn!(
+            task_id = %task_id,
+            findings_recorded,
+            "review agent hit the context window before calling finish — finalizing buffered findings"
+        );
+    } else {
+        tracing::warn!(
+            task_id = %task_id,
+            max_turns,
+            findings_recorded,
+            "review agent hit its turn budget without calling finish — finalizing buffered findings"
+        );
+    }
     Ok(ReviewOutcome::Exhausted)
 }
 
@@ -964,6 +1091,7 @@ mod tests {
             max_files_read: crate::bootstrap::config::DEFAULT_MAX_FILES_READ,
             max_searches: crate::bootstrap::config::DEFAULT_MAX_SEARCHES,
             max_batches: crate::bootstrap::config::DEFAULT_MAX_BATCHES,
+            context_window: None,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -1957,5 +2085,151 @@ mod tests {
             "budget message injected by the wind-down turn: {:?}",
             user_text[4]
         );
+    }
+
+    // ── ADR-0045: context-window budget ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_scales_with_content_and_tools() {
+        let no_tools: Vec<ToolDef> = vec![];
+        let small = [ChatMessage::user("hi")];
+        let big_text = "x".repeat(4000);
+        let big = [ChatMessage::user(big_text.as_str())];
+        let s = estimate_tokens(&small, &no_tools);
+        let b = estimate_tokens(&big, &no_tools);
+        assert!(b > s, "more content → more tokens ({b} vs {s})");
+        // ~chars/4: 4000 chars ≈ ~1000 tokens (plus a little overhead).
+        assert!((900..1100).contains(&b), "≈ chars/4, got {b}");
+        // Advertised tool schemas count against the window too.
+        let tool = ToolDef::function("t", "a description", json!({ "type": "object" }));
+        assert!(
+            estimate_tokens(&small, &[tool]) > s,
+            "tool schema adds to the estimate"
+        );
+    }
+
+    #[test]
+    fn trim_tool_history_elides_old_output_keeps_recent_and_structure() {
+        let no_tools: Vec<ToolDef> = vec![];
+        let big = "y".repeat(8000);
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("review this"),
+            ChatMessage::tool("c1", big.clone()), // old, bulky → trimmable
+            ChatMessage::tool("c2", big.clone()), // old, bulky → trimmable
+            ChatMessage::tool("c3", big.clone()), // within KEEP_RECENT → preserved
+            ChatMessage::user("continue"),        // within KEEP_RECENT → preserved
+        ];
+        let before = estimate_tokens(&messages, &no_tools);
+        let trimmed = trim_tool_history(&mut messages, &no_tools, before / 4);
+        assert!(trimmed >= 1, "trimmed at least one old tool message");
+        assert!(
+            estimate_tokens(&messages, &no_tools) < before,
+            "estimate shrank after trimming"
+        );
+        // Structure preserved: no message removed; tool messages keep their tool_call_id (the
+        // assistant↔tool pairing the protocol requires stays valid).
+        assert_eq!(messages.len(), 6, "no messages removed");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        // The most-recent tool result (within KEEP_RECENT) is left intact.
+        assert_eq!(
+            messages[4].content.as_deref(),
+            Some(big.as_str()),
+            "recent tool output preserved"
+        );
+    }
+
+    #[test]
+    fn is_context_overflow_matches_overflow_not_generic_errors() {
+        assert!(is_context_overflow(&anyhow::anyhow!(
+            "chat completions API returned 400: This model's maximum context length is 128000 tokens"
+        )));
+        assert!(is_context_overflow(&anyhow::anyhow!(
+            "error: context_length_exceeded"
+        )));
+        // A genuine bad-request must still fail fast, not be mistaken for overflow.
+        assert!(!is_context_overflow(&anyhow::anyhow!(
+            "chat completions API returned 400: unknown model 'm'"
+        )));
+        assert!(!is_context_overflow(&anyhow::anyhow!("connection refused")));
+    }
+
+    // ADR-0045 tier 1: a context-overflow error mid-run FINALIZES (Exhausted) instead of failing, so a
+    // finding already buffered before the overflow is not discarded.
+    #[tokio::test]
+    async fn native_loop_finalizes_on_context_overflow() {
+        let chat = MockServer::start().await;
+        // Turn 1: record a finding (200). Turn 2: the gateway rejects the request for length (400).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_reply(
+                "add_review_comment",
+                r#"{"file":"a.rs","line":7,"title":"Bug","priority":"P1","category":"correctness","body":"x"}"#,
+            )))
+            .up_to_n_times(1)
+            .mount(&chat)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": { "message": "This model's maximum context length is 128000 tokens" }
+            })))
+            .mount(&chat)
+            .await;
+
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,3 +1,4 @@\n fn validate() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let mut transcript = Vec::new();
+        let outcome = run_native_agent(
+            &review,
+            "@lightbridge review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut transcript,
+        )
+        .await
+        .expect("overflow finalizes (Ok), it does not fail the run");
+        assert!(
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "context overflow finalizes as Exhausted, got: {outcome:?}"
+        );
+        // The finding recorded before the overflow was posted (buffered), not discarded.
+        let reqs = cp.received_requests().await.unwrap();
+        let inline = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/review/inline"))
+            .count();
+        assert!(inline >= 1, "the finding was buffered before the overflow");
     }
 }
