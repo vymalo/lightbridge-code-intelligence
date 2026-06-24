@@ -1,4 +1,4 @@
-# ADR-0043: Deploying the Grafana dashboards (and why they read Postgres)
+# ADR-0046: Deploying the Grafana dashboards (and why they read Postgres)
 
 - **Status:** Proposed
 - **Date:** 2026-06-24
