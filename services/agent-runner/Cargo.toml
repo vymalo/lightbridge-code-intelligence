@@ -33,3 +33,9 @@ tree-sitter-python.workspace = true
 # HTTP mocking for the control-plane client contract tests (no live control plane).
 wiremock.workspace = true
 tempfile.workspace = true
+# SPIKE (spike/rig-llm-substrate): dev-only so it never ships in the binary. Drives examples/rig_spike.rs.
+rig-core.workspace = true
+# FINDING: rig-core 0.39 is on reqwest 0.13; the workspace is on 0.12. To share ONE transport type
+# with rig's `.http_client(..)` the spike must speak rig's reqwest version — hence this renamed
+# dev-dep. Real adoption = bump the workspace reqwest 0.12 → 0.13 instead.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "rustls"] }

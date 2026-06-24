@@ -65,6 +65,9 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 
 # --- Dev / test only ---
+# SPIKE (spike/rig-llm-substrate): evaluating rig-core as the LLM substrate behind an adapter.
+# rustls-only to match the rest of the workspace (no OpenSSL in the runtime images).
+rig-core = { version = "0.39", default-features = false, features = ["reqwest", "derive", "rustls"] }
 tempfile = "3"
 rsa = "0.9"
 rand = "0.8"
