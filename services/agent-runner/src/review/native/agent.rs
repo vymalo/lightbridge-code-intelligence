@@ -154,11 +154,13 @@ fn estimate_tokens(messages: &[ChatMessage], tools: &[ToolDef]) -> usize {
 /// error text (ADR-0039 folds the response body into the error message).
 fn is_context_overflow(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}").to_lowercase();
+    // Kept tight to genuine context-window signals (the ADR-0045 list). Deliberately NOT
+    // "maximum number of tokens" — that also matches a deterministic `max_tokens`-too-large param
+    // error, which must fail fast, not be finalized as an overflow.
     [
         "context length",
         "context_length_exceeded",
         "maximum context",
-        "maximum number of tokens",
         "too many tokens",
         "reduce the length",
     ]
@@ -175,20 +177,23 @@ fn trim_tool_history(messages: &mut [ChatMessage], tools: &[ToolDef], target: us
     const KEEP_RECENT: usize = 2;
     const STUB: &str = "[earlier tool output elided to fit the context budget]";
     let cutoff = messages.len().saturating_sub(KEEP_RECENT);
+    // Estimate once, then decrement a running total as we trim — `estimate_tokens` JSON-serializes
+    // every tool schema, so calling it per iteration would be O(N²) on a long conversation.
+    // `estimate_tokens` counts each message as `overhead + (content + calls)/4`, so replacing a
+    // body with the stub reclaims `(old_len - stub_len)/4` tokens.
+    let mut est = estimate_tokens(messages, tools);
     let mut trimmed = 0usize;
-    for i in 0..cutoff {
-        if estimate_tokens(messages, tools) <= target {
+    for msg in messages.iter_mut().take(cutoff) {
+        if est <= target {
             break;
         }
-        let is_trimmable_tool = messages[i].role == "tool"
-            && messages[i]
-                .content
-                .as_deref()
-                .is_some_and(|c| c.len() > STUB.len() && c != STUB);
-        if is_trimmable_tool {
-            messages[i].content = Some(STUB.to_string());
-            trimmed += 1;
-        }
+        let old_len = match msg.content.as_deref() {
+            Some(c) if msg.role == "tool" && c.len() > STUB.len() && c != STUB => c.len(),
+            _ => continue,
+        };
+        est = est.saturating_sub((old_len - STUB.len()) / 4);
+        msg.content = Some(STUB.to_string());
+        trimmed += 1;
     }
     trimmed
 }

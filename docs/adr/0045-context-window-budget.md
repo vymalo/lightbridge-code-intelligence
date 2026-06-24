@@ -13,7 +13,7 @@ reply + tool results. Nothing trims, summarizes, or budgets that growth. With `m
 `max_diff_chars=60 000`, the conversation can exceed the model's context window.
 
 When it does, the gateway returns an HTTP 400 ("context length exceeded"). The transport layer
-([ADR-0039](0039-llm-resilience.md)) correctly classifies a 400 as **deterministic** (not transient),
+([ADR-0039](0039-agent-llm-resilience-and-observability.md)) correctly classifies a 400 as **deterministic** (not transient),
 so the loop does `return Err(...)` — which fails the whole task. Because findings only flush to GitHub
 on `finish`, **every buffered finding from the run is discarded** at the exact moment the agent has
 done the most work. That is the worst possible time to fail.
@@ -34,7 +34,7 @@ When a deterministic chat error is a **context-overflow** (matched against the g
 `context length`, `maximum context`, `context_length_exceeded`, `too many tokens`, `reduce the
 length`), the loop stops investigating and **finalizes** (returns `ReviewOutcome::Exhausted`) instead
 of `return Err`. The existing finalize path posts the buffered findings with a truncation note
-([ADR-0037](0037-mediated-review-tools.md)). A genuine non-overflow 4xx still fails fast as today.
+([ADR-0037](0037-agent-acts-via-mediated-tools.md)). A genuine non-overflow 4xx still fails fast as today.
 
 ### Tier 2 — converge before overflow (proactive)
 
@@ -76,6 +76,6 @@ Unset everywhere = today's behavior (no budgeting), so this is safe to ship dark
 
 - Epic [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177).
 - [ADR-0026](0026-native-review-agent.md) — the agent loop this budgets.
-- [ADR-0037](0037-mediated-review-tools.md) — buffered findings + `Exhausted` finalizes anyway.
-- [ADR-0039](0039-llm-resilience.md) — error classification; overflow is a deterministic 4xx today.
+- [ADR-0037](0037-agent-acts-via-mediated-tools.md) — buffered findings + `Exhausted` finalizes anyway.
+- [ADR-0039](0039-agent-llm-resilience-and-observability.md) — error classification; overflow is a deterministic 4xx today.
 - [ADR-0042](0042-risk-first-review-and-parallel-batching.md) — the read budgets + wind-down this extends.
