@@ -603,6 +603,25 @@ pub async fn retract_inline(
     }
 }
 
+/// `POST /internal/tasks/{id}/review/inline/clear` — drop ALL buffered inline findings (no body). Used
+/// on an `abort` so an incomplete run posts only its note, not its half-baked findings.
+pub async fn clear_inline(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::clear_pending_action(pool, id, "inline").await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "clearing inline findings failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "clear error").into_response()
+        }
+    }
+}
+
 /// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`) and
 /// `POST /internal/tasks/{id}/review/summary` (`set_summary`).
 #[derive(Debug, Deserialize)]

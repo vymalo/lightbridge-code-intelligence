@@ -327,6 +327,26 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /internal/tasks/{id}/review/inline/clear` — drop ALL buffered inline findings. Used on an
+    /// `abort` so an incomplete/untrusted run posts only its note, not its half-baked findings (a
+    /// `placeholder` finding reached a PR this way — run 7c15f9bb).
+    pub async fn clear_findings(&self, task_id: Uuid) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!(
+            "{}/internal/tasks/{task_id}/review/inline/clear",
+            self.base_url
+        );
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("clearing inline findings")?
+            .error_for_status()
+            .context("control plane rejected the clear")?;
+        Ok(())
+    }
+
     /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (ADR-0037).
     pub async fn add_review_reply(&self, task_id: Uuid, body: &str) -> anyhow::Result<()> {
         use anyhow::Context;

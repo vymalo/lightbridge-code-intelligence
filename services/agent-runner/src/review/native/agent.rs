@@ -236,6 +236,16 @@ pub async fn run_native_agent(
     let mut p0p1_recorded = 0usize;
     let mut refute_bounced = false;
 
+    // Scratchpad-loop guard (post-Phase-2 dogfood, run 7c15f9bb): a model that can't find what it
+    // wants will reach for `add_review_comment` as a notepad and re-record placeholder "findings" on
+    // the SAME (file, line) — which the buffer dedups (last-write-wins), so it never "sees progress",
+    // spirals, and aborts (posting a `placeholder` finding). Track consecutive recordings on the same
+    // location; after a few, drop `add_review_comment` for one turn and tell it to investigate or finish
+    // instead — breaking the loop mechanically.
+    let mut last_finding_loc: Option<(String, i32)> = None;
+    let mut same_loc_repeats = 0usize;
+    let mut suppress_record = false;
+
     // Cumulative read budgets (ADR-0042): once a budget is spent we drop the matching tool from the
     // offered set and nudge the model to converge — read *enough*, then stop, instead of grinding the
     // whole repo. `max_batches` (investigation rounds) forces the wind-down; the finer `max_files_read`
@@ -269,14 +279,16 @@ pub async fn run_native_agent(
         let turn_defs_owned: Vec<ToolDef>;
         let turn_defs: &[ToolDef] = if in_winddown {
             &winddown_defs
-        } else if files_spent || searches_spent {
+        } else if files_spent || searches_spent || suppress_record {
             turn_defs_owned = defs
                 .iter()
                 .filter(|t| {
                     let n = t.function.name.as_str();
-                    // Drop a tool only when its own budget is spent.
-                    let drop =
-                        (files_spent && n == READ_FILE) || (searches_spent && is_retrieval_tool(n));
+                    // Drop a tool only when its own budget is spent — or `add_review_comment` for one
+                    // turn when the scratchpad-loop guard fired (forces investigate/finish instead).
+                    let drop = (files_spent && n == READ_FILE)
+                        || (searches_spent && is_retrieval_tool(n))
+                        || (suppress_record && n == ADD_REVIEW_COMMENT);
                     !drop
                 })
                 .cloned()
@@ -285,6 +297,8 @@ pub async fn run_native_agent(
         } else {
             &defs
         };
+        // One-turn suppression: the guard's effect on `turn_defs` is now baked in for this turn.
+        suppress_record = false;
         if in_winddown && !winddown_announced {
             winddown_announced = true;
             let why = if batches_spent && turn < winddown {
@@ -544,6 +558,23 @@ pub async fn run_native_agent(
                         ) {
                             p0p1_recorded += 1;
                         }
+                        // Scratchpad-loop detection: count consecutive recordings on the same
+                        // (file, line) — the signature of the abort spiral (run 7c15f9bb).
+                        let loc = arg_field(&call.function.arguments, "file").map(|f| {
+                            (
+                                f,
+                                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                    .ok()
+                                    .and_then(|v| v.get("line").and_then(|l| l.as_i64()))
+                                    .unwrap_or(0) as i32,
+                            )
+                        });
+                        if loc.is_some() && loc == last_finding_loc {
+                            same_loc_repeats += 1;
+                        } else {
+                            same_loc_repeats = 0;
+                            last_finding_loc = loc;
+                        }
                     }
                     if tool == RETRACT_FINDING && result.starts_with("retracted finding") {
                         p0p1_recorded = p0p1_recorded.saturating_sub(1);
@@ -570,6 +601,25 @@ pub async fn run_native_agent(
                     messages.push(ChatMessage::tool(call.id.as_str(), result));
                 }
             }
+        }
+        // Scratchpad-loop guard: ≥3 recordings on the same (file, line) is the abort-spiral signature.
+        // Drop `add_review_comment` for the next turn and tell the model to investigate or finish, so it
+        // can't keep re-recording the same placeholder. One-shot per detection (the counter resets).
+        if same_loc_repeats >= 2 {
+            same_loc_repeats = 0;
+            suppress_record = true;
+            tracing::warn!(
+                task_id = %task_id,
+                turn,
+                loc = ?last_finding_loc,
+                "scratchpad-loop guard: repeated recordings on one line — suppressing add_review_comment next turn"
+            );
+            messages.push(ChatMessage::user(
+                "You've recorded on the same line several times — that's a loop, and the buffer keeps \
+                 only the last one. `add_review_comment` is for a FINAL finding you can prove, not for \
+                 notes. Investigate with `read_file` (or `report_progress` to jot a note), then record \
+                 the finding once — or call `finish`. (add_review_comment is unavailable next turn.)",
+            ));
         }
         // Abort wins over finish if the model somehow asked for both — it's the safer signal.
         if let Some(reason) = abort_reason {
@@ -1218,6 +1268,75 @@ mod tests {
             run("P2").await,
             2,
             "a P2 finding does not trigger the refute bounce"
+        );
+    }
+
+    // ── Scratchpad-loop guard (run 7c15f9bb): repeatedly recording on the SAME (file,line) drops
+    // `add_review_comment` from the offered tools for a turn, breaking the abort spiral. ──
+    #[tokio::test]
+    async fn scratchpad_loop_guard_suppresses_add_review_comment() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: Arc::new(std::sync::Mutex::new(Vec::new())),
+                // Always re-records the same (file,line) — the scratchpad spiral; never finishes.
+                response: tool_call_reply(
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":2,"title":"t","priority":"P2","category":"quality","body":"b","evidence":"e"}"#,
+                ),
+            })
+            .mount(&chat)
+            .await;
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_turns = 6;
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n a\n+b\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let _ = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("clean outcome");
+
+        let log = offered.lock().unwrap();
+        assert!(
+            log[0].iter().any(|n| n == ADD_REVIEW_COMMENT),
+            "turn 0 offers add_review_comment: {:?}",
+            log[0]
+        );
+        // After 3 recordings on the same line (turns 0,1,2), the guard suppresses it on turn 3.
+        assert!(
+            log.get(3)
+                .is_some_and(|t| !t.iter().any(|n| n == ADD_REVIEW_COMMENT)),
+            "turn 3 drops add_review_comment after the same-line loop: {:?}",
+            log.get(3)
         );
     }
 
