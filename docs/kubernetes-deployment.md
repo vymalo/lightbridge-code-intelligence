@@ -110,6 +110,12 @@ spec:
 
 > Resource sizes are illustrative defaults. The design specifies no fixed resource ceiling, so
 > treat them as recommended starting points rather than constraints.
+>
+> The runner Job's resources can be set **per task kind** via the agent config: `indexer_resources`
+> for index Jobs (the heavy path — tree-sitter parse + embeddings + Graphify) and `review_resources`
+> for review Jobs (read-mostly: they reuse the latest indexed snapshot, [ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md),
+> so they run leaner). Each falls back to the shared `resources` when unset, so a single `resources`
+> block keeps uniform sizing.
 
 One Kubernetes Job per task is a deliberate isolation decision (TTL cleanup, per-task creds). See
 [ADR-0004](adr/0004-one-k8s-job-per-task.md).

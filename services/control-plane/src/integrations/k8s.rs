@@ -61,8 +61,14 @@ pub struct KubeLauncher {
     /// ConfigMap (agents namespace) with the runner's `agent.json` + prompt templates, mounted at
     /// `/etc/lightbridge` in each Job. `None` → not mounted (runner falls back to env).
     agent_config_map: Option<String>,
-    /// The runner container's `resources` block (requests/limits), set verbatim when present.
+    /// The runner container's `resources` block (requests/limits), set verbatim when present. Shared
+    /// fallback for both kinds when a per-kind block below is unset.
     resources: Option<Value>,
+    /// Resources for **index** Jobs (`command_text == "index"`, the heavy path); falls back to
+    /// `resources`. See [`resources_for`].
+    indexer_resources: Option<Value>,
+    /// Resources for **review** Jobs (everything else, read-mostly); falls back to `resources`.
+    review_resources: Option<Value>,
     /// Handle to the agent ServiceAccount, used to resolve its UID for the Job `ownerReference`.
     sa: Api<ServiceAccount>,
     /// Lazily-resolved Job `ownerReference` (to the agent SA) for k8s GC + traceability. A
@@ -149,6 +155,8 @@ impl KubeLauncher {
             "AGENT_CONFIG_CONFIGMAP",
         );
         let resources = agent.and_then(|a| a.resources.clone());
+        let indexer_resources = agent.and_then(|a| a.indexer_resources.clone());
+        let review_resources = agent.and_then(|a| a.review_resources.clone());
         Ok(Self {
             // The SA's UID (for the Job ownerReference) is resolved lazily on first launch, not here:
             // at startup the SA may not exist yet (Helm install ordering) or the API may be briefly
@@ -164,6 +172,8 @@ impl KubeLauncher {
             review_system_prompt,
             agent_config_map,
             resources,
+            indexer_resources,
+            review_resources,
             owner_reference: tokio::sync::OnceCell::new(),
         })
     }
@@ -223,7 +233,12 @@ impl TaskLauncher for KubeLauncher {
                 active_deadline_seconds: self.active_deadline_seconds,
                 review_system_prompt: self.review_system_prompt.as_deref(),
                 agent_config_map: self.agent_config_map.as_deref(),
-                resources: self.resources.as_ref(),
+                resources: resources_for(
+                    task,
+                    self.indexer_resources.as_ref(),
+                    self.review_resources.as_ref(),
+                    self.resources.as_ref(),
+                ),
                 owner_reference,
             },
             task,
@@ -297,6 +312,29 @@ struct JobConfig<'a> {
     agent_config_map: Option<&'a str>,
     resources: Option<&'a Value>,
     owner_reference: Option<&'a Value>,
+}
+
+/// Pick the resource block for a task's kind. **Index** Jobs (`command_text == "index"`) are the heavy
+/// path — full tree-sitter parse + embeddings + Graphify — and want more CPU/RAM; **review** Jobs are
+/// read-mostly (they reuse the latest indexed snapshot, ADR-0050, and are LLM/network-bound) so they
+/// run leaner. Each kind falls back to the shared `resources` when its own block is unset, so a chart
+/// that sets only `resources` keeps today's behaviour.
+///
+/// CAVEAT: a *cold-repo* review still self-indexes (ADR-0050 only makes *warm* reviews reuse the
+/// snapshot), so the review block must not be so lean it OOMs a first-time index. In practice the
+/// approval-time index task (Epic #75) indexes a repo before any review runs, so reviews are warm; the
+/// residual cold path is closed once review-never-indexes lands (plan Phase 1.2).
+fn resources_for<'a>(
+    task: &ClaimedTask,
+    indexer: Option<&'a Value>,
+    review: Option<&'a Value>,
+    shared: Option<&'a Value>,
+) -> Option<&'a Value> {
+    if task.command_text == "index" {
+        indexer.or(shared)
+    } else {
+        review.or(shared)
+    }
 }
 
 /// The per-task agent Job manifest (mirrors docs/kubernetes-deployment.md): `restartPolicy: Never`,
@@ -461,6 +499,46 @@ mod tests {
         assert_eq!(
             job_name(&sample_task()),
             "lightbridge-agent-00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn resources_for_picks_by_kind_with_shared_fallback() {
+        let indexer = json!({ "limits": { "memory": "4Gi" } });
+        let review = json!({ "limits": { "memory": "2Gi" } });
+        let shared = json!({ "limits": { "memory": "3Gi" } });
+
+        let mut index_task = sample_task();
+        index_task.command_text = "index".to_string();
+        let review_task = sample_task(); // command_text == "review"
+
+        // Per-kind blocks win for their own kind.
+        assert_eq!(
+            resources_for(&index_task, Some(&indexer), Some(&review), Some(&shared)),
+            Some(&indexer)
+        );
+        assert_eq!(
+            resources_for(&review_task, Some(&indexer), Some(&review), Some(&shared)),
+            Some(&review)
+        );
+        // A missing per-kind block falls back to the shared one (today's behaviour for a chart that
+        // only sets `resources`).
+        assert_eq!(
+            resources_for(&index_task, None, None, Some(&shared)),
+            Some(&shared)
+        );
+        assert_eq!(
+            resources_for(&review_task, None, None, Some(&shared)),
+            Some(&shared)
+        );
+        // Nothing set → None (cluster defaults / LimitRange apply).
+        assert_eq!(resources_for(&index_task, None, None, None), None);
+        // Any non-"index" command (e.g. an @mention re-review) is treated as a review Job.
+        let mut mention = sample_task();
+        mention.command_text = "@lightbridge please re-review".to_string();
+        assert_eq!(
+            resources_for(&mention, Some(&indexer), Some(&review), Some(&shared)),
+            Some(&review)
         );
     }
 
