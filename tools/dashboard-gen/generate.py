@@ -15,6 +15,7 @@ import pathlib
 from grafana_foundation_sdk.cog.encoder import JSONEncoder
 
 from lci_dashboards import (
+    feedback,
     ingress_dispatcher,
     operations,
     overview,
@@ -33,6 +34,7 @@ DASHBOARDS = {
     "task-runs": task_runs.dashboard_builder,
     "repositories": repositories.dashboard_builder,
     "review-quality": review_quality.dashboard_builder,
+    "feedback": feedback.dashboard_builder,
     "ingress-dispatcher": ingress_dispatcher.dashboard_builder,
     "operations": operations.dashboard_builder,
 }

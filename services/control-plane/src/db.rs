@@ -214,6 +214,10 @@ pub struct TranscriptInput {
     pub prompt_tokens: Option<i64>,
     #[serde(default)]
     pub completion_tokens: Option<i64>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// One stored transcript entry, serialized to `GET /tasks/{id}/transcript` (ADR-0034) for the
@@ -247,8 +251,9 @@ pub async fn replace_transcript(
     for (seq, e) in entries.iter().enumerate() {
         sqlx::query(
             "INSERT INTO agent_transcript \
-             (id, task_id, seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (id, task_id, seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, \
+              reasoning_tokens, model) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(Uuid::new_v4())
         .bind(task_id)
@@ -259,6 +264,8 @@ pub async fn replace_transcript(
         .bind(&e.tool_name)
         .bind(e.prompt_tokens)
         .bind(e.completion_tokens)
+        .bind(e.reasoning_tokens)
+        .bind(&e.model)
         .execute(&mut *tx)
         .await?;
     }
@@ -2375,6 +2382,8 @@ mod tests {
                 tool_name: None,
                 prompt_tokens: Some(1200),
                 completion_tokens: Some(30),
+                reasoning_tokens: Some(12),
+                model: Some("adorsys-reviewer".to_string()),
             },
             TranscriptInput {
                 role: "tool".to_string(),
@@ -2383,6 +2392,8 @@ mod tests {
                 tool_name: Some("lightbridge_vector_semantic_search".to_string()),
                 prompt_tokens: None,
                 completion_tokens: None,
+                reasoning_tokens: None,
+                model: None,
             },
         ];
         replace_transcript(&pool, task_id, &first).await.unwrap();
@@ -2396,6 +2407,17 @@ mod tests {
             rows[1].tool_name.as_deref(),
             Some("lightbridge_vector_semantic_search")
         );
+        // The new per-turn observability columns (0017) round-trip: model + reasoning_tokens on the
+        // assistant turn, NULL on the tool-result turn.
+        let (model, reasoning): (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT model, reasoning_tokens FROM agent_transcript WHERE task_id = $1 AND seq = 0",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model.as_deref(), Some("adorsys-reviewer"));
+        assert_eq!(reasoning, Some(12));
 
         // A retry re-submits a (shorter) transcript → fully replaces the old one.
         let second = vec![TranscriptInput {
@@ -2405,6 +2427,8 @@ mod tests {
             tool_name: None,
             prompt_tokens: Some(500),
             completion_tokens: Some(10),
+            reasoning_tokens: None,
+            model: Some("adorsys-reviewer-pro".to_string()),
         }];
         replace_transcript(&pool, task_id, &second).await.unwrap();
         let rows = get_transcript(&pool, task_id).await.unwrap();

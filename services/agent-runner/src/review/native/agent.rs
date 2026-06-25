@@ -465,11 +465,13 @@ pub async fn run_native_agent(
         // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
         // secondary model (when configured) once for this turn. The outcome is either a completion, or
         // a turn-level error we classify before deciding whether to keep going.
+        // Carries the model that actually produced the turn (primary or, on failover, the secondary)
+        // so the transcript records which model did the work — see ADR-0039 failover.
         let turn_result = match chat
             .complete_with_retry(&messages, turn_defs, params, retry_policy)
             .await
         {
-            Ok(c) => Ok(c),
+            Ok(c) => Ok((c, chat.model().to_string())),
             Err(primary_err) => match (&fallback, primary_err.transient) {
                 (Some(fb), true) => {
                     tracing::warn!(
@@ -482,6 +484,7 @@ pub async fn run_native_agent(
                     );
                     fb.complete_with_retry(&messages, turn_defs, params, retry_policy)
                         .await
+                        .map(|c| (c, fb.model().to_string()))
                         .map_err(|fb_err| ChatTurnError {
                             error: fb_err
                                 .error
@@ -496,7 +499,7 @@ pub async fn run_native_agent(
             },
         };
 
-        let completion = match turn_result {
+        let (completion, turn_model) = match turn_result {
             Ok(c) => {
                 // The turn produced a model reply → the chain is healthy again.
                 consecutive_failures = 0;
@@ -555,9 +558,11 @@ pub async fn run_native_agent(
         tracing::info!(
             task_id = %task_id,
             turn,
+            model = %turn_model,
             tools = ?tool_names,
             prompt_tokens = usage.and_then(|u| u.prompt_tokens).unwrap_or(-1),
             completion_tokens = usage.and_then(|u| u.completion_tokens).unwrap_or(-1),
+            reasoning_tokens = usage.and_then(|u| u.reasoning_tokens()).unwrap_or(-1),
             latency_ms = turn_latency_ms,
             "agent turn complete"
         );
@@ -585,6 +590,8 @@ pub async fn run_native_agent(
             tool_name: None,
             prompt_tokens: usage.and_then(|u| u.prompt_tokens),
             completion_tokens: usage.and_then(|u| u.completion_tokens),
+            reasoning_tokens: usage.and_then(|u| u.reasoning_tokens()),
+            model: Some(turn_model),
         });
         // Echo the assistant turn (with its tool_calls) back into the conversation, as the protocol
         // requires before the matching tool-result messages.
@@ -731,6 +738,8 @@ pub async fn run_native_agent(
                         tool_name: Some(call.function.name.clone()),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        reasoning_tokens: None,
+                        model: None,
                     });
                     messages.push(ChatMessage::tool(call.id.as_str(), result));
                 }

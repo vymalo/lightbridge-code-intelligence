@@ -114,17 +114,34 @@ def dashboard_builder() -> dashboard.Dashboard:
         .grid_pos(layout.place(12, 8))
     )
 
+    # input (prompt) / output (completion) / reasoning. reasoning_tokens is a SUBSET of completion
+    # (don't add it to a total), shown as its own line to see how much output is "thinking".
     tokens_over_time = (
         timeseries.Panel()
-        .title("Token usage")
+        .title("Token usage (input / output / reasoning)")
         .datasource(POSTGRES)
         .with_target(
             sql(
                 "SELECT $__timeGroupAlias(t.created_at, $__interval), "
-                "sum(tr.prompt_tokens) AS \"prompt\", sum(tr.completion_tokens) AS \"completion\" "
+                "sum(tr.prompt_tokens) AS \"input\", sum(tr.completion_tokens) AS \"output\", "
+                "sum(tr.reasoning_tokens) AS \"reasoning\" "
                 "FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id "
                 "WHERE $__timeFilter(t.created_at) GROUP BY 1 ORDER BY 1",
                 fmt="time_series",
+            )
+        )
+        .grid_pos(layout.place(12, 8))
+    )
+    models_used = (
+        bargauge.Panel()
+        .title("Runs by model")
+        .datasource(POSTGRES)
+        .with_target(
+            sql(
+                "SELECT tr.model AS metric, count(DISTINCT tr.task_id) AS value "
+                "FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id "
+                "WHERE tr.model IS NOT NULL AND $__timeFilter(t.created_at) "
+                "GROUP BY tr.model ORDER BY value DESC"
             )
         )
         .grid_pos(layout.place(12, 8))
@@ -152,11 +169,17 @@ def dashboard_builder() -> dashboard.Dashboard:
                 "SELECT rv.created_at AS \"reviewed\", "
                 "coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", "
                 "t.target_id AS \"pr\", "
+                "(SELECT string_agg(DISTINCT tr.model, ', ') FROM agent_transcript tr "
+                "WHERE tr.task_id = rv.task_id AND tr.model IS NOT NULL) AS \"model\", "
                 "jsonb_array_length(rv.findings) AS \"findings\", "
                 "rv.inline_count AS \"inline\", rv.deferred_count AS \"deferred\", "
                 "rv.out_of_scope_count AS \"out_of_scope\", "
-                "(SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) "
-                "FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"tokens\", "
+                "(SELECT coalesce(sum(prompt_tokens), 0) FROM agent_transcript tr "
+                "WHERE tr.task_id = rv.task_id) AS \"in\", "
+                "(SELECT coalesce(sum(completion_tokens), 0) FROM agent_transcript tr "
+                "WHERE tr.task_id = rv.task_id) AS \"out\", "
+                "(SELECT coalesce(sum(reasoning_tokens), 0) FROM agent_transcript tr "
+                "WHERE tr.task_id = rv.task_id) AS \"reasoning\", "
                 "(SELECT coalesce(max(seq) + 1, 0) FROM agent_transcript tr "
                 "WHERE tr.task_id = rv.task_id) AS \"turns\" "
                 "FROM reviews rv JOIN tasks t ON t.id = rv.task_id "
@@ -181,6 +204,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_panel(findings_by_priority)
         .with_panel(findings_by_category)
         .with_panel(tokens_over_time)
+        .with_panel(models_used)
         .with_panel(feedback)
         .with_panel(per_review)
     )
