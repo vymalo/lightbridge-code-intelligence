@@ -59,3 +59,13 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Proposed |
 | [0038](0038-per-repo-review-model.md) | Per-repository review model selected in the admin UI from an operator allowlist (admin-owned, not the author-owned repo file) | Proposed |
 | [0039](0039-agent-llm-resilience-and-observability.md) | Agent LLM resilience & observability: generous per-request timeout (180s, eaig reality), bounded retry/backoff on transient errors, per-run circuit breaker, optional model failover, captured HTTP error body, structured per-turn logging | Proposed |
+| [0040](0040-re-review-reads-prior-findings.md) | A re-review reads the agent's own prior review as context (reconcile, don't contradict) | Proposed |
+| [0041](0041-full-diff-coverage-gate.md) | Full-diff coverage gate: bounce an early finish while changed files are untouched | Proposed |
+| [0042](0042-risk-first-review-and-parallel-batching.md) | Risk-first review strategy + parallel read-only tool batching + cumulative read budgets (Phase 1) | Proposed |
+| [0043](0043-review-finding-verification.md) | Finding verification: evidence citation on every finding + a refute pass on P0/P1 (Phase 2) | Proposed |
+| [0044](0044-feedback-memory-m1.md) | Feedback memory (M1): inject 👎-rejected findings as repo memory so the agent doesn't re-raise known false positives | Proposed |
+| [0045](0045-context-window-budget.md) | Context-window budget: converge before overflow, trim consumed tool output, never discard buffered findings | Proposed |
+| [0046](0046-observability-dashboard-deployment.md) | Observability dashboard deployment (most dashboards read Postgres, not Prometheus) | Proposed |
+| [0047](0047-review-prompt-grounding-and-uncertainty.md) | Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence) | Proposed |
+| [0048](0048-review-prompt-structure-and-technique.md) | Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model | Proposed |
+| [0049](0049-eval-driven-reviewer-prompt-iteration.md) | Eval-driven reviewer-prompt iteration — golden cases before deploy | Proposed |

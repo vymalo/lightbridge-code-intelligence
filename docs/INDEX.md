@@ -41,7 +41,7 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 3. [GitHub App and Rust control plane](github-app-and-control-plane.md)
 4. [Indexing and storage](indexing-and-storage.md)
 5. [Jobs and task lifecycle](jobs-and-lifecycle.md)
-6. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker/failover + structured logging). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
+6. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker/failover + structured logging). Prompt engineering (epic #177): [ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md) (grounding & uncertainty — empty retrieval ≠ absence), [ADR-0048](adr/0048-review-prompt-structure-and-technique.md) (prompt structure & technique for the GLM model) + the [revised-prompt draft](drafts/review-system-prompt.md), [ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md) (eval-driven prompt iteration). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
 
 ### Platform engineer path
 1. [Architecture overview](architecture.md)
