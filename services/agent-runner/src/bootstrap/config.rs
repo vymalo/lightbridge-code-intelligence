@@ -437,8 +437,14 @@ impl ReviewConfig {
             .map(|n| n as u32)
             .unwrap_or(DEFAULT_MAX_RETRIES);
         // Review failover was removed. The config fields are still parsed for deploy-compat, but if a
-        // live config still sets one, warn loudly and ignore it.
-        if r.fallback_model.is_some() || r.fallback.is_some() {
+        // live config still sets one with a real value, warn loudly and ignore it. An empty string or
+        // a JSON null is treated as unset (no spurious warning in prod logs).
+        let has_fallback_model = r
+            .fallback_model
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_fallback = r.fallback.as_ref().is_some_and(|v| !v.is_null());
+        if has_fallback_model || has_fallback {
             tracing::warn!(
                 "review.fallback / review.fallback_model are set but IGNORED — the review fallback \
                  model was removed; drop them from the config"
