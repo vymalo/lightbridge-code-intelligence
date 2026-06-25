@@ -233,7 +233,8 @@ pub async fn run_native_agent(
         &review.model,
         Duration::from_secs(review.resilience.request_timeout_secs),
     )
-    .with_attribution(attribution);
+    .with_attribution(attribution)
+    .with_extra(review.extra.clone());
     // Optional secondary model for failover (ADR-0039/0051): its OWN client (own timeout), generation
     // params, and retry budget — same gateway/key, different model. The per-turn failover below uses
     // these so the fallback runs under its own config, not the primary's.
@@ -1131,6 +1132,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            extra: serde_json::Map::new(),
             // Fast resilience defaults so the loop tests don't sleep on the (mocked) failure paths.
             resilience: crate::bootstrap::config::ResilienceConfig {
                 request_timeout_secs: 5,

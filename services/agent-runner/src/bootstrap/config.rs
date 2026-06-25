@@ -135,6 +135,12 @@ pub struct ReviewFile {
     pub top_p: Option<f64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub max_tokens: Option<i64>,
+    /// Provider-specific passthrough generation params, merged verbatim into the chat request body —
+    /// for knobs the typed fields don't cover, notably a **reasoning budget** (e.g. `thinking`,
+    /// `reasoning_effort`) to stop a reasoning model over-thinking. A JSON object; `None` = nothing
+    /// extra. The operator owns correctness; unknown fields the gateway/model ignores are harmless.
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
     /// Resilience knobs (ADR-0039). All optional — unset falls back to the safe defaults above so a
     /// deploy works without an ai-helm values change. Numeric-string tolerant for `{env:…}` values.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
@@ -306,6 +312,10 @@ pub struct ReviewConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// Provider-specific passthrough request fields (reasoning budget etc.), from `review.extra`,
+    /// merged verbatim into the chat body. Empty = nothing extra. (Primary model; the fallback gets
+    /// its own in a follow-up.)
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Resilience policy for the LLM transport: timeout, retry/backoff, circuit breaker (ADR-0039).
     /// Always present (defaults applied at resolve time). These are the **primary** model's per-request
     /// knobs + the loop-level breaker.
@@ -433,6 +443,9 @@ impl ReviewConfig {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            // No env var for arbitrary passthrough params — the file path (`review.extra`) is where a
+            // reasoning budget is set.
+            extra: serde_json::Map::new(),
             resilience: ResilienceConfig::from_env(),
             // Env path: `LLM_FALLBACK_MODEL` (a bare id) inherits the primary's env tuning — there are
             // no per-fallback env vars. The file path (resolve) is where per-model tuning lives.
@@ -473,6 +486,14 @@ impl ReviewConfig {
         let temperature = r.temperature;
         let top_p = r.top_p;
         let max_tokens = r.max_tokens;
+        // `review.extra`: a free-form object of provider-specific params (reasoning budget etc.). Only
+        // a JSON object is meaningful as request fields; anything else resolves to empty.
+        let extra = r
+            .extra
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let request_timeout_secs = r
             .request_timeout_secs
             .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
@@ -527,6 +548,7 @@ impl ReviewConfig {
             temperature,
             top_p,
             max_tokens,
+            extra,
             resilience: ResilienceConfig {
                 request_timeout_secs,
                 max_retries,
@@ -648,6 +670,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                extra: None,
                 request_timeout_secs: None,
                 max_retries: None,
                 circuit_breaker_threshold: None,
@@ -687,6 +710,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                extra: None,
                 request_timeout_secs: None,
                 max_retries: None,
                 circuit_breaker_threshold: None,
