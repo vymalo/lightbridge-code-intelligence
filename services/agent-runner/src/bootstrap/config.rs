@@ -87,36 +87,6 @@ pub struct EmbeddingsTuningFile {
     pub request_timeout_secs: Option<u64>,
 }
 
-/// One review model's tuning (ADR-0051): the per-request knobs that follow whichever model issues a
-/// turn. Used for both the primary (`review.config`) and the fallback (`review.fallback.config`).
-/// All optional + numeric-string tolerant; unset inherits the runner default (primary) or the
-/// primary's effective value (fallback).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModelTuningFile {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
-    pub top_p: Option<f64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
-    pub max_tokens: Option<i64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
-    pub request_timeout_secs: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
-    pub max_retries: Option<u64>,
-}
-
-/// The fallback review model (ADR-0051): its own model id + tuning, used on per-turn failover
-/// (ADR-0039). Replaces the bare `fallback_model` string so the fallback carries its OWN context
-/// window, generation params, and timeout instead of silently inheriting the primary's.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FallbackFile {
-    pub model: String,
-    #[serde(default)]
-    pub config: Option<ModelTuningFile>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewFile {
@@ -168,15 +138,14 @@ pub struct ReviewFile {
     /// the history grows too large. Unset = no budgeting (unchanged behaviour).
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub context_window: Option<usize>,
-    /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
-    /// (ADR-0039). **Deprecated** by `fallback` below (ADR-0051) — kept for dual-read so an older
-    /// agent.json still parses; ignored when `fallback` is present.
+    /// **REMOVED — review failover is gone.** `fallback_model` and `fallback` are still *parsed* (so a
+    /// live `agent.json` that still sets them doesn't break `deny_unknown_fields` on this image) but are
+    /// **ignored**; [`ReviewConfig::resolve`] warns when either is present. Delete these two fields once
+    /// `ai-helm-values` has dropped the `fallbackModel` value.
     #[serde(default)]
     pub fallback_model: Option<String>,
-    /// The fallback model with its OWN tuning (ADR-0051): own context window, generation params, and
-    /// timeout. Takes precedence over `fallback_model`. Unset (and no `fallback_model`) = no failover.
     #[serde(default)]
-    pub fallback: Option<FallbackFile>,
+    pub fallback: Option<serde_json::Value>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -320,34 +289,11 @@ pub struct ReviewConfig {
     /// Always present (defaults applied at resolve time). These are the **primary** model's per-request
     /// knobs + the loop-level breaker.
     pub resilience: ResilienceConfig,
-    /// The fallback review model with its OWN per-request config (ADR-0051): own context window,
-    /// generation params, timeout, and retries, applied on a per-turn failover (ADR-0039). `None` =
-    /// single-model behaviour (no failover). Loop-cumulative budgets stay the primary's.
-    pub fallback: Option<FallbackConfig>,
-}
-
-/// The resolved fallback review model (ADR-0051). Each tuning field defaults to the **primary's**
-/// effective value when the operator didn't set it, so a fallback configured with only a model id
-/// behaves exactly as the old `fallback_model` did (inherit the primary), while an operator can now
-/// override the window / params / timeout per the `-pro` model's real characteristics.
-/// The trim/context-budget window is deliberately NOT here: it's a pre-turn, run-level decision keyed
-/// on the primary's `context_window` (the loop can't know a turn will fail over before it sends). A
-/// fallback with a smaller window is backstopped by the ADR-0045 tier-1 overflow-finalize, not a
-/// per-fallback trim. So the fallback's per-request knobs are its generation params + timeout/retries.
-#[derive(Debug, Clone)]
-pub struct FallbackConfig {
-    pub model: String,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub max_tokens: Option<i64>,
-    pub request_timeout_secs: u64,
-    pub max_retries: u32,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
 /// per turn, so the timeout is deliberately generous; retries are bounded and only fire on transient
-/// failures; a per-run circuit breaker fails fast before the turn budget is exhausted; an optional
-/// secondary model provides config-gated failover.
+/// failures; and a per-run circuit breaker fails fast before the turn budget is exhausted.
 #[derive(Debug, Clone)]
 pub struct ResilienceConfig {
     /// Per-request timeout (seconds) for one chat round-trip.
@@ -447,23 +393,6 @@ impl ReviewConfig {
             // reasoning budget is set.
             extra: serde_json::Map::new(),
             resilience: ResilienceConfig::from_env(),
-            // Env path: `LLM_FALLBACK_MODEL` (a bare id) inherits the primary's env tuning — there are
-            // no per-fallback env vars. The file path (resolve) is where per-model tuning lives.
-            fallback: std::env::var("LLM_FALLBACK_MODEL")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .map(|model| FallbackConfig {
-                    model,
-                    temperature: None,
-                    top_p: None,
-                    max_tokens: None,
-                    request_timeout_secs: parse_env_u64("LLM_REQUEST_TIMEOUT_SECS")
-                        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-                    max_retries: parse_env_u64("LLM_MAX_RETRIES")
-                        .map(|n| n as u32)
-                        .unwrap_or(DEFAULT_MAX_RETRIES),
-                }),
         }))
     }
 
@@ -477,8 +406,7 @@ impl ReviewConfig {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
-        // Primary effective values (file wins, else env, else default). Computed as locals so the
-        // fallback can default each of its per-request knobs to the primary's (ADR-0051).
+        // Primary effective values (file wins, else env, else default).
         let context_window = r
             .context_window
             .or_else(|| parse_env_u64("LLM_CONTEXT_WINDOW").map(|n| n as usize))
@@ -508,14 +436,14 @@ impl ReviewConfig {
             .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
             .map(|n| n as u32)
             .unwrap_or(DEFAULT_MAX_RETRIES);
-        let fallback = resolve_fallback(
-            r,
-            temperature,
-            top_p,
-            max_tokens,
-            request_timeout_secs,
-            max_retries,
-        );
+        // Review failover was removed. The config fields are still parsed for deploy-compat, but if a
+        // live config still sets one, warn loudly and ignore it.
+        if r.fallback_model.is_some() || r.fallback.is_some() {
+            tracing::warn!(
+                "review.fallback / review.fallback_model are set but IGNORED — the review fallback \
+                 model was removed; drop them from the config"
+            );
+        }
         Ok(Some(Self {
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
@@ -563,60 +491,8 @@ impl ReviewConfig {
                     .map(|n| n as u32)
                     .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
             },
-            fallback,
         }))
     }
-}
-
-/// Resolve the fallback model (ADR-0051) from a `review` file block, defaulting each per-request knob
-/// to the primary's effective value (`p_*`). Prefers the nested `fallback { model, config }`; falls
-/// back to the deprecated `fallback_model` string (then `LLM_FALLBACK_MODEL`), which inherits all of
-/// the primary's tuning — i.e. exactly the pre-0051 behaviour. `None` = no failover.
-fn resolve_fallback(
-    r: &ReviewFile,
-    p_temperature: Option<f64>,
-    p_top_p: Option<f64>,
-    p_max_tokens: Option<i64>,
-    p_request_timeout_secs: u64,
-    p_max_retries: u32,
-) -> Option<FallbackConfig> {
-    if let Some(fb) = r.fallback.as_ref().filter(|fb| !fb.model.trim().is_empty()) {
-        let c = fb.config.as_ref();
-        return Some(FallbackConfig {
-            model: fb.model.trim().to_string(),
-            temperature: c.and_then(|c| c.temperature).or(p_temperature),
-            top_p: c.and_then(|c| c.top_p).or(p_top_p),
-            max_tokens: c.and_then(|c| c.max_tokens).or(p_max_tokens),
-            request_timeout_secs: c
-                .and_then(|c| c.request_timeout_secs)
-                .unwrap_or(p_request_timeout_secs),
-            max_retries: c
-                .and_then(|c| c.max_retries)
-                .map(|n| n as u32)
-                .unwrap_or(p_max_retries),
-        });
-    }
-    // Deprecated path: a bare `fallback_model` string (or env) inherits all the primary's tuning.
-    let model = r
-        .fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("LLM_FALLBACK_MODEL")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })?;
-    Some(FallbackConfig {
-        model,
-        temperature: p_temperature,
-        top_p: p_top_p,
-        max_tokens: p_max_tokens,
-        request_timeout_secs: p_request_timeout_secs,
-        max_retries: p_max_retries,
-    })
 }
 
 /// Load the **required** reviewer system prompt (ADR-0037): the `system_prompt_file` template when a
@@ -748,72 +624,33 @@ mod tests {
         std::fs::remove_file(&prompt).ok();
     }
 
-    // ADR-0051: the fallback gets its OWN per-request config — overrides what it sets, inherits the
-    // primary's effective value for what it doesn't; and a legacy bare `fallback_model` inherits all.
+    // Review failover is removed, but the deprecated `fallback_model` / `fallback` fields must still
+    // PARSE so a live agent.json that still sets them doesn't fail `deny_unknown_fields` on this image —
+    // they are simply ignored. (Transition-safety; delete the fields once ai-helm-values drops them.)
     #[test]
-    fn fallback_inherits_primary_then_overrides() {
+    fn deprecated_fallback_fields_parse_but_are_ignored() {
         let prompt = std::env::temp_dir().join(format!("lci-fb-{}.md", std::process::id()));
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
-        let prompt_path = prompt.to_string_lossy().into_owned();
-
-        // Nested fallback: overrides max_tokens + timeout, inherits temperature from primary.
-        let nested = FileConfig {
+        let file = FileConfig {
             embeddings: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".into(),
                 api_key: "k".into(),
                 model: "primary".into(),
-                system_prompt_file: Some(prompt_path.clone()),
-                context_window: Some(100_000),
-                temperature: Some(0.5),
-                request_timeout_secs: Some(180),
-                fallback: Some(FallbackFile {
-                    model: "fb".into(),
-                    config: Some(ModelTuningFile {
-                        request_timeout_secs: Some(240),
-                        max_tokens: Some(4096),
-                        ..Default::default()
-                    }),
-                }),
-                ..Default::default()
-            }),
-        };
-        let fb = ReviewConfig::resolve(Some(&nested))
-            .unwrap()
-            .unwrap()
-            .fallback
-            .expect("fallback present");
-        assert_eq!(fb.model, "fb");
-        assert_eq!(fb.max_tokens, Some(4096), "overridden");
-        assert_eq!(fb.request_timeout_secs, 240, "overridden");
-        assert_eq!(fb.temperature, Some(0.5), "inherited from primary");
-
-        // Legacy bare `fallback_model` (dual-read) inherits ALL the primary's tuning.
-        let legacy = FileConfig {
-            embeddings: None,
-            review: Some(ReviewFile {
-                base_url: "https://gw/v1".into(),
-                api_key: "k".into(),
-                model: "primary".into(),
-                system_prompt_file: Some(prompt_path),
-                context_window: Some(100_000),
-                temperature: Some(0.5),
+                system_prompt_file: Some(prompt.to_string_lossy().into_owned()),
+                // Both the bare-string and the nested-object forms a live config might carry.
                 fallback_model: Some("old-fb".into()),
+                fallback: Some(
+                    serde_json::json!({ "model": "fb", "config": { "max_tokens": 4096 } }),
+                ),
                 ..Default::default()
             }),
         };
-        let fb2 = ReviewConfig::resolve(Some(&legacy))
-            .unwrap()
-            .unwrap()
-            .fallback
-            .expect("legacy fallback present");
-        assert_eq!(fb2.model, "old-fb");
-        assert_eq!(
-            fb2.temperature,
-            Some(0.5),
-            "legacy inherits primary temperature"
-        );
-
+        // Resolves cleanly (no error) and yields the primary model; the fallback fields have no effect.
+        let cfg = ReviewConfig::resolve(Some(&file))
+            .expect("resolves with deprecated fallback fields set")
+            .expect("review enabled");
+        assert_eq!(cfg.model, "primary");
         std::fs::remove_file(&prompt).ok();
     }
 }

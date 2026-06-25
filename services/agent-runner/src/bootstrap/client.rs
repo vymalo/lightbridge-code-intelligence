@@ -201,7 +201,7 @@ pub struct TranscriptEntry {
     /// Reasoning slice of `completion_tokens` (subset, not additive) when the model reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<i64>,
-    /// The model that produced this turn — captures primary→fallback failover (ADR-0039).
+    /// The model that produced this turn (recorded in the transcript, ADR-0034).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
