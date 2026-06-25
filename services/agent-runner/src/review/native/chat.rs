@@ -335,8 +335,28 @@ impl ChatClient {
     }
 
     /// Set provider-specific passthrough request fields (e.g. a reasoning budget). Merged verbatim into
-    /// every chat-completion body via `#[serde(flatten)]`. See [`ChatClient::extra`].
-    pub fn with_extra(mut self, extra: serde_json::Map<String, serde_json::Value>) -> Self {
+    /// every chat-completion body via `#[serde(flatten)]`. **Reserved structural keys are stripped with
+    /// a warning** — the flattened map serializes *after* the named fields, so a colliding key would
+    /// otherwise silently overwrite a structural field (`model`/`messages`/…). See [`ChatClient::extra`].
+    pub fn with_extra(mut self, mut extra: serde_json::Map<String, serde_json::Value>) -> Self {
+        const RESERVED: &[&str] = &[
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "stream",
+        ];
+        for key in RESERVED {
+            if extra.remove(*key).is_some() {
+                tracing::warn!(
+                    key,
+                    "ignoring reserved key in review.extra (it would override a structural request field)"
+                );
+            }
+        }
         self.extra = extra;
         self
     }
@@ -721,6 +741,50 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert!(body.get("thinking").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // A reserved structural key placed in `extra` (operator typo / footgun) is stripped, so it can NOT
+    // override `model`/`temperature`/… via the flatten merge. A non-reserved key still passes through.
+    #[tokio::test]
+    async fn with_extra_strips_reserved_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_reply()))
+            .mount(&server)
+            .await;
+
+        let mut extra = serde_json::Map::new();
+        extra.insert("model".to_string(), serde_json::json!("evil-override"));
+        extra.insert("temperature".to_string(), serde_json::json!(1.9));
+        extra.insert("reasoning_effort".to_string(), serde_json::json!("low"));
+        let client =
+            ChatClient::new(&format!("{}/v1", server.uri()), "key", "real-model").with_extra(extra);
+
+        client
+            .complete(
+                &[ChatMessage::user("hi")],
+                &[],
+                ChatParams {
+                    temperature: Some(0.2),
+                    ..ChatParams::default()
+                },
+            )
+            .await
+            .expect("complete");
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["model"], "real-model", "extra cannot override model");
+        assert_eq!(
+            body["temperature"],
+            serde_json::json!(0.2),
+            "extra cannot override the structural temperature"
+        );
+        assert_eq!(
+            body["reasoning_effort"], "low",
+            "non-reserved key passes through"
+        );
     }
 
     #[tokio::test]

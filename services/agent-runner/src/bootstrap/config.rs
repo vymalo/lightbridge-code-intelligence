@@ -487,13 +487,18 @@ impl ReviewConfig {
         let top_p = r.top_p;
         let max_tokens = r.max_tokens;
         // `review.extra`: a free-form object of provider-specific params (reasoning budget etc.). Only
-        // a JSON object is meaningful as request fields; anything else resolves to empty.
-        let extra = r
-            .extra
-            .as_ref()
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
+        // a JSON object is meaningful as request fields; a non-object is a misconfiguration — warn and
+        // ignore it rather than silently dropping it (review still runs; the tuning just doesn't apply).
+        let extra = match r.extra.as_ref() {
+            Some(serde_json::Value::Object(o)) => o.clone(),
+            None => serde_json::Map::new(),
+            Some(_) => {
+                tracing::warn!(
+                    "review.extra is not a JSON object; ignoring it (expected a map of request fields)"
+                );
+                serde_json::Map::new()
+            }
+        };
         let request_timeout_secs = r
             .request_timeout_secs
             .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
