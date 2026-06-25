@@ -69,3 +69,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0047](0047-review-prompt-grounding-and-uncertainty.md) | Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence) | Proposed |
 | [0048](0048-review-prompt-structure-and-technique.md) | Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model | Proposed |
 | [0049](0049-eval-driven-reviewer-prompt-iteration.md) | Eval-driven reviewer-prompt iteration — golden cases before deploy | Proposed |
+| [0050](0050-retrieval-pins-to-latest-indexed-snapshot.md) | Reviews reuse the latest indexed snapshot (pin retrieval + skip-check to it; no per-PR re-index) | Proposed |
