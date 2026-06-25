@@ -13,8 +13,8 @@
 //! behavioural fix: the buffer (which the control plane holds) is NEVER discarded on a clean exhaustion
 //! — the caller finalizes on `Finished` OR `Exhausted` so buffered findings are still posted, with a
 //! truncation note on `Exhausted` and an abort note on `Aborted`. A transport layer (ADR-0039) wraps
-//! each turn with a generous timeout, bounded retry/backoff on transient failures, optional failover to
-//! a secondary model, and a per-run circuit breaker; the HTTP error body is folded into the error so a
+//! each turn with a generous timeout, bounded retry/backoff on transient failures, and a per-run
+//! circuit breaker; the HTTP error body is folded into the error so a
 //! failed run is legible. Cancellation comes for free: `run()` races the whole task against the
 //! self-cancel poll, so a cancelled task drops the in-flight future.
 
@@ -239,29 +239,6 @@ pub async fn run_native_agent(
     .with_attribution(attribution)
     .with_extra(review.extra.clone())
     .with_stream(stream_enabled);
-    // Optional secondary model for failover (ADR-0039/0051): its OWN client (own timeout), generation
-    // params, and retry budget — same gateway/key, different model. The per-turn failover below uses
-    // these so the fallback runs under its own config, not the primary's.
-    let fallback = review.fallback.as_ref().map(|fb| {
-        let client = ChatClient::with_timeout(
-            &review.base_url,
-            &review.api_key,
-            &fb.model,
-            Duration::from_secs(fb.request_timeout_secs),
-        )
-        .with_attribution(attribution)
-        .with_stream(stream_enabled);
-        let params = ChatParams {
-            temperature: fb.temperature,
-            top_p: fb.top_p,
-            max_tokens: fb.max_tokens,
-        };
-        let retry = RetryPolicy {
-            max_retries: fb.max_retries,
-            ..RetryPolicy::default()
-        };
-        (client, params, retry)
-    });
     let retry_policy = RetryPolicy {
         max_retries: review.resilience.max_retries,
         ..RetryPolicy::default()
@@ -271,7 +248,6 @@ pub async fn run_native_agent(
     tracing::info!(
         task_id = %task_id,
         model = %review.model,
-        fallback_model = review.fallback.as_ref().map(|f| f.model.as_str()).unwrap_or("(none)"),
         base_url_host = %base_url_host(&review.base_url),
         request_timeout_secs = review.resilience.request_timeout_secs,
         max_retries = review.resilience.max_retries,
@@ -485,44 +461,18 @@ pub async fn run_native_agent(
             }
         }
 
-        // Try the primary model with bounded retry; on exhausting transient retries, fail over to the
-        // secondary model (when configured) once for this turn. The outcome is either a completion, or
-        // a turn-level error we classify before deciding whether to keep going.
-        // Carries the model that actually produced the turn (primary or, on failover, the secondary)
-        // so the transcript records which model did the work — see ADR-0039 failover.
+        // Try the model with bounded retry/backoff on transient failures. The outcome is either a
+        // completion, or a turn-level error we classify before deciding whether to keep going.
+        // Carries the model that produced the turn so the transcript records which model did the work.
         let turn_result = match chat
             .complete_with_retry(&messages, turn_defs, params, retry_policy)
             .await
         {
             Ok(c) => Ok((c, chat.model().to_string())),
-            Err(primary_err) => match (&fallback, primary_err.transient) {
-                (Some((fb_client, fb_params, fb_retry)), true) => {
-                    // Failover runs under the fallback's OWN params + retry budget (ADR-0051).
-                    tracing::warn!(
-                        task_id = %task_id,
-                        turn,
-                        primary_model = %review.model,
-                        fallback_model = %fb_client.model(),
-                        error = %primary_err,
-                        "primary model exhausted retries; failing over to secondary model"
-                    );
-                    fb_client
-                        .complete_with_retry(&messages, turn_defs, *fb_params, *fb_retry)
-                        .await
-                        .map(|c| (c, fb_client.model().to_string()))
-                        .map_err(|fb_err| ChatTurnError {
-                            error: fb_err.error.context(format!(
-                                "failover model {} also failed",
-                                fb_client.model()
-                            )),
-                            transient: fb_err.transient,
-                        })
-                }
-                _ => Err(ChatTurnError {
-                    error: primary_err.error,
-                    transient: primary_err.transient,
-                }),
-            },
+            Err(err) => Err(ChatTurnError {
+                error: err.error,
+                transient: err.transient,
+            }),
         };
 
         let (completion, turn_model) = match turn_result {
@@ -558,7 +508,7 @@ pub async fn run_native_agent(
                     consecutive_failures,
                     breaker_threshold,
                     error = %turn_err.error,
-                    "transient turn failure after retries (and failover, if configured)"
+                    "transient turn failure after retries"
                 );
                 if breaker_threshold > 0 && consecutive_failures >= breaker_threshold {
                     return Err(turn_err.error).with_context(|| {
@@ -1010,7 +960,7 @@ fn coverage_nudge(uncovered: &[&str]) -> String {
     )
 }
 
-/// A turn-level chat failure after retries (and failover, if configured), carrying whether the
+/// A turn-level chat failure after retries, carrying whether the
 /// underlying error was transient — the loop keeps a transient one going toward the circuit breaker
 /// but fails the run immediately on a deterministic one.
 struct ChatTurnError {
@@ -1144,7 +1094,6 @@ mod tests {
                 max_retries: 0,
                 circuit_breaker_threshold: 3,
             },
-            fallback: None,
         }
     }
 
@@ -1789,73 +1738,8 @@ mod tests {
         }
     }
 
-    // ── Failover: the primary model 5xx's; the configured secondary model handles the turn and the
-    // run finishes cleanly (ADR-0039). Mocks are matched on the request body's `model` field. ──────
-    #[tokio::test]
-    async fn native_loop_fails_over_to_secondary_model() {
-        use wiremock::matchers::body_partial_json;
-
-        let chat = MockServer::start().await;
-        // Primary model "m" always 5xx (transient → retries exhaust → failover).
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_partial_json(json!({ "model": "m" })))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&chat)
-            .await;
-        // Secondary model "m-fallback" finishes immediately.
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_partial_json(json!({ "model": "m-fallback" })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_reply(
-                "finish",
-                r#"{"summary":"handled by fallback"}"#,
-            )))
-            .mount(&chat)
-            .await;
-
-        // No diff → no inline finalize; only the summary endpoint is hit on finish.
-        let cp = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!(
-                "/internal/tasks/{}/review/summary",
-                Uuid::nil()
-            )))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&cp)
-            .await;
-
-        let mut review = review_config(format!("{}/v1", chat.uri()));
-        review.fallback = Some(crate::bootstrap::config::FallbackConfig {
-            model: "m-fallback".to_string(),
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            request_timeout_secs: 5,
-            max_retries: 0,
-        });
-        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
-        let embc = EmbeddingsClient::new("http://unused", "key", "model");
-        run_native_agent(
-            &review,
-            "review",
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &cpc,
-            &embc,
-            Uuid::nil(),
-            std::path::Path::new("/tmp"),
-            &mut Vec::new(),
-        )
-        .await
-        .expect("fallback model finishes the run");
-    }
-
-    // ── Circuit breaker: the chain is down (persistent 5xx) and no fallback is set, so the run fails
-    // fast at the breaker threshold instead of consuming the whole turn budget (ADR-0039). ─────────
+    // ── Circuit breaker: the chain is down (persistent 5xx), so the run fails fast at the breaker
+    // threshold instead of consuming the whole turn budget (ADR-0039). ─────────
     #[tokio::test]
     async fn native_loop_circuit_breaker_trips_fast() {
         let chat = MockServer::start().await;

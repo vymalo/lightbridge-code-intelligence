@@ -409,8 +409,8 @@ impl ChatClient {
         }
     }
 
-    /// Return a copy of this client that targets a different model id (same gateway/key/timeout) — used
-    /// for failover to the secondary model (ADR-0039). Cheap: clones the shared `reqwest::Client`.
+    /// Return a copy of this client that targets a different model id (same gateway/key/timeout).
+    /// Cheap: clones the shared `reqwest::Client`.
     pub fn for_model(&self, model: impl Into<String>) -> Self {
         Self {
             url: self.url.clone(),
@@ -507,7 +507,7 @@ impl ChatClient {
     /// `policy.max_retries` times on connect/timeout, HTTP 429, or HTTP 5xx — honouring a 429's
     /// `Retry-After` over the computed backoff — and returns immediately on success or a deterministic
     /// 4xx. The returned [`ChatError`] tells the caller whether the *final* failure was transient (so
-    /// the loop can decide on failover).
+    /// the loop can decide whether to keep going toward the circuit breaker).
     pub async fn complete_with_retry(
         &self,
         messages: &[ChatMessage],
@@ -1311,7 +1311,7 @@ mod tests {
         assert!(format!("{err}").contains("request failed"), "got: {err}");
     }
 
-    // `for_model` retargets the model id while sharing the gateway/key/timeout — the failover primitive.
+    // `for_model` retargets the model id while sharing the gateway/key/timeout.
     #[tokio::test]
     async fn for_model_retargets_the_model_id() {
         let server = MockServer::start().await;
