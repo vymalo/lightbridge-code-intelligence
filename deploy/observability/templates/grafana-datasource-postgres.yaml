@@ -32,5 +32,9 @@ spec:
       sslmode: {{ .Values.postgresDatasource.sslmode | quote }}
       postgresVersion: {{ .Values.postgresDatasource.postgresVersion }}
     secureJsonData:
-      password: "${PASSWORD}"
+      # grafana-operator substitutes `${<key>}` (the secretKeyRef key above,
+      # case-sensitive) with the Secret value. The placeholder MUST equal the key
+      # verbatim or the operator leaves the literal string and Postgres auth fails —
+      # so derive it from the key rather than hardcoding `${PASSWORD}`.
+      password: {{ printf "${%s}" .Values.postgresDatasource.passwordSecret.key | quote }}
 {{- end }}
