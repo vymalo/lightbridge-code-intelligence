@@ -243,6 +243,10 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// A provider may report a mid-stream failure as a `data: {"error": …}` event (no `choices`).
+    /// Surfaced so the collector fails the turn instead of finishing with an empty message.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -397,7 +401,7 @@ impl ChatClient {
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             api_key: api_key.into(),
             model: model.into(),
-            http: build_http_client(request_timeout),
+            http: build_http_client(Some(request_timeout)),
             attribution: reqwest::header::HeaderMap::new(),
             extra: serde_json::Map::new(),
             stream: false,
@@ -451,6 +455,11 @@ impl ChatClient {
     /// inter-chunk idle timeout, instead of one buffered response under the whole-request timeout.
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = stream;
+        if stream {
+            // Streaming: drop the whole-request total timeout so a long-but-progressing turn isn't
+            // capped — the per-chunk `idle_timeout` in `collect_stream` is the stall detector instead.
+            self.http = build_http_client(None);
+        }
         self
     }
 
@@ -649,11 +658,16 @@ impl ChatClient {
         };
 
         let mut stream = response.bytes_stream();
-        let mut buf = String::new();
+        // Raw byte buffer: HTTP chunks split at arbitrary byte boundaries, so we must NOT decode each
+        // chunk on its own (a multi-byte UTF-8 char split across chunks would corrupt). We strip `\r`
+        // as bytes arrive (normalising CRLF SSE `\r\n\r\n` → `\n\n`), then decode only *complete*
+        // events. (Gemini/Codex review on #206.)
+        let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
         let mut tools: Vec<ToolCallAcc> = Vec::new();
+        let mut done = false; // saw an explicit `data: [DONE]`
 
         loop {
             let chunk = match tokio::time::timeout(self.idle_timeout, stream.next()).await {
@@ -663,7 +677,7 @@ impl ChatClient {
                         anyhow::Error::new(e).context("reading chat stream chunk"),
                     ));
                 }
-                Ok(None) => break, // stream closed cleanly
+                Ok(None) => break, // stream closed — completeness checked after the loop
                 Err(_) => {
                     return Err(transient(anyhow::anyhow!(
                         "chat stream idle for {:?} (no chunk) — treating as a stall",
@@ -671,21 +685,29 @@ impl ChatClient {
                     )));
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend(chunk.iter().copied().filter(|&b| b != b'\r'));
 
-            // SSE events are separated by a blank line; process every complete event in the buffer.
-            while let Some(pos) = buf.find("\n\n") {
-                let event: String = buf.drain(..pos + 2).collect();
+            // SSE events are separated by a blank line; drain + decode each *complete* event whole.
+            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+                let event = String::from_utf8_lossy(&event);
                 for line in event.lines() {
                     let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                         continue;
                     };
                     if data == "[DONE]" {
+                        done = true;
                         continue;
                     }
                     let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
                         continue; // keep-alive / unparseable fragment — skip
                     };
+                    // A mid-stream provider error (no `choices`) must fail the turn, not finish empty.
+                    if let Some(err) = chunk.error {
+                        return Err(transient(anyhow::anyhow!(
+                            "chat stream returned an error event: {err}"
+                        )));
+                    }
                     if chunk.usage.is_some() {
                         usage = chunk.usage;
                     }
@@ -717,6 +739,15 @@ impl ChatClient {
                     }
                 }
             }
+        }
+
+        // An upstream/proxy that closed the stream before a terminal signal left us with a partial
+        // (possibly half-built tool call). Treat it as transient so the turn retries, rather than
+        // returning a "successful" empty/partial completion. (Codex review on #206.)
+        if !done && finish_reason.is_none() {
+            return Err(transient(anyhow::anyhow!(
+                "chat stream closed before completion (no finish_reason / [DONE])"
+            )));
         }
 
         let tool_calls: Vec<ToolCall> = tools
@@ -776,10 +807,14 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// private CA — `ClusterIssuer/self-signed-ca`, which the default rustls/webpki roots don't include).
 /// Absent both, the default client (public roots) is used. `add_root_certificate` augments the default
 /// roots, it doesn't replace them.
-fn build_http_client(request_timeout: Duration) -> reqwest::Client {
-    // Per-request timeout (ADR-0039): generous (default 180s) because eaig can legitimately take up to
-    // ~2 minutes per turn — an aggressive timeout would kill a slow-but-valid response.
-    let mut builder = reqwest::Client::builder().timeout(request_timeout);
+fn build_http_client(total_timeout: Option<Duration>) -> reqwest::Client {
+    // A connect timeout always applies. The whole-request `total_timeout` is set for the buffered
+    // (non-stream) path (ADR-0039: generous — eaig can take ~2 min/turn); the streaming path passes
+    // `None` so a long-but-progressing turn isn't capped — its bound is the per-chunk idle timeout.
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
+    if let Some(total) = total_timeout {
+        builder = builder.timeout(total);
+    }
     if let Some((path, cert)) = ca_cert() {
         match cert {
             Ok(cert) => {
@@ -1049,6 +1084,54 @@ mod tests {
         assert_eq!(call.function.arguments, r#"{"query":"auth"}"#);
         // Usage from the final chunk is captured.
         assert_eq!(out.usage.and_then(|u| u.prompt_tokens), Some(10));
+    }
+
+    // CRLF SSE (standards-compliant gateways) must parse identically: the byte buffer strips `\r`, so
+    // `\r\n\r\n` normalises to the `\n\n` event boundary instead of never matching. (#206 review.)
+    #[tokio::test]
+    async fn stream_handles_crlf_line_endings() {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\r\n\r\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\r\n\r\n\
+                   data: [DONE]\r\n\r\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m").with_stream(true);
+        let out = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("crlf stream completes");
+        assert_eq!(out.message.content.as_deref(), Some("hello world"));
+        assert_eq!(out.finish_reason.as_deref(), Some("stop"));
+    }
+
+    // A stream that closes before a terminal signal ([DONE] / finish_reason) is a truncated response —
+    // surfaced as a transient error so the turn retries, not a "successful" partial completion. (#206.)
+    #[tokio::test]
+    async fn stream_truncated_without_finish_is_transient_error() {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial...\"}}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&server)
+            .await;
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m").with_stream(true);
+        let err = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect_err("a truncated stream is an error");
+        assert!(
+            format!("{err:#}").contains("closed before completion"),
+            "got: {err:#}"
+        );
     }
 
     #[tokio::test]
