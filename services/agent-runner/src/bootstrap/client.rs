@@ -74,6 +74,12 @@ impl TaskContext {
                 "x-code-intelligence-repo".to_string(),
                 clean(&format!("{}/{}", self.owner, self.name), 200),
             ),
+            // Repo OWNER (org/user login) on its own, so the gateway can bucket per-org
+            // budget (x-org-id) without splitting "owner/name" in CEL.
+            (
+                "x-code-intelligence-owner".to_string(),
+                clean(&self.owner, 100),
+            ),
             (
                 "x-code-intelligence-repo-id".to_string(),
                 self.repository_id.to_string(),
