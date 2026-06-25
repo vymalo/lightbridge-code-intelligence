@@ -81,8 +81,15 @@ pub struct AgentSection {
     pub review_system_prompt: Option<String>,
     /// The runner container's k8s `resources` block (requests/limits), passed through verbatim into
     /// the Job's container spec. A raw object so operators can express any valid shape (and use
-    /// `{env:…}` inside). `None` → no resources set (cluster defaults / LimitRange apply).
+    /// `{env:…}` inside). `None` → no resources set (cluster defaults / LimitRange apply). Acts as the
+    /// shared fallback when a per-kind override below is unset.
     pub resources: Option<serde_json::Value>,
+    /// Per-kind override for **index** Jobs (`command_text == "index"`) — the heavy path (full
+    /// tree-sitter parse + embeddings + Graphify), wants more CPU/RAM. Falls back to `resources`.
+    pub indexer_resources: Option<serde_json::Value>,
+    /// Per-kind override for **review** Jobs (everything else) — read-mostly (reuses the indexed
+    /// snapshot, ADR-0050; LLM/network-bound), so it can run leaner. Falls back to `resources`.
+    pub review_resources: Option<serde_json::Value>,
 }
 
 /// Dispatcher loop timings (seconds). Each falls back to its built-in default in `dispatcher.rs`.
