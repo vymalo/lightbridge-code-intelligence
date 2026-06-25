@@ -41,7 +41,14 @@ pub trait TaskLauncher {
 /// Creates one Kubernetes Job per task via the cluster API.
 pub struct KubeLauncher {
     jobs: Api<Job>,
+    /// The agent-runner image. Shared fallback for both kinds when a per-kind image below is unset.
     image: String,
+    /// Image for **index** Jobs (`command_text == "index"`) — the full image bundling Python +
+    /// Graphify; falls back to `image`. See [`image_for`].
+    indexer_image: Option<String>,
+    /// Image for **review** Jobs (everything else) — the leaner image without the Python/Graphify
+    /// venv; falls back to `image`. See [`image_for`].
+    review_image: Option<String>,
     service_account: String,
     /// In-cluster URL the runner calls back for context + status (the control plane's own Service).
     control_plane_url: String,
@@ -123,6 +130,14 @@ impl KubeLauncher {
             "AGENT_RUNNER_IMAGE",
             "ghcr.io/vymalo/lightbridge-agent-runner:latest",
         );
+        let indexer_image = pick_opt(
+            agent.and_then(|a| a.indexer_runner_image.as_deref()),
+            "AGENT_INDEXER_RUNNER_IMAGE",
+        );
+        let review_image = pick_opt(
+            agent.and_then(|a| a.review_runner_image.as_deref()),
+            "AGENT_REVIEW_RUNNER_IMAGE",
+        );
         let service_account = pick(
             agent.and_then(|a| a.service_account.as_deref()),
             "AGENT_SERVICE_ACCOUNT",
@@ -164,6 +179,8 @@ impl KubeLauncher {
             sa: Api::namespaced(client.clone(), &namespace),
             jobs: Api::namespaced(client, &namespace),
             image,
+            indexer_image,
+            review_image,
             service_account,
             control_plane_url,
             runner_token,
@@ -225,7 +242,12 @@ impl TaskLauncher for KubeLauncher {
         let manifest = job_manifest(
             &name,
             JobConfig {
-                image: &self.image,
+                image: image_for(
+                    task,
+                    self.indexer_image.as_deref(),
+                    self.review_image.as_deref(),
+                    &self.image,
+                ),
                 service_account: &self.service_account,
                 control_plane_url: &self.control_plane_url,
                 runner_token: &self.runner_token,
@@ -336,6 +358,32 @@ fn resources_for<'a>(
         indexer.or(shared)
     } else {
         review.or(shared)
+    }
+}
+
+/// Pick the container image for a task's kind (runner-differentiation, RFC-0001). **Index** Jobs
+/// (`command_text == "index"`) run the *full* image — Python + Graphify bundled — to build the
+/// structural graph; **review** Jobs (everything else) run a *leaner* image without the Graphify
+/// venv, since the review path is LLM/network-bound and never spawns Graphify. Each kind falls back
+/// to the shared `shared` image when its own override is unset, so a chart that sets only
+/// `runner_image` keeps today's single-image behaviour.
+///
+/// CAVEAT: a *cold-repo* review still self-indexes (ADR-0050 only makes *warm* reviews reuse the
+/// snapshot). On the leaner review image Graphify is absent, but the structural-graph step
+/// (`index_graph` in services/agent-runner/src/indexer/graph.rs) is best-effort/non-fatal — it logs
+/// and skips when `graphify` can't run. So a first cold review still builds the semantic (pgvector)
+/// index and merely defers the graph until the next `index` task (on the indexer image) builds it.
+/// The proper fix — review never self-indexes — is a separate runner-differentiation slice.
+fn image_for<'a>(
+    task: &ClaimedTask,
+    indexer: Option<&'a str>,
+    review: Option<&'a str>,
+    shared: &'a str,
+) -> &'a str {
+    if task.command_text == "index" {
+        indexer.unwrap_or(shared)
+    } else {
+        review.unwrap_or(shared)
     }
 }
 
@@ -541,6 +589,38 @@ mod tests {
         assert_eq!(
             resources_for(&mention, Some(&indexer), Some(&review), Some(&shared)),
             Some(&review)
+        );
+    }
+
+    #[test]
+    fn image_for_picks_by_kind_with_shared_fallback() {
+        let indexer = "ghcr.io/vymalo/lightbridge-agent-runner:tag";
+        let review = "ghcr.io/vymalo/lightbridge-agent-review:tag";
+        let shared = "ghcr.io/vymalo/lightbridge-agent-runner:latest";
+
+        let mut index_task = sample_task();
+        index_task.command_text = "index".to_string();
+        let review_task = sample_task(); // command_text == "review"
+
+        // Per-kind images win for their own kind.
+        assert_eq!(
+            image_for(&index_task, Some(indexer), Some(review), shared),
+            indexer
+        );
+        assert_eq!(
+            image_for(&review_task, Some(indexer), Some(review), shared),
+            review
+        );
+        // A missing per-kind image falls back to the shared one (today's single-image behaviour for
+        // a chart that only sets `runner_image`).
+        assert_eq!(image_for(&index_task, None, None, shared), shared);
+        assert_eq!(image_for(&review_task, None, None, shared), shared);
+        // Any non-"index" command (e.g. an @mention re-review) is treated as a review Job.
+        let mut mention = sample_task();
+        mention.command_text = "@lightbridge please re-review".to_string();
+        assert_eq!(
+            image_for(&mention, Some(indexer), Some(review), shared),
+            review
         );
     }
 

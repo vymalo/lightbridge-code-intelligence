@@ -42,10 +42,19 @@ jobs:
         include:
           - image: lightbridge-control-plane
             dockerfile: services/control-plane/Dockerfile
+            target: ""
           - image: lightbridge-web
             dockerfile: apps/web/Dockerfile
+            target: ""
+          # Two agent images from one Dockerfile (runner-differentiation): the full `indexer` target
+          # keeps the historical `lightbridge-agent-runner` name (back-compat); `review` is the new
+          # leaner image (no Python/Graphify).
           - image: lightbridge-agent-runner
             dockerfile: services/agent-runner/Dockerfile
+            target: indexer
+          - image: lightbridge-agent-review
+            dockerfile: services/agent-runner/Dockerfile
+            target: review
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -54,6 +63,8 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          # Empty target → build-push-action ignores it (builds the Dockerfile's last stage).
+          target: ${{ matrix.target }}
           push: false
           # Load into the local daemon so we can measure the built image (size report below).
           load: true
@@ -86,10 +97,19 @@ jobs:
         include:
           - image: lightbridge-control-plane
             dockerfile: services/control-plane/Dockerfile
+            target: ""
           - image: lightbridge-web
             dockerfile: apps/web/Dockerfile
+            target: ""
+          # Two agent images from one Dockerfile (runner-differentiation): the full `indexer` target
+          # keeps the historical `lightbridge-agent-runner` name (back-compat); `review` is the new
+          # leaner image (no Python/Graphify).
           - image: lightbridge-agent-runner
             dockerfile: services/agent-runner/Dockerfile
+            target: indexer
+          - image: lightbridge-agent-review
+            dockerfile: services/agent-runner/Dockerfile
+            target: review
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -117,6 +137,8 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          # Empty target → build-push-action ignores it (builds the Dockerfile's last stage).
+          target: ${{ matrix.target }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

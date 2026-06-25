@@ -65,7 +65,15 @@ impl ReviewSection {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentSection {
     pub namespace: Option<String>,
+    /// The agent-runner container image. Acts as the shared fallback when a per-kind override below
+    /// is unset.
     pub runner_image: Option<String>,
+    /// Per-kind override for **index** Jobs (`command_text == "index"`) — the full image that
+    /// bundles Python + Graphify for structural-graph extraction. Falls back to `runner_image`.
+    pub indexer_runner_image: Option<String>,
+    /// Per-kind override for **review** Jobs (everything else) — the leaner image without the
+    /// Python/Graphify venv (the review path never spawns Graphify). Falls back to `runner_image`.
+    pub review_runner_image: Option<String>,
     pub service_account: Option<String>,
     pub control_plane_url: Option<String>,
     /// Secret holding the internal CA (`ca.crt`) to mount into the Job.
