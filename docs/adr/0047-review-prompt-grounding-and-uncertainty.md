@@ -1,8 +1,20 @@
 # ADR-0047: Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
+- **As-built:** a minimal **substrate assist** shipped in [#197](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/197)
+  (`EMPTY_RETRIEVAL_RESULT` in `tools.rs` — an empty retrieval is now fed back as an explicit "empty ≠
+  absence; verify with `read_file`" message instead of a bare `[]`) plus the Tier-1 golden case
+  `golden_empty_retrieval_grounds_against_absence`. **This refines the body below:** the
+  "Decision Drivers" / "Why a prompt rule and not a code guard" sections were drafted pre-#197 and say
+  "the gateway returns a literal `[]`" and "No code change required to ship" — #197 added the small
+  substrate message as **belt-and-suspenders**; the prompt rule remains the **primary** lever and the
+  runner does not parse the model's free-text reasoning. The grounding **prompt wording** is finalized in
+  [`docs/drafts/review-system-prompt.md`](../drafts/review-system-prompt.md) (prime directive 2 + the
+  Grounding & uncertainty section). Deploying that wording to `ai-helm-values`
+  (`config.reviewSystemPrompt`) remains the operator's call — this ADR proposes the wording, it does not
+  deploy it.
 
 ## Context and Problem Statement
 
