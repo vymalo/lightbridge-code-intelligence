@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ratelimit::{self, RateLimitSnapshot};
+
 /// A single message in the Chat Completions `messages` array.
 ///
 /// The same type is used both for messages we send (system/user prompts, tool results, and the
@@ -135,13 +137,16 @@ pub struct ChatParams {
 }
 
 /// The assistant's reply for one turn: its message (text and/or `tool_calls`), the provider's
-/// `finish_reason` (e.g. `tool_calls`, `stop`, `length`) so the loop can detect truncation, and the
-/// token `usage` for the turn (for the transcript/observability, ADR-0034).
+/// `finish_reason` (e.g. `tool_calls`, `stop`, `length`) so the loop can detect truncation, the token
+/// `usage` for the turn (for the transcript/observability, ADR-0034), and the gateway's advertised
+/// rate-limit budget at the time of the response ([`RateLimitSnapshot`] — advisory telemetry; empty
+/// unless the gateway has the draft-03 headers enabled).
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
+    pub rate_limit: RateLimitSnapshot,
 }
 
 /// Token usage for one completion, as reported by the OpenAI-compatible API. All optional — some
@@ -443,7 +448,7 @@ impl ChatClient {
         if !status.is_success() {
             // Read the body (bounded) so the failure is legible. 429 + 5xx are transient; other 4xx
             // are deterministic (bad request, auth, unknown model) and must NOT be retried.
-            let retry_after = retry_after_secs(response.headers());
+            let retry_after = ratelimit::retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
             let snippet = truncate_on_boundary(&body, 1024);
             let transient =
@@ -461,6 +466,10 @@ impl ChatClient {
                 retry_after: retry_after.filter(|_| transient),
             });
         }
+
+        // Capture the gateway's advertised budget before the body consumes the response (Copy, so the
+        // borrow on `headers()` ends here). Advisory only — see [`crate::ratelimit`].
+        let rate_limit = RateLimitSnapshot::from_headers(response.headers());
 
         let response: ChatResponse = response.json().await.map_err(|e| ChatError {
             // A malformed 2xx body is not a transport problem — don't retry it.
@@ -483,6 +492,7 @@ impl ChatClient {
         Ok(Completion {
             finish_reason: choice.finish_reason,
             usage,
+            rate_limit,
             message: ChatMessage {
                 role: choice
                     .message
@@ -507,19 +517,6 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
-}
-
-/// Parse a `Retry-After` header expressed as an integer number of seconds (the form gateways use for
-/// 429s). The HTTP-date form is ignored — we fall back to our own backoff then.
-fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
 }
 
 /// Build the HTTP client, additionally trusting the internal CA PEM at `LLM_CA_CERT` (falling back to
@@ -676,6 +673,39 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    // The gateway's draft-03 rate-limit headers are parsed onto the completion (advisory telemetry).
+    #[tokio::test]
+    async fn complete_parses_rate_limit_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-limit", "1000")
+                    .insert_header("x-ratelimit-remaining", "40")
+                    .insert_header("x-ratelimit-reset", "12")
+                    .set_body_json(serde_json::json!({
+                        "choices": [{ "finish_reason": "stop",
+                            "message": { "role": "assistant", "content": "ok" } }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let out = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("complete");
+        assert_eq!(out.rate_limit.limit, Some(1000));
+        assert_eq!(out.rate_limit.remaining, Some(40));
+        assert_eq!(out.rate_limit.reset, Some(Duration::from_secs(12)));
+        assert!(
+            out.rate_limit.is_low(0.1),
+            "40/1000 is below the 10% threshold"
+        );
     }
 
     #[tokio::test]

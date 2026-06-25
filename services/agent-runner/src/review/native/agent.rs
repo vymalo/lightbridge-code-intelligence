@@ -569,11 +569,13 @@ pub async fn run_native_agent(
         let turn_latency_ms = turn_started.elapsed().as_millis() as u64;
 
         let usage = completion.usage;
+        let rate_limit = completion.rate_limit;
         let assistant = completion.message;
         let calls = assistant.tool_calls.clone();
 
-        // One concise line per turn (ADR-0034/0039): index, tools called, tokens, wall-clock latency.
-        // Full content lives in the transcript; this keeps pod logs legible without the payloads.
+        // One concise line per turn (ADR-0034/0039): index, tools called, tokens, wall-clock latency,
+        // and the gateway's remaining rate-limit budget when it advertises one (advisory telemetry,
+        // crate::ratelimit). Full content lives in the transcript; this keeps pod logs legible.
         let tool_names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
         tracing::info!(
             task_id = %task_id,
@@ -583,9 +585,25 @@ pub async fn run_native_agent(
             prompt_tokens = usage.and_then(|u| u.prompt_tokens).unwrap_or(-1),
             completion_tokens = usage.and_then(|u| u.completion_tokens).unwrap_or(-1),
             reasoning_tokens = usage.and_then(|u| u.reasoning_tokens()).unwrap_or(-1),
+            ratelimit_remaining = rate_limit.remaining.map(|r| r as i64).unwrap_or(-1),
+            ratelimit_limit = rate_limit.limit.map(|l| l as i64).unwrap_or(-1),
             latency_ms = turn_latency_ms,
             "agent turn complete"
         );
+        // Soft warning when the shared gateway budget is nearly spent (≤10%) or this response was
+        // itself rate-limited — a heads-up in the logs, not a gate (the budget is global across
+        // runners, RFC-0001, so a single run can't reason about it authoritatively).
+        if rate_limit.limited || rate_limit.is_low(0.1) {
+            tracing::warn!(
+                task_id = %task_id,
+                turn,
+                ratelimit_remaining = rate_limit.remaining.map(|r| r as i64).unwrap_or(-1),
+                ratelimit_limit = rate_limit.limit.map(|l| l as i64).unwrap_or(-1),
+                reset_secs = rate_limit.reset.map(|d| d.as_secs() as i64).unwrap_or(-1),
+                limited = rate_limit.limited,
+                "gateway rate-limit budget low"
+            );
+        }
         // Proof-of-work (epic #137): log the model's reasoning for this turn (bounded) so a run is
         // legible from a live log tail, not just the DB transcript. Skip when the turn was pure
         // tool-calls with no prose.
