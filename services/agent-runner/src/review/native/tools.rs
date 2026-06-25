@@ -554,9 +554,23 @@ fn parse<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T, String> {
     })
 }
 
-/// Render a retrieval result as a JSON string for the model, or a recoverable error string.
+/// Model-facing result for a retrieval that matched nothing. Deliberately explicit instead of a bare
+/// `[]`: an empty index result is NOT evidence that the code/feature is absent — the #187 hallucination
+/// came from the model reading `[]` as "removed" and confidently flagging a non-existent removal. This
+/// grounds ADR-0047 ("empty ≠ absent") at the *substrate* so even a weaker prompt is backstopped. All
+/// retrieval tools (vector search + graph) return JSON arrays, so an empty result is exactly `"[]"`.
+pub const EMPTY_RETRIEVAL_RESULT: &str = "No results matched. An empty result means the index found \
+    nothing for this query — it is NOT evidence that the symbol, code, or feature is absent or was \
+    removed (it may be unindexed, renamed, or phrased differently). To check whether something exists, \
+    open the relevant file with `read_file`. Do not record a finding from an empty retrieval alone \
+    (ADR-0047).";
+
+/// Render a retrieval result as a JSON string for the model, or a recoverable error string. An empty
+/// list is replaced by [`EMPTY_RETRIEVAL_RESULT`] — a bare `[]` is ambiguous and was misread as "absent"
+/// (#187); the explicit message is what the model sees instead.
 fn render<T: serde::Serialize>(tool: &str, result: anyhow::Result<T>) -> String {
     match result.and_then(|v| Ok(serde_json::to_string_pretty(&v)?)) {
+        Ok(json) if json.trim() == "[]" => EMPTY_RETRIEVAL_RESULT.to_string(),
         Ok(json) => json,
         Err(error) => format!("error: {tool} failed: {error:#}"),
     }
@@ -782,6 +796,50 @@ mod tests {
             ToolOutcome::Continue(s) => {
                 assert!(s.contains("src/auth/session.rs"), "got: {s}");
                 assert!(s.contains("validate_session"));
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    // ── Grounding (ADR-0047, #187): an EMPTY retrieval feeds the model an explicit "no results — not
+    // evidence of absence" message, NOT a bare `[]`. Freezes the substrate the #187 hallucination
+    // exploited (the model read `[]` as "feature removed" and flagged a non-existent removal). ────────
+    #[tokio::test]
+    async fn dispatch_vector_search_empty_is_explicit_not_bare_brackets() {
+        let emb_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb_server)
+            .await;
+        let cp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&cp_server)
+            .await;
+
+        let cp = ControlPlaneClient::new(cp_server.uri(), "tok");
+        let emb = EmbeddingsClient::new(&emb_server.uri(), "key", "model");
+        let outcome = tools(&cp, &emb)
+            .dispatch(&call(
+                VECTOR_SEMANTIC_SEARCH,
+                r#"{"query":"removed feature"}"#,
+            ))
+            .await;
+        match outcome {
+            ToolOutcome::Continue(s) => {
+                assert_eq!(
+                    s, EMPTY_RETRIEVAL_RESULT,
+                    "empty retrieval is the explicit message"
+                );
+                assert_ne!(s.trim(), "[]", "never a bare empty array");
+                assert!(
+                    s.contains("NOT evidence") && s.contains("read_file"),
+                    "the message grounds absence + points to verification: {s}"
+                );
             }
             other => panic!("expected Continue, got {other:?}"),
         }
