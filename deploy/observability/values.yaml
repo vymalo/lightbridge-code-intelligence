@@ -59,5 +59,6 @@ dashboards:
   task-runs: true
   repositories: true
   review-quality: true
+  feedback: true
   ingress-dispatcher: true
   operations: true

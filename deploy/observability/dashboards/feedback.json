@@ -30,11 +30,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM reviews WHERE $__timeFilter(created_at)",
+          "rawSql": "SELECT count(*) FROM review_feedback WHERE $__timeFilter(created_at)",
           "refId": "A"
         }
       ],
-      "title": "Reviews finalized",
+      "title": "Reactions",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -45,7 +45,9 @@
         "uid": "${DS_POSTGRES}"
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "percentunit"
+        },
         "overrides": []
       },
       "gridPos": {
@@ -65,11 +67,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM reviews rv, jsonb_array_elements(rv.findings) f WHERE $__timeFilter(rv.created_at)",
+          "rawSql": "SELECT count(*) FILTER (WHERE reaction = '+1')::float / NULLIF(count(*) FILTER (WHERE reaction IN ('+1','-1')), 0) FROM review_feedback WHERE $__timeFilter(created_at)",
           "refId": "A"
         }
       ],
-      "title": "Findings",
+      "title": "Approval rate",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -100,11 +102,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) FROM (WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT 1 FROM rf WHERE $__timeFilter(rf.created_at) AND CASE WHEN upper(coalesce(f->>'priority','')) IN ('P0','P1','P2') THEN upper(f->>'priority') WHEN lower(coalesce(f->>'severity','')) IN ('error','critical') THEN 'P0' WHEN lower(coalesce(f->>'severity','')) = 'warning' THEN 'P1' ELSE 'P2' END = 'P0') s",
+          "rawSql": "SELECT count(*) FROM review_feedback WHERE reaction = '-1' AND $__timeFilter(created_at)",
           "refId": "A"
         }
       ],
-      "title": "P0 findings",
+      "title": "\ud83d\udc4e (range)",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -135,11 +137,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at)",
+          "rawSql": "SELECT count(DISTINCT reactor) FROM review_feedback WHERE $__timeFilter(created_at)",
           "refId": "A"
         }
       ],
-      "title": "Tokens (range)",
+      "title": "Distinct reactors",
       "transformations": [],
       "transparent": false,
       "type": "stat"
@@ -170,11 +172,11 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT $__timeGroupAlias(rf.created_at, $__interval), CASE WHEN upper(coalesce(f->>'priority','')) IN ('P0','P1','P2') THEN upper(f->>'priority') WHEN lower(coalesce(f->>'severity','')) IN ('error','critical') THEN 'P0' WHEN lower(coalesce(f->>'severity','')) = 'warning' THEN 'P1' ELSE 'P2' END AS \"priority\", count(*) AS \"findings\" FROM rf WHERE $__timeFilter(rf.created_at) GROUP BY 1, 2 ORDER BY 1",
+          "rawSql": "SELECT $__timeGroupAlias(created_at, $__interval), reaction AS \"reaction\", count(*) AS \"count\" FROM review_feedback WHERE $__timeFilter(created_at) GROUP BY 1, 2 ORDER BY 1",
           "refId": "A"
         }
       ],
-      "title": "Findings by priority",
+      "title": "Reactions over time",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"
@@ -205,11 +207,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH rf AS (  SELECT rv.task_id, rv.created_at, je AS f   FROM reviews rv, jsonb_array_elements(rv.findings) je) SELECT coalesce(nullif(f->>'category',''), 'correctness') AS metric, count(*) AS value FROM rf WHERE $__timeFilter(rf.created_at) GROUP BY 1 ORDER BY value DESC",
+          "rawSql": "SELECT reaction AS metric, count(*) AS value FROM review_feedback WHERE $__timeFilter(created_at) GROUP BY reaction ORDER BY value DESC",
           "refId": "A"
         }
       ],
-      "title": "Findings by category",
+      "title": "Reactions by type",
       "transformations": [],
       "transparent": false,
       "type": "bargauge"
@@ -238,16 +240,16 @@
             "uid": "${DS_POSTGRES}"
           },
           "editorMode": "code",
-          "format": "time_series",
+          "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), sum(tr.prompt_tokens) AS \"input\", sum(tr.completion_tokens) AS \"output\", sum(tr.reasoning_tokens) AS \"reasoning\" FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at) GROUP BY 1 ORDER BY 1",
+          "rawSql": "SELECT coalesce(nullif(f->>'category',''),'correctness') AS metric, count(*) AS value FROM review_feedback rf JOIN review_comments rc ON rc.github_comment_id = rf.github_comment_id AND rc.kind = rf.comment_kind JOIN reviews rv ON rv.task_id = rc.task_id JOIN tasks t ON t.id = rc.task_id LEFT JOIN repositories r ON r.id = t.repository_id CROSS JOIN LATERAL jsonb_array_elements(rv.findings) f WHERE rc.kind = 'inline' AND f->>'file' = rc.file AND f->>'line' = rc.line::text AND rf.reaction = '-1' AND $__timeFilter(rf.created_at) GROUP BY 1 ORDER BY value DESC",
           "refId": "A"
         }
       ],
-      "title": "Token usage (input / output / reasoning)",
+      "title": "\ud83d\udc4e by finding category",
       "transformations": [],
       "transparent": false,
-      "type": "timeseries"
+      "type": "bargauge"
     },
     {
       "datasource": {
@@ -275,11 +277,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT tr.model AS metric, count(DISTINCT tr.task_id) AS value FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE tr.model IS NOT NULL AND $__timeFilter(t.created_at) GROUP BY tr.model ORDER BY value DESC",
+          "rawSql": "SELECT coalesce(nullif(f->>'priority',''),'P2') AS metric, count(*) AS value FROM review_feedback rf JOIN review_comments rc ON rc.github_comment_id = rf.github_comment_id AND rc.kind = rf.comment_kind JOIN reviews rv ON rv.task_id = rc.task_id JOIN tasks t ON t.id = rc.task_id LEFT JOIN repositories r ON r.id = t.repository_id CROSS JOIN LATERAL jsonb_array_elements(rv.findings) f WHERE rc.kind = 'inline' AND f->>'file' = rc.file AND f->>'line' = rc.line::text AND rf.reaction = '-1' AND $__timeFilter(rf.created_at) GROUP BY 1 ORDER BY value DESC",
           "refId": "A"
         }
       ],
-      "title": "Runs by model",
+      "title": "\ud83d\udc4e by finding priority",
       "transformations": [],
       "transparent": false,
       "type": "bargauge"
@@ -294,7 +296,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
         "y": 20
@@ -310,14 +312,14 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT reaction AS metric, count(*) AS value FROM review_feedback rf JOIN tasks t ON t.id = rf.task_id WHERE $__timeFilter(t.created_at) GROUP BY reaction ORDER BY value DESC",
+          "rawSql": "SELECT coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", count(*) FILTER (WHERE rf.reaction = '+1') AS \"up\", count(*) FILTER (WHERE rf.reaction = '-1') AS \"down\", count(*) FILTER (WHERE rf.reaction NOT IN ('+1','-1')) AS \"other\" FROM review_feedback rf JOIN tasks t ON t.id = rf.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(rf.created_at) GROUP BY r.owner, r.name, t.repository_id ORDER BY count(*) FILTER (WHERE rf.reaction = '-1') DESC, \"up\" DESC",
           "refId": "A"
         }
       ],
-      "title": "Reviewer reactions",
+      "title": "Feedback by repository",
       "transformations": [],
       "transparent": false,
-      "type": "bargauge"
+      "type": "table"
     },
     {
       "datasource": {
@@ -329,10 +331,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
-        "w": 24,
-        "x": 0,
-        "y": 28
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",
@@ -345,11 +347,11 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT rv.created_at AS \"reviewed\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_id AS \"pr\", (SELECT string_agg(DISTINCT tr.model, ', ') FROM agent_transcript tr WHERE tr.task_id = rv.task_id AND tr.model IS NOT NULL) AS \"model\", jsonb_array_length(rv.findings) AS \"findings\", rv.inline_count AS \"inline\", rv.deferred_count AS \"deferred\", rv.out_of_scope_count AS \"out_of_scope\", (SELECT coalesce(sum(prompt_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"in\", (SELECT coalesce(sum(completion_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"out\", (SELECT coalesce(sum(reasoning_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"reasoning\", (SELECT coalesce(max(seq) + 1, 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"turns\" FROM reviews rv JOIN tasks t ON t.id = rv.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(rv.created_at) ORDER BY rv.created_at DESC LIMIT 50",
+          "rawSql": "SELECT coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", rc.file AS \"file\", rc.line AS \"line\", coalesce(nullif(f->>'priority',''),'P2') AS \"priority\", coalesce(nullif(f->>'category',''),'correctness') AS \"category\", f->>'title' AS \"finding\", count(*) AS \"downvotes\" FROM review_feedback rf JOIN review_comments rc ON rc.github_comment_id = rf.github_comment_id AND rc.kind = rf.comment_kind JOIN reviews rv ON rv.task_id = rc.task_id JOIN tasks t ON t.id = rc.task_id LEFT JOIN repositories r ON r.id = t.repository_id CROSS JOIN LATERAL jsonb_array_elements(rv.findings) f WHERE rc.kind = 'inline' AND f->>'file' = rc.file AND f->>'line' = rc.line::text AND rf.reaction = '-1' AND $__timeFilter(rf.created_at) GROUP BY r.owner, r.name, t.repository_id, rc.file, rc.line, f->>'priority', f->>'category', f->>'title' ORDER BY count(*) DESC LIMIT 50",
           "refId": "A"
         }
       ],
-      "title": "Recent reviews",
+      "title": "Most down-voted findings",
       "transformations": [],
       "transparent": false,
       "type": "table"
@@ -368,6 +370,6 @@
     "to": "now"
   },
   "timezone": "browser",
-  "title": "Lightbridge \u2014 Review quality",
-  "uid": "lci-review-quality"
+  "title": "Lightbridge \u2014 Feedback quality",
+  "uid": "lci-feedback"
 }

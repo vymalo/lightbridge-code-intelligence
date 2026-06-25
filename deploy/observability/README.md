@@ -27,7 +27,8 @@ names, and the operator resolves them to UIDs at import.
 | `overview.json` | UI landing KPIs (+ tokens, run-duration p95) | Postgres |
 | `task-runs.json` | runs list + detail (+ Loki drill-down) | Postgres, Loki |
 | `repositories.json` | repositories view (+ index size, languages) | Postgres |
-| `review-quality.json` | findings by priority/category, tokens, reactions | Postgres |
+| `review-quality.json` | findings by priority/category, model, input/output/reasoning tokens | Postgres |
+| `feedback.json` | reaction quality: approval rate, 👎 by finding category/priority | Postgres |
 | `ingress-dispatcher.json` | webhook + queue/dispatch health | Postgres, Loki |
 | `operations.json` | RED metrics | Prometheus |
 

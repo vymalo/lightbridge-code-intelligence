@@ -152,6 +152,25 @@ pub struct Usage {
     pub prompt_tokens: Option<i64>,
     #[serde(default)]
     pub completion_tokens: Option<i64>,
+    /// Reasoning-model breakdown. `reasoning_tokens` is a SUBSET of `completion_tokens` (the API
+    /// already counts it there), surfaced separately so the transcript can split input/output/
+    /// reasoning. Absent on non-reasoning models / gateways that omit it.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
+}
+
+impl Usage {
+    /// Reasoning tokens for the turn, if the model reported the breakdown.
+    pub fn reasoning_tokens(&self) -> Option<i64> {
+        self.completion_tokens_details
+            .and_then(|d| d.reasoning_tokens)
+    }
 }
 
 #[derive(Serialize)]
