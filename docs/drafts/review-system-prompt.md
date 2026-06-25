@@ -37,7 +37,7 @@ What the live prompt does **not** yet have — the three things ADR-0047/0048 ad
    result means*. So `0 hits` / `[]` / "not found" is left to interpretation — exactly the gap that let
    PR #187 read emptiness as "feature removed." #197 mitigated this at the **substrate** (the runner now
    feeds back an explicit "empty ≠ absence" message instead of a bare `[]`), but the **prompt** still
-   carries no rule. This is the highest-priority addition. → *Prime directive #2 + the Grounding &
+   carries no rule. This is the highest-priority addition. → *Prime directive 2 + the Grounding &
    uncertainty section below.*
 2. **Top + bottom anchoring (ADR-0048 §2).** A ~6.5 KB prompt loses its middle. The live prompt has no
    top **Prime directives** block and no bottom **Final reminders** block; the two highest-stakes rules
@@ -186,9 +186,10 @@ Use these as the bar for what to record and what to skip.
 - **Model reconciliation (as-built):** ADR-0047/0048 were written referencing **GLM**; the live reviewer
   is now **MiniMax-M2** (`adorsys-reviewer` = MiniMaxAI/MiniMax-M2, `contextWindow: 204800`, fallback
   `adorsys-reviewer-pro`). Both ADRs deliberately chose only **model-portable** techniques (GPT-style,
-  non-reasoning), so every change here transfers unchanged; the only consequence is that ADR-0048 §5's
-  "tune firm phrasing by eval, don't assume" caveat now applies to **MiniMax-M2**, confirmed via the
-  ADR-0049 harness rather than assumed.
+  non-reasoning), so every change here transfers *by design*; the only consequence is that ADR-0048 §5's
+  "tune firm phrasing by eval, don't assume" caveat now applies to **MiniMax-M2** — to be confirmed
+  empirically via the ADR-0049 **Tier-2** real-model harness (deferred, #177), not assumed. (Tier-1 is
+  offline/scripted and freezes the substrate, not live-model prose.)
 - Before deploying, run it through the eval harness proposed in
   [ADR-0049](../adr/0049-eval-driven-reviewer-prompt-iteration.md) — at minimum the empty-retrieval
   grounding case (the #187 regression).

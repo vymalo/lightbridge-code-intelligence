@@ -11,8 +11,11 @@
   reconciliation:** this ADR was written referencing **GLM**; the live reviewer is now **MiniMax-M2**
   (`adorsys-reviewer` = MiniMaxAI/MiniMax-M2, `contextWindow: 204800`). The decision is unchanged — every
   technique here was deliberately chosen as **model-portable** (GPT-style, non-reasoning), so it
-  transfers; §5's "tune firm phrasing by eval, don't assume" now applies to MiniMax-M2, confirmed via the
-  ADR-0049 harness. Deploy remains the operator's call.
+  transfers *by design*; §5's "tune firm phrasing by eval, don't assume" now applies to MiniMax-M2.
+  **This portability is not yet empirically confirmed:** ADR-0049 Tier 1 is offline/scripted (it freezes
+  the substrate, not live-model prose), and the real-model **Tier 2** harness that would confirm MiniMax-M2
+  behaviour is deferred (#177). Treat the techniques as sound-by-construction, pending Tier-2 evidence.
+  Deploy remains the operator's call.
 
 ## Context and Problem Statement
 

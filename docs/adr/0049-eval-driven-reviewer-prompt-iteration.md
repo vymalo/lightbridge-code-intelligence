@@ -4,14 +4,19 @@
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
 - **As-built:** **Tier 1** shipped in [#197](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/197)
-  — `golden_empty_retrieval_grounds_against_absence` (#187), `golden_p2_finding_is_recorded_not_dropped`
-  (#2), and `golden_turn_exhaustion_preserves_buffered_findings` (#4) in `agent.rs`, the
+  — `golden_empty_retrieval_grounds_against_absence` (PR [#187](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/187)),
+  `golden_p2_finding_is_recorded_not_dropped` (failure mode 2), and
+  `golden_turn_exhaustion_preserves_buffered_findings` (failure mode 4) in `agent.rs`, the
   `dispatch_vector_search_empty_is_explicit_not_bare_brackets` substrate unit test in `tools.rs`, and a
   seed-case **coverage map** documenting cases 2/5/6 as server-side/CP-contract or Tier-2 with pointers
-  to their existing guards. **Tier 2** (the real-model harness over curated golden diffs) remains
-  **deferred** — manual/gated under [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177),
-  per "What this deliberately defers." The workflow contract (a prompt change ships with a matching
-  Tier-1 case) is in force.
+  to their existing guards. **Scope of Tier 1 (important):** these are deterministic assertions on the
+  *loop machinery and the prompt's structured substrate* driven by a **scripted** model — e.g. the
+  empty-retrieval case asserts the model is handed the explicit non-absence message, **not** that a live
+  model refrains from an absence claim. Proving the real model chooses the right action is **Tier 2**
+  (the real-model harness over curated golden diffs), which remains **deferred** — manual/gated under
+  [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177), per "What this
+  deliberately defers." The workflow contract (a prompt change ships with a matching Tier-1 case) is in
+  force.
 
 ## Context and Problem Statement
 
