@@ -233,12 +233,28 @@ pub async fn run_native_agent(
         Duration::from_secs(review.resilience.request_timeout_secs),
     )
     .with_attribution(attribution);
-    // Optional secondary model for failover (ADR-0039): same gateway/key, different model id.
-    let fallback = review
-        .resilience
-        .fallback_model
-        .as_deref()
-        .map(|m| chat.for_model(m));
+    // Optional secondary model for failover (ADR-0039/0051): its OWN client (own timeout), generation
+    // params, and retry budget — same gateway/key, different model. The per-turn failover below uses
+    // these so the fallback runs under its own config, not the primary's.
+    let fallback = review.fallback.as_ref().map(|fb| {
+        let client = ChatClient::with_timeout(
+            &review.base_url,
+            &review.api_key,
+            &fb.model,
+            Duration::from_secs(fb.request_timeout_secs),
+        )
+        .with_attribution(attribution);
+        let params = ChatParams {
+            temperature: fb.temperature,
+            top_p: fb.top_p,
+            max_tokens: fb.max_tokens,
+        };
+        let retry = RetryPolicy {
+            max_retries: fb.max_retries,
+            ..RetryPolicy::default()
+        };
+        (client, params, retry)
+    });
     let retry_policy = RetryPolicy {
         max_retries: review.resilience.max_retries,
         ..RetryPolicy::default()
@@ -248,7 +264,7 @@ pub async fn run_native_agent(
     tracing::info!(
         task_id = %task_id,
         model = %review.model,
-        fallback_model = review.resilience.fallback_model.as_deref().unwrap_or("(none)"),
+        fallback_model = review.fallback.as_ref().map(|f| f.model.as_str()).unwrap_or("(none)"),
         base_url_host = %base_url_host(&review.base_url),
         request_timeout_secs = review.resilience.request_timeout_secs,
         max_retries = review.resilience.max_retries,
@@ -473,22 +489,25 @@ pub async fn run_native_agent(
         {
             Ok(c) => Ok((c, chat.model().to_string())),
             Err(primary_err) => match (&fallback, primary_err.transient) {
-                (Some(fb), true) => {
+                (Some((fb_client, fb_params, fb_retry)), true) => {
+                    // Failover runs under the fallback's OWN params + retry budget (ADR-0051).
                     tracing::warn!(
                         task_id = %task_id,
                         turn,
                         primary_model = %review.model,
-                        fallback_model = %fb.model(),
+                        fallback_model = %fb_client.model(),
                         error = %primary_err,
                         "primary model exhausted retries; failing over to secondary model"
                     );
-                    fb.complete_with_retry(&messages, turn_defs, params, retry_policy)
+                    fb_client
+                        .complete_with_retry(&messages, turn_defs, *fb_params, *fb_retry)
                         .await
-                        .map(|c| (c, fb.model().to_string()))
+                        .map(|c| (c, fb_client.model().to_string()))
                         .map_err(|fb_err| ChatTurnError {
-                            error: fb_err
-                                .error
-                                .context(format!("failover model {} also failed", fb.model())),
+                            error: fb_err.error.context(format!(
+                                "failover model {} also failed",
+                                fb_client.model()
+                            )),
                             transient: fb_err.transient,
                         })
                 }
@@ -1114,8 +1133,8 @@ mod tests {
                 request_timeout_secs: 5,
                 max_retries: 0,
                 circuit_breaker_threshold: 3,
-                fallback_model: None,
             },
+            fallback: None,
         }
     }
 
@@ -1797,7 +1816,14 @@ mod tests {
             .await;
 
         let mut review = review_config(format!("{}/v1", chat.uri()));
-        review.resilience.fallback_model = Some("m-fallback".to_string());
+        review.fallback = Some(crate::bootstrap::config::FallbackConfig {
+            model: "m-fallback".to_string(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            request_timeout_secs: 5,
+            max_retries: 0,
+        });
         let cpc = ControlPlaneClient::new(cp.uri(), "tok");
         let embc = EmbeddingsClient::new("http://unused", "key", "model");
         run_native_agent(

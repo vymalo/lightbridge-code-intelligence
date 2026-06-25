@@ -201,6 +201,9 @@ async fn run(
         &embeddings_config.api_key,
         &embeddings_config.model,
     )
+    .with_timeout(std::time::Duration::from_secs(
+        embeddings_config.request_timeout_secs,
+    ))
     .with_attribution(&attribution);
 
     let checkout = clone::checkout(&context, &config.workdir).await?;

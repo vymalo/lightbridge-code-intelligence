@@ -35,8 +35,11 @@ pub struct EmbeddingsClient {
 /// the default rustls/webpki roots don't include; the Job mounts that CA and points the env at it.
 /// Absent the env, the default client (public roots) is used — fine for plain-HTTP / public-cert
 /// endpoints. `add_root_certificate` augments the default roots, it doesn't replace them.
-fn build_http_client() -> reqwest::Client {
+fn build_http_client(timeout: Option<std::time::Duration>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
+    if let Some(t) = timeout {
+        builder = builder.timeout(t);
+    }
     if let Ok(path) = std::env::var("EMBEDDINGS_CA_CERT") {
         match load_ca(&path) {
             Ok(cert) => {
@@ -64,9 +67,16 @@ impl EmbeddingsClient {
             url: format!("{base_url}/v1/embeddings"),
             api_key: api_key.into(),
             model: model.into(),
-            http: build_http_client(),
+            http: build_http_client(None),
             attribution: reqwest::header::HeaderMap::new(),
         }
+    }
+
+    /// Apply a per-request timeout (ADR-0051; from `embeddings.config.request_timeout_secs`). Rebuilds
+    /// the transport with the timeout set, preserving the CA-trust behaviour.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = build_http_client(Some(timeout));
+        self
     }
 
     /// Attach gateway attribution headers (epic #89). Invalid header names/values are skipped (these
