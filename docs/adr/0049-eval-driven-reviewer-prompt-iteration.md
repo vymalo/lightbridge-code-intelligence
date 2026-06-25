@@ -55,9 +55,12 @@ Proposed seed cases, one per failure mode from epic #177:
    buffer or `finish` with an absence/removal claim, and that it falls back to `read_file` or records
    "could not verify." (This is the #187 regression, frozen as a test.)
 2. **Out-of-scope finding (#3).** Provide a diff touching `a.rs`; script a model that tries to
-   `add_review_comment` on `b.rs` (unchanged). **Assert** the finding is not anchored as P0/P1 on the
-   untouched file (the control-plane diff-validation in ADR-0022 is the enforcement; the eval asserts
-   the *agent* doesn't try).
+   `add_review_comment` on `b.rs` (unchanged). The control plane validates write-back (ADR-0022) and
+   the per-call mediated tool path anchors/rejects against the diff (ADR-0037) — that server side is the
+   enforcement. This eval's distinct value is the *prompt's* effect: run the agent **with** the
+   review-only-the-diff rule (the post-0047/0048 state) and **assert the agent does not attempt** the
+   out-of-scope call in the first place — i.e. the prompt prevents the attempt, not merely the server
+   rejecting a stray one. (A negative-control run against a prompt missing the rule shows the delta.)
 3. **P2 recorded, not narrated (#2).** Script a P2-worthy issue. **Assert** it is recorded via
    `add_review_comment`, not only mentioned in the `finish` summary; assert the summary does not reduce
    to "no P0/P1 findings."
@@ -118,10 +121,15 @@ matching Tier-1 golden case** and SHOULD be checked against Tier 2 before the op
   [ADR-0048](0048-review-prompt-structure-and-technique.md) — the prompt changes this gates.
 - [ADR-0013](0013-local-dev-and-build-tooling.md) — nextest + wiremock, the existing test substrate
   Tier 1 extends.
-- [ADR-0022](0022-review-writeback-control-plane.md) — control-plane diff validation (the enforcement
-  the out-of-scope eval asserts against).
+- [ADR-0022](0022-review-writeback-control-plane.md) — control-plane validates review write-back.
+- [ADR-0037](0037-agent-acts-via-mediated-tools.md) — the per-call mediated tool path that anchors/rejects
+  against the diff (the server-side enforcement the out-of-scope eval distinguishes from the prompt effect).
 - [ADR-0034](0034-agent-run-transcript-and-observability.md) — the transcript, a data source for
   scoring Tier 2 runs.
+- [ADR-0040](0040-re-review-reads-prior-findings.md) — prior-review reconciliation (the self-consistency
+  golden case).
+- [ADR-0042](0042-risk-first-review-and-parallel-batching.md),
+  [ADR-0045](0045-context-window-budget.md) — the budgets/wind-down the convergence golden case exercises.
 - OpenAI, *Evaluation best practices* — "Adopt eval-driven development: evaluate early and often"; the
   "vibe-based evals" anti-pattern: https://developers.openai.com/api/docs/guides/evaluation-best-practices
 - OpenAI, *Evals guide* — describe → run → analyze/iterate loop:

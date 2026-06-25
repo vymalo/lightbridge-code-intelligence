@@ -116,11 +116,13 @@ Use these as the bar for what to record and what to skip.
 > it (it surfaces in the deferred section) rather than anchoring to an untouched line.
 
 **Empty retrieval — grounding:**
-> `lightbridge_graph_find_symbol(term="OldFeature")` → `0 hits`.
-> Bad verdict: *"Symbol search confirms OldFeature was removed by this PR."* (false — the search being
-> empty does not mean the symbol is gone, and this PR may not touch it at all).
-> Good move: open the file with `read_file` to check; if still unconfirmed, write *"could not verify
-> whether OldFeature is still referenced"* and do not claim it was removed.
+> `lightbridge_graph_find_symbol(term="processPayment")` → `0 hits` — a symbol this PR does **not**
+> change; you were checking whether the changed code still relies on it.
+> Bad verdict: *"Symbol search confirms `processPayment` is unused / no longer referenced."* (false — an
+> empty search means the index is stale, hollow, or doesn't cover that symbol, **not** that it is gone.
+> Note this is about *index coverage*, not whether the PR removed anything.)
+> Good move: open the file with `read_file` to check the real callers; if still unconfirmed, write
+> *"could not verify whether `processPayment` is still referenced"* and do not assert it is unused.
 
 # Final reminders
 

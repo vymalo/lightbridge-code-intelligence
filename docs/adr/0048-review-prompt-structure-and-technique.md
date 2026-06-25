@@ -155,16 +155,24 @@ prompt is unchanged until a human edits `ai-helm-values`.
 - **Splitting the system prompt into a cached static prefix + per-run suffix** (prompt caching) — a
   cost/latency optimization, not a quality one; revisit if the gateway supports caching.
 - **Native extended-thinking / reasoning blocks** — Claude-only and not available on the OpenAI-style
-  gateway; induced planning (#4) is the portable substitute.
+  gateway; induced planning (#4) is the portable substitute. The substitution is split by concern:
+  induced planning (#4) stands in for what a reasoning model's "think out loud" does for *convergence*,
+  while the worked examples (#3) and top+bottom anchoring (#2) — plus the refute pass (ADR-0043) — are
+  the substitutes for what it does for *quality/self-correction*. GLM won't self-correct on the first
+  pass the way a reasoning model does, so these explicit scaffolds carry that load.
 
 ## References
 
 - Epic [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177).
 - [ADR-0037](0037-agent-acts-via-mediated-tools.md) — prompt assembly + the mediated tools the examples
   reference.
+- [ADR-0041](0041-full-diff-coverage-gate.md) — the coverage gate this prompt history references.
 - [ADR-0042](0042-risk-first-review-and-parallel-batching.md) — hypothesis-per-batch + budgets the
   planning reminder reinforces.
-- [ADR-0043](0043-review-finding-verification.md) — the evidence field the examples cite.
+- [ADR-0043](0043-review-finding-verification.md) — the evidence field the examples cite + the refute
+  pass that complements the examples for quality.
+- [ADR-0044](0044-feedback-memory-m1.md) — feedback memory, part of the prompt history this restructures.
+- [ADR-0045](0045-context-window-budget.md) — the context budget that bounds the prompt + examples length.
 - [ADR-0047](0047-review-prompt-grounding-and-uncertainty.md) — the grounding section this scaffolds.
 - [ADR-0049](0049-eval-driven-reviewer-prompt-iteration.md) — the eval that gates this rewrite.
 - OpenAI, *GPT-4.1 Prompting Guide* — structure/ordering, delimiters (JSON poor), top+bottom instruction

@@ -123,6 +123,8 @@ that helps — it labels `0 hits` explicitly in the result summary so the emptin
 
 - Epic [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177).
 - [ADR-0037](0037-agent-acts-via-mediated-tools.md) — the agent loop + prompt assembly this governs.
+- [ADR-0042](0042-risk-first-review-and-parallel-batching.md) — the `max_files_read` budget that bounds
+  the "confirm with `read_file`" fallback this ADR adds.
 - [ADR-0043](0043-review-finding-verification.md) — evidence citation + refute pass on *findings* (this
   ADR extends the bar to the *narrative* and the *empty-result interpretation*).
 - [ADR-0048](0048-review-prompt-structure-and-technique.md) — the structural rewrite this contract slots
