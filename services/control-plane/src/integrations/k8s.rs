@@ -321,9 +321,11 @@ struct JobConfig<'a> {
 /// that sets only `resources` keeps today's behaviour.
 ///
 /// CAVEAT: a *cold-repo* review still self-indexes (ADR-0050 only makes *warm* reviews reuse the
-/// snapshot), so the review block must not be so lean it OOMs a first-time index. In practice the
-/// approval-time index task (Epic #75) indexes a repo before any review runs, so reviews are warm; the
-/// residual cold path is closed once review-never-indexes lands (plan Phase 1.2).
+/// snapshot — `repo_indexed` is false until `latest_indexed_commit` exists, and the runner indexes
+/// when `!repo_indexed`). So `review_resources` must still be able to absorb a one-off full index —
+/// **do not set it below what a cold index needs.** In practice the approval-time index task (Epic #75)
+/// indexes a repo before any review runs, so reviews are normally warm; this residual cold path is
+/// removed once review no longer self-indexes (a later step in the runner-differentiation plan).
 fn resources_for<'a>(
     task: &ClaimedTask,
     indexer: Option<&'a Value>,
