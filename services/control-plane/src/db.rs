@@ -998,6 +998,64 @@ pub async fn delete_repo_index_rows(pool: &PgPool, repository_id: i64) -> Result
     Ok(result.rows_affected())
 }
 
+// ── Index snapshot pruning (RFC-0002, ADR-0052) ──────────────────────────────────────────────────
+// Every default-branch push writes a full new `(repository_id, commit_sha)` snapshot into
+// `code_chunks` (+ Neo4j) and nothing reaps the old ones — reviews only ever read the *latest*
+// (`latest_indexed_commit`, ADR-0050). The index sweeper keeps only the in-use snapshots per repo and
+// prunes the rest. These helpers are the Postgres half; the Neo4j half is `neo4j::prune_graph`.
+
+/// Repos that currently hold MORE THAN ONE distinct `commit_sha` in `code_chunks` — i.e. the only
+/// repos with anything prunable. The sweeper iterates these so a steady-state repo (one snapshot)
+/// costs a single grouped count, not a per-repo delete.
+pub async fn repos_with_stale_snapshots(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT repository_id FROM code_chunks \
+         GROUP BY repository_id HAVING count(DISTINCT commit_sha) > 1",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Commits that a still-running task pins, so the sweeper never prunes a snapshot out from under an
+/// in-flight run. Two cases: an INDEX task mid-write (its `head_sha` snapshot is being inserted now),
+/// and any non-terminal task. Terminal statuses (the run is done) are excluded; everything else is
+/// "in use". `head_sha IS NOT NULL` since a null can't match a `commit_sha`.
+pub async fn in_use_commits(pool: &PgPool, repository_id: i64) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT head_sha FROM tasks \
+         WHERE repository_id = $1 AND head_sha IS NOT NULL \
+           AND status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled')",
+    )
+    .bind(repository_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete every `code_chunks` row for `repository_id` whose `commit_sha` is NOT in `keep`, except rows
+/// indexed within the last 10 minutes (a recency grace: a just-finished index whose task hasn't yet
+/// flipped to a terminal status, belt-and-suspenders on top of `in_use_commits`). Returns rows deleted.
+/// No-op (returns 0) when `keep` is empty — never blindly delete a repo's whole index here.
+pub async fn prune_code_chunks(
+    pool: &PgPool,
+    repository_id: i64,
+    keep: &[String],
+) -> Result<u64, sqlx::Error> {
+    if keep.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        "DELETE FROM code_chunks \
+         WHERE repository_id = $1 \
+           AND commit_sha <> ALL($2) \
+           AND created_at < now() - interval '10 minutes'",
+    )
+    .bind(repository_id)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Disabled repositories that still have index data (leftover `code_chunks` or `repo_index` rows) —
 /// the purge reconciler re-purges these so a cleanup lost to a control-plane restart still completes.
 /// (Neo4j leftovers accompany `code_chunks`, so this also catches graph data to purge.)
@@ -2803,5 +2861,71 @@ mod tests {
             latest_indexed_commit(&pool, repo_id + 9999).await.unwrap(),
             None
         );
+    }
+
+    /// Index pruning (ADR-0052): the keep-set is the latest snapshot ∪ any commit an in-flight
+    /// (non-terminal) task pins; `prune_code_chunks` drops everything else (past the recency grace),
+    /// and an empty keep-set is a no-op so a live index is never wiped.
+    #[sqlx::test]
+    async fn prune_keeps_latest_and_in_flight_and_drops_the_rest(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        // Three snapshots, oldest → newest; the last (`latest-sha`) wins `latest_indexed_commit` via
+        // the `id DESC` tie-break.
+        for (sha, file) in [
+            ("stale-sha", "a.rs"),
+            ("inflight-sha", "b.rs"),
+            ("latest-sha", "c.rs"),
+        ] {
+            upsert_code_chunks(&pool, repo_id, sha, &[chunk_at(file, 1, 0)])
+                .await
+                .unwrap();
+        }
+        // Age every snapshot past the 10-minute recency grace so they're eligible to prune.
+        sqlx::query("UPDATE code_chunks SET created_at = now() - interval '1 hour' WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // An in-flight (status 'queued') review pins `inflight-sha`.
+        create_task(&pool, &pr_task(repo_id, "inflight-sha"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Keep-set the sweeper assembles.
+        assert_eq!(
+            in_use_commits(&pool, repo_id).await.unwrap(),
+            vec!["inflight-sha".to_string()]
+        );
+        assert_eq!(
+            latest_indexed_commit(&pool, repo_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("latest-sha")
+        );
+        assert_eq!(
+            repos_with_stale_snapshots(&pool).await.unwrap(),
+            vec![repo_id]
+        );
+
+        // Prune everything outside the keep-set: only `stale-sha` goes.
+        let keep = vec!["inflight-sha".to_string(), "latest-sha".to_string()];
+        assert_eq!(prune_code_chunks(&pool, repo_id, &keep).await.unwrap(), 1);
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT commit_sha FROM code_chunks WHERE repository_id = $1 ORDER BY commit_sha",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["inflight-sha".to_string(), "latest-sha".to_string()]
+        );
+
+        // Safety: an empty keep-set never deletes (guards against wiping a live index).
+        assert_eq!(prune_code_chunks(&pool, repo_id, &[]).await.unwrap(), 0);
     }
 }

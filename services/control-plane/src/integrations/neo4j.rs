@@ -125,6 +125,40 @@ pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Res
     Ok(deleted)
 }
 
+/// Prune a repo's stale structural-graph snapshots: delete every `Symbol` for `repository_id` whose
+/// `commit` is NOT in `keep` (RFC-0002 / ADR-0052 — the Neo4j half of index pruning). `keep` is the
+/// in-use commit set (latest indexed + in-flight) computed by the sweeper. No-op when `keep` is empty
+/// (mirrors [`crate::db::prune_code_chunks`] — never wipe the whole graph here). Returns nodes deleted.
+pub async fn prune_graph(
+    graph: &Graph,
+    repository_id: i64,
+    keep: &[String],
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    if keep.is_empty() {
+        return Ok(0);
+    }
+    // Count BEFORE deleting (same reason as `delete_repo_graph`: the nodes leave the query context).
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep \
+                 WITH collect(s) AS nodes, count(s) AS deleted \
+                 FOREACH (n IN nodes | DETACH DELETE n) \
+                 RETURN deleted",
+            )
+            .param("repo", repository_id)
+            .param("keep", keep.to_vec()),
+        )
+        .await
+        .context("prune repo graph")?;
+    let deleted = match rows.next().await.context("read prune count")? {
+        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
+        None => 0,
+    };
+    Ok(deleted)
+}
+
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
@@ -316,6 +350,66 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live round-trip for `prune_graph` (ADR-0052): two snapshots of one repo, prune to a keep-set →
+    /// the kept commit's nodes survive, the rest are deleted; an empty keep-set is a no-op. Ignored by
+    /// default (no Neo4j in CI) — run with `--ignored` after `docker compose up -d neo4j`.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn prune_graph_keeps_only_the_keep_set() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+        let repo = 4242i64;
+        // Clean any prior run for this repo.
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        let node = |id: &str| GraphNode {
+            node_id: id.into(),
+            label: format!("{id}()"),
+            source_file: "src/x.rs".into(),
+            start_line: 1,
+        };
+        let keep_sha = "graph-keep-sha";
+        let stale_sha = "graph-stale-sha";
+        upsert_graph(&graph, repo, keep_sha, &[node("keep_fn")], &[])
+            .await
+            .expect("upsert keep");
+        upsert_graph(&graph, repo, stale_sha, &[node("stale_fn")], &[])
+            .await
+            .expect("upsert stale");
+
+        // Prune everything but `keep_sha` → the one stale node goes.
+        let deleted = prune_graph(&graph, repo, &[keep_sha.to_string()])
+            .await
+            .expect("prune");
+        assert_eq!(deleted, 1, "only the stale snapshot's node is pruned");
+        assert_eq!(
+            find_symbol(&graph, repo, stale_sha, "stale", 10)
+                .await
+                .expect("find stale")
+                .len(),
+            0,
+            "stale snapshot gone"
+        );
+        assert_eq!(
+            find_symbol(&graph, repo, keep_sha, "keep", 10)
+                .await
+                .expect("find keep")
+                .len(),
+            1,
+            "kept snapshot survives"
+        );
+
+        // Empty keep-set is a no-op (never wipe a live graph).
+        assert_eq!(prune_graph(&graph, repo, &[]).await.expect("noop"), 0);
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

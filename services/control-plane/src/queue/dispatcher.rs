@@ -21,6 +21,9 @@ const DEFAULT_CLAIM_LEASE_SECS: u64 = 60;
 const DEFAULT_POLL_FALLBACK_SECS: u64 = 5;
 const DEFAULT_LAUNCH_BACKOFF_SECS: u64 = 30;
 const DEFAULT_REAP_INTERVAL_SECS: u64 = 30;
+/// Storage GC isn't urgent (it only reclaims space, never affects correctness), so it runs far less
+/// often than the reaper — every 10 minutes by default.
+const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 600;
 
 /// Tunable dispatcher loop timings.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +37,8 @@ pub struct DispatcherConfig {
     pub launch_backoff: Duration,
     /// How often the reaper reconciles stuck (lease-expired) tasks against their Jobs.
     pub reap_interval: Duration,
+    /// How often the index sweeper prunes stale `(repo, commit)` index snapshots (ADR-0052).
+    pub prune_interval: Duration,
 }
 
 impl DispatcherConfig {
@@ -60,6 +65,10 @@ impl DispatcherConfig {
                 section.and_then(|s| s.reap_interval_seconds),
                 DEFAULT_REAP_INTERVAL_SECS,
             ),
+            prune_interval: secs(
+                section.and_then(|s| s.prune_interval_seconds),
+                DEFAULT_PRUNE_INTERVAL_SECS,
+            ),
         }
     }
 }
@@ -85,6 +94,10 @@ pub async fn run<L: TaskLauncher>(
     // and active-status-guarded, so it stays correct even if more than one replica runs it.
     let mut reap_tick = tokio::time::interval(cfg.reap_interval);
     reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Index-snapshot GC (ADR-0052) shares this loop, like the reaper — its deletes are idempotent and
+    // keep-set-guarded, so it stays correct even if more than one replica runs it.
+    let mut prune_tick = tokio::time::interval(cfg.prune_interval);
+    prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(owner, "dispatcher started");
 
     loop {
@@ -105,6 +118,12 @@ pub async fn run<L: TaskLauncher>(
                 }
                 // Durable backstop for repo data purge (a spawned purge can be lost on restart).
                 crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
+            }
+            _ = prune_tick.tick() => {
+                // Reap stale `(repo, commit)` index snapshots from pgvector + Neo4j (ADR-0052).
+                if let Err(error) = crate::queue::index_sweeper::sweep_once(&pool, neo4j.as_deref()).await {
+                    tracing::error!(%error, "index sweeper cycle failed");
+                }
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
             // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so

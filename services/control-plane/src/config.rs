@@ -97,6 +97,9 @@ pub struct DispatcherSection {
     pub launch_backoff_seconds: Option<u64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub reap_interval_seconds: Option<u64>,
+    /// How often the index sweeper prunes stale `(repo, commit)` snapshots (ADR-0052).
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub prune_interval_seconds: Option<u64>,
 }
 
 /// Load the control-plane config file if it exists. `Ok(None)` when absent (use env); `Err` when it
