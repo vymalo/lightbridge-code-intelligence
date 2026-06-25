@@ -947,26 +947,27 @@ pub async fn cancel_task_by_id(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Er
     Ok(result.rows_affected() > 0)
 }
 
-/// Whether a repository already has a semantic index **at `commit_sha`** — i.e. `code_chunks` rows
-/// scoped to the exact commit the runner's retrieval queries will be pinned to. The runner uses this
-/// to skip the full re-index on a review when a reusable index already exists (ADR-0025).
+/// The `commit_sha` of the repository's **most recently indexed snapshot**, or `None` if it has never
+/// been indexed (ADR-0050). This is the single anchor for review reuse: the runner skips the re-index
+/// when this is `Some` and pins all retrieval (`search_code_chunks`, graph) to this same commit — so
+/// the skip decision and the search scope always reference a commit that *provably has chunks*.
 ///
-/// This MUST be checked at the same commit `search_code_chunks` queries (see
-/// [`crate::http::internal`]'s retrieval-commit resolution). A repo-level "any rows?" check is a
-/// trap: an index built at commit *A* would answer "yes, indexed", the re-index gets skipped, but a
-/// search pinned to commit *B* then returns **zero** hits — a "hollow index" that silently starves
-/// the agent (dogfood run `7c15f9bb`). Keying both on the same commit keeps the skip decision honest.
-pub async fn repo_has_index(
+/// Why "latest", not the PR head: indexing is maintained on the default branch by re-index-on-push
+/// (#183), and a review's value comes from the *base* repo context plus the PR diff (already in the
+/// prompt). Pinning to the PR head (the previous behaviour) meant every new head commit looked
+/// "not indexed" and triggered a full re-index per PR (slow + costly), while a repo-level "any rows?"
+/// check meant searches at the head returned **zero** hits — a hollow index that starved the agent
+/// (run `7c15f9bb`). Anchoring to the latest indexed snapshot fixes both: real hits, no per-PR re-index.
+pub async fn latest_indexed_commit(
     pool: &PgPool,
     repository_id: i64,
-    commit_sha: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM code_chunks WHERE repository_id = $1 AND commit_sha = $2)",
+        "SELECT commit_sha FROM code_chunks WHERE repository_id = $1 \
+         ORDER BY created_at DESC LIMIT 1",
     )
     .bind(repository_id)
-    .bind(commit_sha)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
 }
 
@@ -2765,28 +2766,36 @@ mod tests {
         );
     }
 
-    /// `repo_has_index` is commit-scoped: an index at commit *A* must NOT count as "indexed" when the
-    /// retrieval will query commit *B*. This is the hollow-index guard (run `7c15f9bb`) — keep it in
-    /// lockstep with `search_code_chunks`'s `(repo, commit)` scoping above.
+    /// `latest_indexed_commit` returns the most-recently-indexed snapshot (ADR-0050): `None` for an
+    /// un-indexed repo, and the newest `commit_sha` once chunks exist — the single anchor reviews reuse
+    /// and pin retrieval to, so the skip decision and the search scope can't disagree (no hollow index).
     #[sqlx::test]
-    async fn repo_has_index_is_commit_scoped(pool: PgPool) {
+    async fn latest_indexed_commit_returns_newest_snapshot(pool: PgPool) {
         let repo_id = seed(&pool).await;
 
-        // No chunks at all → not indexed at any commit.
-        assert!(!repo_has_index(&pool, repo_id, "headsha").await.unwrap());
+        // Never indexed → None.
+        assert_eq!(latest_indexed_commit(&pool, repo_id).await.unwrap(), None);
 
-        upsert_code_chunks(&pool, repo_id, "headsha", &[chunk_at("a.rs", 1, 0)])
+        // Index an older snapshot, then a newer one (later created_at).
+        upsert_code_chunks(&pool, repo_id, "base-sha", &[chunk_at("a.rs", 1, 0)])
+            .await
+            .unwrap();
+        upsert_code_chunks(&pool, repo_id, "newer-sha", &[chunk_at("b.rs", 1, 0)])
             .await
             .unwrap();
 
-        // Indexed at the queried commit → reuse it.
-        assert!(repo_has_index(&pool, repo_id, "headsha").await.unwrap());
-        // Indexed, but at a DIFFERENT commit than retrieval will query → must re-index (the hollow
-        // case the repo-level check used to miss).
-        assert!(!repo_has_index(&pool, repo_id, "othersha").await.unwrap());
+        // Returns the most recent snapshot — what retrieval pins to (it provably has chunks).
+        assert_eq!(
+            latest_indexed_commit(&pool, repo_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("newer-sha")
+        );
         // A different repo is unaffected.
-        assert!(!repo_has_index(&pool, repo_id + 9999, "headsha")
-            .await
-            .unwrap());
+        assert_eq!(
+            latest_indexed_commit(&pool, repo_id + 9999).await.unwrap(),
+            None
+        );
     }
 }
