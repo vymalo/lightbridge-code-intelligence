@@ -66,9 +66,9 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0044](0044-feedback-memory-m1.md) | Feedback memory (M1): inject 👎-rejected findings as repo memory so the agent doesn't re-raise known false positives | Proposed |
 | [0045](0045-context-window-budget.md) | Context-window budget: converge before overflow, trim consumed tool output, never discard buffered findings | Proposed |
 | [0046](0046-observability-dashboard-deployment.md) | Observability dashboard deployment (most dashboards read Postgres, not Prometheus) | Proposed |
-| [0047](0047-review-prompt-grounding-and-uncertainty.md) | Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence) | Proposed |
-| [0048](0048-review-prompt-structure-and-technique.md) | Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model | Proposed |
-| [0049](0049-eval-driven-reviewer-prompt-iteration.md) | Eval-driven reviewer-prompt iteration — golden cases before deploy | Proposed |
+| [0047](0047-review-prompt-grounding-and-uncertainty.md) | Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence) | Accepted |
+| [0048](0048-review-prompt-structure-and-technique.md) | Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model | Accepted |
+| [0049](0049-eval-driven-reviewer-prompt-iteration.md) | Eval-driven reviewer-prompt iteration — golden cases before deploy | Accepted |
 | [0050](0050-retrieval-pins-to-latest-indexed-snapshot.md) | Reviews reuse the latest indexed snapshot (pin retrieval + skip-check to it; no per-PR re-index) | Proposed |
 | [0051](0051-per-model-config.md) | Per-model configuration blocks (primary / fallback / embeddings) | Proposed |
 | [0052](0052-index-snapshot-pruning.md) | Index snapshot pruning — keep the latest + in-flight, sweep the rest | Proposed |

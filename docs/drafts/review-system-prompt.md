@@ -18,6 +18,39 @@ draft changes *structure, grounding, and examples*, not the substantive checklis
 
 The two new/most-changed pieces are shown in full; the rest is annotated.
 
+## Gap analysis — what the current live prompt is missing
+
+Reviewed against the live `config.reviewSystemPrompt` in `ai-helm-values`
+(`environments/prod/values/lightbridge-code-intelligence.yaml`, the `# Role …` prompt). The live prompt
+is **strong on substance** and this draft keeps all of it:
+
+- the exhaustive **What to hunt for** catalogue, the **scope discipline** (review the change, not the
+  repo — stated in *What you work on*, *How to report*, and *What NOT to do*), the **evidence field**
+  requirement, **P2-recorded-not-narrated**, the **verdict reflects every priority** rule, **refute
+  your own P0/P1 blockers** (ADR-0043), **risk-first hypothesis batching** (ADR-0042), and the
+  **scratchpad guard**. None of that changes.
+
+What the live prompt does **not** yet have — the three things ADR-0047/0048 add, in priority order:
+
+1. **The empty-retrieval grounding rule (ADR-0047 — the #187 fix).** The live prompt says "ground every
+   claim in evidence" and "calibrate uncertainty out loud," but it never tells the model *what an empty
+   result means*. So `0 hits` / `[]` / "not found" is left to interpretation — exactly the gap that let
+   PR #187 read emptiness as "feature removed." #197 mitigated this at the **substrate** (the runner now
+   feeds back an explicit "empty ≠ absence" message instead of a bare `[]`), but the **prompt** still
+   carries no rule. This is the highest-priority addition. → *Prime directive #2 + the Grounding &
+   uncertainty section below.*
+2. **Top + bottom anchoring (ADR-0048 §2).** A ~6.5 KB prompt loses its middle. The live prompt has no
+   top **Prime directives** block and no bottom **Final reminders** block; the two highest-stakes rules
+   (review-the-diff-not-repo; empty ≠ absence) are not anchored at both ends. → *the Prime directives and
+   Final reminders blocks below.*
+3. **Worked good-vs-bad examples (ADR-0048 §3 — "the biggest missing lever").** The live prompt
+   *describes* a complete finding but shows **none**. → *the Examples section below* (in-scope P0,
+   out-of-scope, P2-recorded-vs-narrated, anchoring, empty-retrieval).
+
+Lesser additions: an explicit **"`read_file` is your fallback when retrieval is empty"** reminder
+(ADR-0048 §6) and a clearer **permission to say "I could not verify"** (ADR-0047 rule 3 — present only
+weakly today as "I could not verify X beats confident fiction").
+
 ---
 
 ```markdown
@@ -144,7 +177,18 @@ Use these as the bar for what to record and what to skip.
 - The `[…unchanged …]` blocks above are placeholders for the corresponding sections of the *current*
   live prompt, kept verbatim. When applying this, splice the new **Prime directives**, **Grounding &
   uncertainty**, **Plan and persist**, **Examples**, and **Final reminders** sections into the existing
-  prompt rather than rewriting the hunting catalogue and reporting rules from scratch.
+  prompt rather than rewriting the hunting catalogue and reporting rules from scratch. Concretely, the
+  placeholders map to these live sections (keep their wording):
+  - `[…unchanged risk-first workflow…]` → the live **# How you review — risk-first, in batches** steps.
+  - `[…unchanged hunting catalogue…]` → the live **# What to hunt for** section (Correctness · Concurrency ·
+    Error handling · Security · Data & compatibility · Performance · Maintainability · Tests · Edge cases).
+  - `[…unchanged reporting rules…]` → the live **# How to report** + **# What NOT to do** sections.
+- **Model reconciliation (as-built):** ADR-0047/0048 were written referencing **GLM**; the live reviewer
+  is now **MiniMax-M2** (`adorsys-reviewer` = MiniMaxAI/MiniMax-M2, `contextWindow: 204800`, fallback
+  `adorsys-reviewer-pro`). Both ADRs deliberately chose only **model-portable** techniques (GPT-style,
+  non-reasoning), so every change here transfers unchanged; the only consequence is that ADR-0048 §5's
+  "tune firm phrasing by eval, don't assume" caveat now applies to **MiniMax-M2**, confirmed via the
+  ADR-0049 harness rather than assumed.
 - Before deploying, run it through the eval harness proposed in
   [ADR-0049](../adr/0049-eval-driven-reviewer-prompt-iteration.md) — at minimum the empty-retrieval
   grounding case (the #187 regression).

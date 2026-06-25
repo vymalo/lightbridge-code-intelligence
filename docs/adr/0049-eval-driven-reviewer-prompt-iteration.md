@@ -1,8 +1,17 @@
 # ADR-0049: Eval-driven reviewer-prompt iteration — golden cases before deploy
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
+- **As-built:** **Tier 1** shipped in [#197](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/197)
+  — `golden_empty_retrieval_grounds_against_absence` (#187), `golden_p2_finding_is_recorded_not_dropped`
+  (#2), and `golden_turn_exhaustion_preserves_buffered_findings` (#4) in `agent.rs`, the
+  `dispatch_vector_search_empty_is_explicit_not_bare_brackets` substrate unit test in `tools.rs`, and a
+  seed-case **coverage map** documenting cases 2/5/6 as server-side/CP-contract or Tier-2 with pointers
+  to their existing guards. **Tier 2** (the real-model harness over curated golden diffs) remains
+  **deferred** — manual/gated under [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177),
+  per "What this deliberately defers." The workflow contract (a prompt change ships with a matching
+  Tier-1 case) is in force.
 
 ## Context and Problem Statement
 

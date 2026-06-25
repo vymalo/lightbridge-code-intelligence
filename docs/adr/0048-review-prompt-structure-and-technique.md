@@ -1,8 +1,18 @@
 # ADR-0048: Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
+- **As-built:** the revised prompt draft is finalized in
+  [`docs/drafts/review-system-prompt.md`](../drafts/review-system-prompt.md) — it applies the prime
+  directives (top anchor), the Grounding & uncertainty section (ADR-0047), worked good-vs-bad examples,
+  induced planning/persistence, and a Final reminders (bottom anchor) block, with a gap analysis vs the
+  live prompt and exact splice points for the unchanged catalogue/reporting sections. **Model
+  reconciliation:** this ADR was written referencing **GLM**; the live reviewer is now **MiniMax-M2**
+  (`adorsys-reviewer` = MiniMaxAI/MiniMax-M2, `contextWindow: 204800`). The decision is unchanged — every
+  technique here was deliberately chosen as **model-portable** (GPT-style, non-reasoning), so it
+  transfers; §5's "tune firm phrasing by eval, don't assume" now applies to MiniMax-M2, confirmed via the
+  ADR-0049 harness. Deploy remains the operator's call.
 
 ## Context and Problem Statement
 
