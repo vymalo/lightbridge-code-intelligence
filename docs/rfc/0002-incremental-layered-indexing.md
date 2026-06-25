@@ -3,16 +3,28 @@
 - **Status:** Proposed
 - **Author(s):** Stephane Segning Lambou
 - **Date:** 2026-06-20
-- **Resulting ADRs:** (filled in once accepted — anticipated: an ADR for the layer model + retrieval
-  scoping, and an ADR for the webhook-driven index lifecycle)
+- **Resulting ADRs:** [ADR-0050](../adr/0050-retrieval-pins-to-latest-indexed-snapshot.md) (Phase 0 —
+  reviews reuse the latest indexed snapshot), [ADR-0052](../adr/0052-index-snapshot-pruning.md)
+  (snapshot pruning / the index sweeper). Anticipated for the remaining phases: an ADR for the
+  `ref`/overlay layer model + retrieval scoping, and one for the webhook-driven overlay lifecycle.
+
+> **Update (2026-06-25):** **Phase 0 shipped** — reviews no longer re-index per PR; they reuse the
+> latest indexed snapshot ([#183](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/183)
+> index-on-push, [#188](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/188)
+> commit-scope `repo_has_index`, [#194](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/194)/ADR-0050).
+> This **reframes the remaining problem**: the *compute* waste is largely gone (warm repos don't
+> re-index), so **storage accumulation is now the dominant issue** — and **pruning ships next**
+> (ADR-0052, the *index sweeper*), ahead of the full overlay model below. See "Phasing".
 
 ## Summary
 
-Today every review task re-clones the repo and **re-indexes the whole tree** — full tree-sitter →
-pgvector embeddings *and* full Graphify → Neo4j — scoped by `(repository_id, commit_sha)`. With many
-PRs/branches on one repo this is wasteful twice over: it recomputes an expensive index that is ~99%
-identical to the default branch on every PR, and it accumulates a near-duplicate copy of the index
-per commit in both pgvector and Neo4j that nothing prunes.
+Indexing scopes everything by `(repository_id, commit_sha)`: full tree-sitter → pgvector embeddings
+*and* full Graphify → Neo4j. This was wasteful twice over — it recomputed an index ~99% identical to
+the default branch on every PR, **and** it accumulates a near-duplicate copy per commit in both stores
+that nothing prunes. **Phase 0 (shipped) fixed the first half**: a review now reuses the latest indexed
+snapshot instead of re-indexing (ADR-0050). The **second half remains** — every default-branch push
+still writes a full new snapshot and the old ones are never reaped, so a busy repo's storage grows
+without bound.
 
 This RFC proposes **layered indexing**: index the **default branch once** (the *base layer*), and for
 each PR index **only the changed files** as a thin **overlay layer** keyed by commit SHA on top of
@@ -101,14 +113,22 @@ The webhook handler maps events to queue tasks:
 
 ### Phasing (each step independently shippable)
 
-- **Phase 0 (dedup, quick win — ship first):** skip indexing when the `(repo, ref, head_sha)` is
-  already indexed; index the default branch on push so re-reviews of the same head are free. No schema
-  change beyond using the existing `commit_sha`. Cuts the most obvious waste immediately.
+- **Phase 0 (dedup) — ✅ SHIPPED.** Index the default branch on push (#183); skip per-PR re-indexing and
+  pin both the skip-check and retrieval to the latest indexed snapshot (#188, #194 / ADR-0050). No
+  schema change. Cut the compute waste immediately — the original motivation's biggest line item.
+- **Snapshot pruning (the *index sweeper*) — ✅ SHIPPED (ADR-0052).** Brought forward ahead of the
+  overlay model because, post-Phase 0, storage is the dominant remaining problem. A periodic dispatcher
+  sweep (modeled on the task reaper) keeps only the in-use snapshots per repo — the latest indexed
+  commit (what retrieval pins to) plus any commit an in-flight task pins, with a recency grace — and
+  reaps the rest from pgvector + Neo4j. This is the pre-overlay form of the layer GC: today the unit is
+  a whole `(repo, commit)` snapshot; once overlays land it generalizes to "keep base + live overlays".
 - **Phase 1 (layer key + lifecycle delete):** add the `ref` layer dimension; delete a PR's layer on
-  close/branch-delete via webhooks. Bounds storage.
+  close/branch-delete via webhooks. (The sweeper above already bounds storage; this makes deletion
+  prompt + per-PR.)
 - **Phase 2 (overlay indexing):** index only changed files for a PR; retrieval reads base ⊕ overlay.
-  The compute win.
-- **Phase 3 (sweeper):** periodic reconciliation for missed delete webhooks + disconnected repos.
+  The remaining *compute* win for multi-branch correctness (less urgent now Phase 0 removed per-PR reindex).
+- **Phase 3 (webhook-driven delete + GitHub-API reconciliation):** prompt overlay delete on PR
+  close/branch-delete + a reconciliation pass for missed events (the sweeper generalizes to this).
 
 ## Drawbacks
 

@@ -77,6 +77,18 @@ pub fn reap_outcome(outcome: &'static str) {
     counter!("lci_reaper_tasks_total", "outcome" => outcome).increment(1);
 }
 
+/// An index-sweeper cycle outcome (RFC-0002 / ADR-0052): `pruned` (a repo had stale snapshots reaped),
+/// `clean` (nothing to prune), or `error`. String literals → zero-alloc.
+pub fn index_prune_outcome(outcome: &'static str) {
+    counter!("lci_index_prune_total", "outcome" => outcome).increment(1);
+}
+
+/// Rows reaped by the index sweeper across one cycle: `code_chunks` rows + Neo4j `Symbol` nodes.
+pub fn index_prune_deleted(chunks: u64, graph_nodes: u64) {
+    counter!("lci_index_prune_chunks_deleted_total").increment(chunks);
+    counter!("lci_index_prune_graph_nodes_deleted_total").increment(graph_nodes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
