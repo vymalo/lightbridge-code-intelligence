@@ -27,8 +27,9 @@ use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
 use super::tools::{
-    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH,
-    GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING, VECTOR_SEMANTIC_SEARCH,
+    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, EMPTY_RETRIEVAL_RESULT,
+    FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING,
+    VECTOR_SEMANTIC_SEARCH,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::ReviewConfig;
@@ -1029,7 +1030,9 @@ fn base_url_host(base_url: &str) -> String {
 /// model used to flail against blindly — and otherwise returns the leading bytes (bounded).
 fn result_summary(result: &str) -> String {
     let trimmed = result.trim();
-    if trimmed == "[]" {
+    // `[]` (legacy) or the explicit empty-retrieval message both mean "nothing matched" — keep the log
+    // line terse so an empty retrieval reads the same in the stream regardless of substrate wording.
+    if trimmed == "[]" || trimmed == EMPTY_RETRIEVAL_RESULT {
         return "0 hits".to_string();
     }
     truncate_on_boundary(trimmed, 200).to_string()
@@ -2271,5 +2274,284 @@ mod tests {
             .filter(|r| r.url.path().ends_with("/review/inline"))
             .count();
         assert!(inline >= 1, "the finding was buffered before the overflow");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // ADR-0049 — Tier-1 reviewer-prompt golden cases (offline, deterministic, in CI).
+    //
+    // Each case freezes one observed failure mode from epic #177 as a behavioural assertion on the
+    // agent loop driven by a SCRIPTED model (no gateway, no tokens). These guard the machinery and the
+    // prompt's *structured* substrate; they do NOT judge real-model prose — that is Tier-2 (a manual,
+    // gated harness against the live model; see ADR-0049 §"Tier 2"). A change to the reviewer prompt
+    // (config.reviewSystemPrompt, or ADR-0047/0048) ships WITH a matching golden case here.
+    //
+    // Seed-case coverage map (ADR-0049 §"Tier 1"):
+    //   1. Empty-retrieval grounding (#187) ... golden_empty_retrieval_grounds_against_absence (here)
+    //                                           + dispatch_vector_search_empty_is_explicit_not_bare_
+    //                                           brackets (tools.rs) — the substrate freeze.
+    //   2. Out-of-scope finding (#3) .......... Tier-2 / CP-contract: scope is enforced server-side
+    //                                           (ADR-0022 write-back validation, ADR-0037 mediated
+    //                                           anchoring). A scripted model can't demonstrate the
+    //                                           PROMPT preventing the attempt — that needs the real
+    //                                           model (negative control), so it lives in Tier 2.
+    //   3. P2 recorded, not narrated (#2) ..... golden_p2_finding_is_recorded_not_dropped (here)
+    //   4. Convergence / no-discard (#4) ...... golden_turn_exhaustion_preserves_buffered_findings
+    //                                           (here, turn-budget path) + native_loop_exhausts_budget_
+    //                                           without_discarding (outcome) + native_loop_finalizes_on_
+    //                                           context_overflow (context-window path).
+    //   5. Anchoring (#5) ..................... inline-vs-bucket is decided server-side at finalize; the
+    //                                           agent-side substrate (no inline tool without a diff to
+    //                                           anchor to) is no_diff_omits_add_review_comment_from_
+    //                                           offered_tools.
+    //   6. Self-consistency (#6) .............. substrate (the prior-review block reaches the prompt) is
+    //                                           build_messages_injects_prior_review_context; that the
+    //                                           model reconciles rather than contradicts is Tier-2.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+
+    // Case 1 — the #187 setup: a PR review where the index returns nothing for the model's query. The
+    // model must NOT be handed a bare `[]` (which it read as "feature removed", then flagged a
+    // non-existent removal). Tier-1 freezes the SUBSTRATE: the tool result fed back is the explicit
+    // "empty ≠ absent" message (ADR-0047). Whether the live model then refrains from a removal finding
+    // is the Tier-2 quality check.
+    #[tokio::test]
+    async fn golden_empty_retrieval_grounds_against_absence() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                tool_call_reply(
+                    "lightbridge_vector_semantic_search",
+                    r#"{"query":"the removed validateToken helper"}"#,
+                ),
+                // The coverage gate bounces the first finish once (a.rs never engaged); the second goes
+                // through. Script repeats the last entry, so a single `finish` here suffices.
+                tool_call_reply("finish", r#"{"summary":"Reviewed; nothing actionable."}"#),
+            ],
+        )
+        .await;
+
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        // The index has nothing for this query.
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,2 +1,2 @@\n-fn old() {}\n+fn new() {}\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let mut transcript = Vec::new();
+        let outcome = run_native_agent(
+            &review,
+            "@lightbridge review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut transcript,
+        )
+        .await
+        .expect("clean finish");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "got: {outcome:?}"
+        );
+
+        let tool_results: Vec<&str> = transcript
+            .iter()
+            .filter(|e| e.role == "tool")
+            .filter_map(|e| e.content.as_deref())
+            .collect();
+        assert!(
+            tool_results
+                .iter()
+                .any(|c| c.contains("NOT evidence") && c.contains("read_file")),
+            "the empty retrieval is surfaced as an explicit non-absence signal, not a bare []: \
+             {tool_results:?}"
+        );
+        assert!(
+            !tool_results.iter().any(|c| c.trim() == "[]"),
+            "the model is never handed a bare empty array for an empty retrieval"
+        );
+    }
+
+    // Case 3 — a confirmed P2 must be RECORDED as an anchored finding (add_review_comment →
+    // /review/inline), not merely narrated in the finish summary. Tier-1 asserts the loop forwards a P2
+    // to the buffer exactly like any other priority — there is no client-side "blockers only" filter.
+    // (That the live model's summary doesn't reduce to "no P0/P1 findings" is the Tier-2 prose check.)
+    #[tokio::test]
+    async fn golden_p2_finding_is_recorded_not_dropped() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                tool_call_reply(
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":2,"title":"Unclear name","priority":"P2","category":"quality","body":"`x` is opaque; rename it"}"#,
+                ),
+                tool_call_reply("finish", r#"{"summary":"One quality nit (P2)."}"#),
+            ],
+        )
+        .await;
+        let cp = MockServer::start().await;
+        for ep in ["review/inline", "review/summary"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&cp)
+                .await;
+        }
+        let review = review_config(format!("{}/v1", chat.uri()));
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n a\n+let x = 1;\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let mut transcript = Vec::new();
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut transcript,
+        )
+        .await
+        .expect("clean finish");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "got: {outcome:?}"
+        );
+        let reqs = cp.received_requests().await.unwrap();
+        let inline = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/review/inline"))
+            .count();
+        assert_eq!(
+            inline, 1,
+            "the P2 was recorded as an anchored finding, not dropped or only narrated"
+        );
+        // And the loop counted it as a real recorded finding (the CP confirmed the buffer).
+        assert!(
+            transcript.iter().any(|e| e.role == "tool"
+                && e.content
+                    .as_deref()
+                    .map(|c| c.contains("recorded finding at a.rs:2"))
+                    .unwrap_or(false)),
+            "the P2 finding was buffered"
+        );
+    }
+
+    // Case 4 (turn-budget path) — a run that records a finding then WANDERS without calling finish must
+    // still (a) terminate within the turn budget as Exhausted and (b) preserve the already-buffered
+    // finding: exhaustion finalizes, it never discards (#137). Complements native_loop_finalizes_on_
+    // context_overflow (the context-window path) by exercising the TURN-budget path.
+    #[tokio::test]
+    async fn golden_turn_exhaustion_preserves_buffered_findings() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                // Turn 0: record a real finding (engages a.rs).
+                tool_call_reply(
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":2,"title":"nit","priority":"P2","category":"quality","body":"b"}"#,
+                ),
+                // Then wander forever (Script repeats the last entry): search, never finish.
+                tool_call_reply("lightbridge_vector_semantic_search", r#"{"query":"more"}"#),
+            ],
+        )
+        .await;
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&cp)
+            .await;
+        for ep in ["review/inline", "review/summary"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&cp)
+                .await;
+        }
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_turns = 4; // small budget; the model never finishes → Exhausted
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n a\n+b\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("exhaustion is a clean outcome");
+        assert!(
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "a wandering run terminates within budget: {outcome:?}"
+        );
+        let reqs = cp.received_requests().await.unwrap();
+        let inline = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/review/inline"))
+            .count();
+        assert!(
+            inline >= 1,
+            "the finding recorded before wandering was buffered, not discarded at exhaustion"
+        );
     }
 }

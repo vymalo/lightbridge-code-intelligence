@@ -1,6 +1,6 @@
 # ADR-0051: Per-model configuration blocks (primary / fallback / embeddings)
 
-- **Status:** Proposed
+- **Status:** Accepted — runner shipped ([#195](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/195)); chart + values restructure pending (step 2/3 below)
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
 
@@ -24,8 +24,16 @@ window and generation params, which is wrong if they ever differ. There is no pl
 
 ## Decision
 
-Introduce a **per-model config block**. Each model the runner uses carries its own configuration; the
-agent applies the config of the model it is actually using.
+Give each **secondary** model the runner uses its own configuration block. The primary's existing flat
+config *is* its per-model block, so it stays flat (this is also what keeps the rollout dual-read — see
+below); the **fallback** and **embeddings** models, which had no config of their own, get a nested
+`config` block. The agent applies the config of the model it is actually using.
+
+> **As-built note.** An earlier draft of this ADR nested the *primary* too (`llm.config.*`). The runner
+> that shipped (#195) deliberately kept the primary flat: nesting it would have broken the
+> `deny_unknown_fields` dual-read (a lagging runner image couldn't parse the new shape), and the
+> primary already had a complete flat block. So the per-model addition is scoped to the two models that
+> lacked config — fallback and embeddings.
 
 ### Shape (ai-helm-values)
 
@@ -34,33 +42,30 @@ agents:
   embeddings:
     baseUrl: …
     model: qwen3-embedding-8b
-    config:                       # embeddings-specific knobs (small; grows as needed)
-      requestTimeoutSecs: 60
   llm:
     baseUrl: …
     model: adorsys-reviewer
-    config:                       # full per-model config
-      contextWindow: 204800
-      temperature: 0.2
-      maxTokens: 8192
-      maxTurns: 150
-      maxBatchSize: 8
-      maxFilesRead: 30
-      maxSearches: 15
-      maxBatches: 6
-      maxDiffChars: 60000
-      requestTimeoutSecs: 180
-      maxRetries: 2
-      circuitBreakerThreshold: 3
-    fallback:
+config:
+  embeddings:
+    requestTimeoutSecs: 60        # NEW: embeddings-specific knobs (small; grows as needed)
+  model:                          # the PRIMARY's config — stays flat (its existing block)
+    contextWindow: 204800
+    temperature: 0.2
+    maxTokens: 8192
+    maxTurns: 150
+    maxDiffChars: 60000
+    requestTimeoutSecs: 180
+    maxRetries: 2
+    fallback:                     # NEW: the fallback model with its OWN per-request config
       model: adorsys-reviewer-pro
-      config:                     # the fallback's per-request knobs (its own timeout/params)
-        requestTimeoutSecs: 240
+      config:
+        requestTimeoutSecs: 240   # a slower -pro won't time out on the primary's budget
         temperature: 0.2
 ```
 
-The chart maps these into nested `agent.json` blocks (`review.model.config`, `review.fallback.config`,
-`embeddings.config`); the runner reads them into a `ModelConfig` struct.
+The chart maps the primary's `config.model.*` into flat `review.*` (unchanged), and the new blocks into
+nested `agent.json` blocks (`review.fallback{model,config}`, `embeddings.config`); the runner reads the
+fallback/embeddings tuning into `FallbackConfig` / `EmbeddingsConfig`.
 
 ### Which knobs follow which model
 
@@ -88,11 +93,14 @@ This keeps the structure per-model while preserving sane loop semantics.
 pinned image — so changing `agent.json`'s shape out from under a lagging runner image would fail every
 Job (the config-rollout gotcha). To deploy safely in any order:
 
-1. The new runner **dual-reads**: it accepts the new nested `model`/`fallback`/`config` blocks **and**
-   the existing flat fields (`context_window`, `temperature`, `fallback_model`, …). Nested wins; flat is
-   the fallback. So both the old and the new `agent.json` parse.
-2. Ship the runner first (dual-read), then the chart (emits nested), then the values restructure.
-3. A later cleanup PR removes the flat fields once nothing emits them.
+1. The primary's tuning stays **flat** on `review.*` (`context_window`, `temperature`, …) exactly as
+   before — so an old `agent.json` still parses. The new runner additionally accepts the nested
+   `review.fallback{model,config}` and `embeddings.config` blocks, **and** keeps reading the deprecated
+   flat `review.fallback_model` string (nested `fallback` wins when both are present). So both the old
+   and the new `agent.json` parse.
+2. Ship the runner first (dual-read — done, #195), then the chart (emits `review.fallback` +
+   `embeddings.config`), then the values restructure (sets the fallback's own timeout/params).
+3. A later cleanup PR drops the deprecated `fallback_model` once nothing emits it.
 
 ## Consequences
 
