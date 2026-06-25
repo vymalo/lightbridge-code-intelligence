@@ -1818,7 +1818,6 @@ mod tests {
         let mut review = review_config(format!("{}/v1", chat.uri()));
         review.fallback = Some(crate::bootstrap::config::FallbackConfig {
             model: "m-fallback".to_string(),
-            context_window: None,
             temperature: None,
             top_p: None,
             max_tokens: None,

@@ -54,31 +54,33 @@ agents:
       circuitBreakerThreshold: 3
     fallback:
       model: adorsys-reviewer-pro
-      config:                     # the fallback's OWN full config (own window, params, timeouts)
-        contextWindow: 204800
+      config:                     # the fallback's per-request knobs (its own timeout/params)
         requestTimeoutSecs: 240
+        temperature: 0.2
 ```
 
 The chart maps these into nested `agent.json` blocks (`review.model.config`, `review.fallback.config`,
 `embeddings.config`); the runner reads them into a `ModelConfig` struct.
 
-### Which knobs follow which model (the one wrinkle)
+### Which knobs follow which model
 
-Per the decision to make **everything per-model**, every knob lives in each model's `config`. But the
-review loop is a *single sequence of turns* that mostly runs on the primary and may fail over to the
-fallback for an individual turn — so two classes of knob behave differently at runtime:
+The review loop is a *single sequence of turns* that mostly runs on the primary and may fail over to the
+fallback for an individual turn, so knobs fall into two classes:
 
-- **Per-request knobs follow the active model.** `contextWindow` (the trim/wind-down threshold),
-  `temperature` / `topP` / `maxTokens`, and `requestTimeoutSecs` / `maxRetries` are applied for the
-  model issuing that turn's request — so a turn that fails over to the fallback uses the fallback's
-  window and params.
-- **Loop-cumulative knobs come from the primary.** `maxTurns`, the read budgets
-  (`maxFilesRead`/`maxSearches`/`maxBatches`/`maxBatchSize`), `maxDiffChars`, and the
-  `circuitBreakerThreshold` describe the *run*, which is one sequence — they are read from the
-  **primary** model's config. The fallback may still carry these (uniform shape), but they are not used
-  to redefine the run mid-flight (a failover must not, e.g., reset the turn ceiling).
+- **Per-request knobs follow the active model.** `temperature` / `topP` / `maxTokens` and
+  `requestTimeoutSecs` / `maxRetries` are applied for the model issuing that turn's request — so a turn
+  that fails over to the fallback runs under the fallback's generation params + timeout + retry budget.
+  These are the fallback's `config`.
+- **Run-level knobs come from the primary.** The context-budget **`contextWindow`** (the trim/wind-down
+  threshold), `maxTurns`, the read budgets (`maxFilesRead`/`maxSearches`/`maxBatches`/`maxBatchSize`),
+  `maxDiffChars`, and `circuitBreakerThreshold` describe the *run*, which is one sequence — so they are
+  the **primary's**. In particular `contextWindow` is **not** a per-fallback knob: the trim happens
+  *before* a turn is sent, when the loop can't yet know it will fail over, so it always uses the
+  primary's window. A fallback with a smaller window is backstopped by the ADR-0045 tier-1
+  overflow-finalize (never a lost finding), not a separate per-fallback trim. So the fallback's `config`
+  carries only the per-request knobs above — not `contextWindow`, not the loop budgets.
 
-This keeps the config uniform (a full block per model) while preserving sane loop semantics.
+This keeps the structure per-model while preserving sane loop semantics.
 
 ### Backward-compatible rollout (the `deny_unknown_fields` trap)
 
@@ -94,9 +96,10 @@ Job (the config-rollout gotcha). To deploy safely in any order:
 
 ## Consequences
 
-- **Good:** each model is configured independently — the fallback gets its own window/timeouts (a slower
-  `-pro` can have a longer timeout), embeddings gets its own block, and `contextWindow` matches each
-  model's real window (no more early trims). Uniform, discoverable structure.
+- **Good:** each model is configured independently — the fallback gets its own generation params + a
+  longer timeout (a slower `-pro` won't time out on the primary's budget), embeddings gets its own
+  block, and the primary's `contextWindow` is set to the model's real window (no more early trims).
+  Discoverable per-model structure.
 - **Good:** the dual-read migration avoids the `deny_unknown_fields` deploy hazard — no lockstep needed.
 - **Cost:** more config surface and a non-trivial refactor across three repos (runner config + loop,
   chart mapping, values). The primary/fallback `ModelConfig` is a shared struct; embeddings is a thin

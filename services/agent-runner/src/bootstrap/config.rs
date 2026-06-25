@@ -94,8 +94,6 @@ pub struct EmbeddingsTuningFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelTuningFile {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
-    pub context_window: Option<usize>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
     pub temperature: Option<f64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
@@ -322,10 +320,13 @@ pub struct ReviewConfig {
 /// effective value when the operator didn't set it, so a fallback configured with only a model id
 /// behaves exactly as the old `fallback_model` did (inherit the primary), while an operator can now
 /// override the window / params / timeout per the `-pro` model's real characteristics.
+/// The trim/context-budget window is deliberately NOT here: it's a pre-turn, run-level decision keyed
+/// on the primary's `context_window` (the loop can't know a turn will fail over before it sends). A
+/// fallback with a smaller window is backstopped by the ADR-0045 tier-1 overflow-finalize, not a
+/// per-fallback trim. So the fallback's per-request knobs are its generation params + timeout/retries.
 #[derive(Debug, Clone)]
 pub struct FallbackConfig {
     pub model: String,
-    pub context_window: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
@@ -441,9 +442,6 @@ impl ReviewConfig {
                 .filter(|s| !s.is_empty())
                 .map(|model| FallbackConfig {
                     model,
-                    context_window: parse_env_u64("LLM_CONTEXT_WINDOW")
-                        .map(|n| n as usize)
-                        .filter(|&n| n > 0),
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
@@ -486,7 +484,6 @@ impl ReviewConfig {
             .unwrap_or(DEFAULT_MAX_RETRIES);
         let fallback = resolve_fallback(
             r,
-            context_window,
             temperature,
             top_p,
             max_tokens,
@@ -548,10 +545,8 @@ impl ReviewConfig {
 /// to the primary's effective value (`p_*`). Prefers the nested `fallback { model, config }`; falls
 /// back to the deprecated `fallback_model` string (then `LLM_FALLBACK_MODEL`), which inherits all of
 /// the primary's tuning — i.e. exactly the pre-0051 behaviour. `None` = no failover.
-#[allow(clippy::too_many_arguments)]
 fn resolve_fallback(
     r: &ReviewFile,
-    p_context_window: Option<usize>,
     p_temperature: Option<f64>,
     p_top_p: Option<f64>,
     p_max_tokens: Option<i64>,
@@ -562,10 +557,6 @@ fn resolve_fallback(
         let c = fb.config.as_ref();
         return Some(FallbackConfig {
             model: fb.model.trim().to_string(),
-            context_window: c
-                .and_then(|c| c.context_window)
-                .filter(|&n| n > 0)
-                .or(p_context_window),
             temperature: c.and_then(|c| c.temperature).or(p_temperature),
             top_p: c.and_then(|c| c.top_p).or(p_top_p),
             max_tokens: c.and_then(|c| c.max_tokens).or(p_max_tokens),
@@ -593,7 +584,6 @@ fn resolve_fallback(
         })?;
     Some(FallbackConfig {
         model,
-        context_window: p_context_window,
         temperature: p_temperature,
         top_p: p_top_p,
         max_tokens: p_max_tokens,
@@ -737,7 +727,7 @@ mod tests {
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let prompt_path = prompt.to_string_lossy().into_owned();
 
-        // Nested fallback: overrides context_window + timeout, inherits temperature from primary.
+        // Nested fallback: overrides max_tokens + timeout, inherits temperature from primary.
         let nested = FileConfig {
             embeddings: None,
             review: Some(ReviewFile {
@@ -751,8 +741,8 @@ mod tests {
                 fallback: Some(FallbackFile {
                     model: "fb".into(),
                     config: Some(ModelTuningFile {
-                        context_window: Some(200_000),
                         request_timeout_secs: Some(240),
+                        max_tokens: Some(4096),
                         ..Default::default()
                     }),
                 }),
@@ -765,7 +755,7 @@ mod tests {
             .fallback
             .expect("fallback present");
         assert_eq!(fb.model, "fb");
-        assert_eq!(fb.context_window, Some(200_000), "overridden");
+        assert_eq!(fb.max_tokens, Some(4096), "overridden");
         assert_eq!(fb.request_timeout_secs, 240, "overridden");
         assert_eq!(fb.temperature, Some(0.5), "inherited from primary");
 
@@ -789,11 +779,6 @@ mod tests {
             .fallback
             .expect("legacy fallback present");
         assert_eq!(fb2.model, "old-fb");
-        assert_eq!(
-            fb2.context_window,
-            Some(100_000),
-            "legacy inherits primary window"
-        );
         assert_eq!(
             fb2.temperature,
             Some(0.5),
