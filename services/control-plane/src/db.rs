@@ -962,9 +962,13 @@ pub async fn latest_indexed_commit(
     pool: &PgPool,
     repository_id: i64,
 ) -> Result<Option<String>, sqlx::Error> {
+    // `id DESC` tie-breaks when two snapshots share a `created_at` (coarse clock, or rows written in one
+    // transaction where `now()` is constant) — `id` is BIGSERIAL, so the most-recently-inserted snapshot
+    // wins deterministically. Backed by the `(repository_id, created_at DESC, id DESC)` index (migration
+    // 0018) so this is an index lookup, not a scan — it runs on every search/graph query via `task_scope`.
     sqlx::query_scalar(
         "SELECT commit_sha FROM code_chunks WHERE repository_id = $1 \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(repository_id)
     .fetch_optional(pool)
@@ -2776,7 +2780,9 @@ mod tests {
         // Never indexed → None.
         assert_eq!(latest_indexed_commit(&pool, repo_id).await.unwrap(), None);
 
-        // Index an older snapshot, then a newer one (later created_at).
+        // Index an older snapshot, then a newer one. Determinism does NOT rely on the wall clock: under
+        // `#[sqlx::test]` `now()` can be identical for both inserts, so the `id DESC` tie-break (the
+        // second insert has the higher BIGSERIAL id) is what guarantees "newer-sha" wins.
         upsert_code_chunks(&pool, repo_id, "base-sha", &[chunk_at("a.rs", 1, 0)])
             .await
             .unwrap();
