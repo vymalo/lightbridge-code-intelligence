@@ -1016,10 +1016,11 @@ pub async fn repos_with_stale_snapshots(pool: &PgPool) -> Result<Vec<i64>, sqlx:
     .await
 }
 
-/// Commits that a still-running task pins, so the sweeper never prunes a snapshot out from under an
-/// in-flight run. Two cases: an INDEX task mid-write (its `head_sha` snapshot is being inserted now),
-/// and any non-terminal task. Terminal statuses (the run is done) are excluded; everything else is
-/// "in use". `head_sha IS NOT NULL` since a null can't match a `commit_sha`.
+/// Commits a still-running task pins, so the sweeper never prunes a snapshot out from under an
+/// in-flight run. Non-terminal tasks that carry a `head_sha` (e.g. a review pinned to a PR head);
+/// terminal statuses are excluded. `head_sha IS NOT NULL` since a null can't match a `commit_sha`.
+/// NOTE: an `index` task carries a NULL `head_sha` (see [`create_index_task`]) so it is NOT covered
+/// here — that case is handled by [`has_active_index_task`] (the sweeper skips a repo mid-index).
 pub async fn in_use_commits(pool: &PgPool, repository_id: i64) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT DISTINCT head_sha FROM tasks \
@@ -1028,6 +1029,23 @@ pub async fn in_use_commits(pool: &PgPool, repository_id: i64) -> Result<Vec<Str
     )
     .bind(repository_id)
     .fetch_all(pool)
+    .await
+}
+
+/// Is an `index` task still in flight for this repo? An index task is the only thing that *writes* a
+/// new snapshot, and it carries a NULL `head_sha` (see [`create_index_task`]) so [`in_use_commits`]
+/// can't protect the commit it is mid-writing — and the Neo4j graph has NO recency grace (unlike
+/// `code_chunks`). So the sweeper skips a repo entirely while an index runs and defers the prune one
+/// cycle; deferring GC is harmless. Active = any non-terminal status.
+pub async fn has_active_index_task(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM tasks \
+           WHERE repository_id = $1 AND command_text = 'index' \
+             AND status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled'))",
+    )
+    .bind(repository_id)
+    .fetch_one(pool)
     .await
 }
 
@@ -2927,5 +2945,33 @@ mod tests {
 
         // Safety: an empty keep-set never deletes (guards against wiping a live index).
         assert_eq!(prune_code_chunks(&pool, repo_id, &[]).await.unwrap(), 0);
+    }
+
+    /// The sweeper gates a whole repo while an `index` task runs (ADR-0052): an index task carries a
+    /// NULL `head_sha`, so it never appears in `in_use_commits` — `has_active_index_task` is what
+    /// protects the snapshot it's mid-writing (and the Neo4j graph, which has no recency grace).
+    #[sqlx::test]
+    async fn has_active_index_task_gates_a_repo_mid_index(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        // A review task in flight is NOT an index task → gate stays open, and the index commit it
+        // would write isn't covered by in_use_commits.
+        create_task(&pool, &pr_task(repo_id, "review-head"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_active_index_task(&pool, repo_id).await.unwrap());
+
+        // A queued index task (NULL head_sha) → gate closes; in_use_commits still doesn't list it.
+        create_index_task(&pool, repo_id, 99)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(has_active_index_task(&pool, repo_id).await.unwrap());
+        assert_eq!(
+            in_use_commits(&pool, repo_id).await.unwrap(),
+            vec!["review-head".to_string()],
+            "index task's (NULL) head_sha is not in the keep-set — the gate is its only protection"
+        );
     }
 }

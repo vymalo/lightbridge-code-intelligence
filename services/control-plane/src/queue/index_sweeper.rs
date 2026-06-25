@@ -46,6 +46,16 @@ async fn sweep_repo(
     neo4j: Option<&neo4rs::Graph>,
     repository_id: i64,
 ) -> anyhow::Result<()> {
+    // Never prune a repo mid-index: an `index` task is the only thing WRITING a new snapshot, it
+    // carries a NULL head_sha (so `in_use_commits` can't protect it), and the Neo4j graph has no
+    // recency grace. Defer to the next cycle once it completes — deferring GC is harmless.
+    if db::has_active_index_task(pool, repository_id).await? {
+        tracing::debug!(
+            repository_id,
+            "index sweeper: active index task; skipping prune this cycle"
+        );
+        return Ok(());
+    }
     let mut keep = db::in_use_commits(pool, repository_id).await?;
     if let Some(latest) = db::latest_indexed_commit(pool, repository_id).await? {
         if !keep.contains(&latest) {

@@ -120,10 +120,17 @@ pub async fn run<L: TaskLauncher>(
                 crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
             }
             _ = prune_tick.tick() => {
-                // Reap stale `(repo, commit)` index snapshots from pgvector + Neo4j (ADR-0052).
-                if let Err(error) = crate::queue::index_sweeper::sweep_once(&pool, neo4j.as_deref()).await {
-                    tracing::error!(%error, "index sweeper cycle failed");
-                }
+                // Reap stale `(repo, commit)` index snapshots from pgvector + Neo4j (ADR-0052). Run it
+                // OFF the loop so a large prune never adds head-of-line latency to task dispatch — the
+                // sweep is idempotent + keep-set-guarded, so an occasional overlap (a sweep outliving
+                // `prune_interval`) is harmless. `PgPool` + the `Arc<Graph>` are cheap to clone.
+                let pool = pool.clone();
+                let neo4j = neo4j.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = crate::queue::index_sweeper::sweep_once(&pool, neo4j.as_deref()).await {
+                        tracing::error!(%error, "index sweeper cycle failed");
+                    }
+                });
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
             // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so
