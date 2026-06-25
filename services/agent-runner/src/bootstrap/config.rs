@@ -73,6 +73,50 @@ pub struct EmbeddingsFile {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Per-model tuning block (ADR-0051). Embeddings have few knobs today; `config` keeps the shape
+    /// uniform with the review models and is where future ones land. Unset = defaults.
+    #[serde(default)]
+    pub config: Option<EmbeddingsTuningFile>,
+}
+
+/// Per-model tuning for the embeddings model (ADR-0051). Numeric-string tolerant for `{env:}` values.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingsTuningFile {
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub request_timeout_secs: Option<u64>,
+}
+
+/// One review model's tuning (ADR-0051): the per-request knobs that follow whichever model issues a
+/// turn. Used for both the primary (`review.config`) and the fallback (`review.fallback.config`).
+/// All optional + numeric-string tolerant; unset inherits the runner default (primary) or the
+/// primary's effective value (fallback).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelTuningFile {
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub context_window: Option<usize>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    pub temperature: Option<f64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    pub top_p: Option<f64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    pub max_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub max_retries: Option<u64>,
+}
+
+/// The fallback review model (ADR-0051): its own model id + tuning, used on per-turn failover
+/// (ADR-0039). Replaces the bare `fallback_model` string so the fallback carries its OWN context
+/// window, generation params, and timeout instead of silently inheriting the primary's.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FallbackFile {
+    pub model: String,
+    #[serde(default)]
+    pub config: Option<ModelTuningFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -121,9 +165,14 @@ pub struct ReviewFile {
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub context_window: Option<usize>,
     /// Optional secondary model to fail over to when the primary exhausts its retries on a turn
-    /// (ADR-0039). Unset = single-model behaviour (unchanged).
+    /// (ADR-0039). **Deprecated** by `fallback` below (ADR-0051) — kept for dual-read so an older
+    /// agent.json still parses; ignored when `fallback` is present.
     #[serde(default)]
     pub fallback_model: Option<String>,
+    /// The fallback model with its OWN tuning (ADR-0051): own context window, generation params, and
+    /// timeout. Takes precedence over `fallback_model`. Unset (and no `fallback_model`) = no failover.
+    #[serde(default)]
+    pub fallback: Option<FallbackFile>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -173,6 +222,9 @@ pub struct EmbeddingsConfig {
     /// Model identifier, e.g. `text-embedding-3-small`. The schema expects 1536-dim vectors
     /// matching that model; choosing a different-dimension model requires a migration (ADR-0018).
     pub model: String,
+    /// Per-request timeout (seconds) for one embeddings call (ADR-0051). From `embeddings.config
+    /// .request_timeout_secs` / `EMBEDDINGS_REQUEST_TIMEOUT_SECS`, else [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+    pub request_timeout_secs: u64,
 }
 
 impl EmbeddingsConfig {
@@ -181,17 +233,26 @@ impl EmbeddingsConfig {
             base_url: require("EMBEDDINGS_BASE_URL")?,
             api_key: require("EMBEDDINGS_API_KEY")?,
             model: require("EMBEDDINGS_MODEL")?,
+            request_timeout_secs: parse_env_u64("EMBEDDINGS_REQUEST_TIMEOUT_SECS")
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
-    /// Resolve from the file config when it carries an `embeddings` block, else from env. All three
-    /// fields are required either way (no default model — a misconfig fails loud).
+    /// Resolve from the file config when it carries an `embeddings` block, else from env. The three
+    /// connection fields are required either way (no default model — a misconfig fails loud); the
+    /// `config` block is optional.
     pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Self> {
         match file.and_then(|f| f.embeddings.as_ref()) {
             Some(e) => Ok(Self {
                 base_url: require_field("embeddings", "base_url", &e.base_url)?,
                 api_key: require_field("embeddings", "api_key", &e.api_key)?,
                 model: require_field("embeddings", "model", &e.model)?,
+                request_timeout_secs: e
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.request_timeout_secs)
+                    .or_else(|| parse_env_u64("EMBEDDINGS_REQUEST_TIMEOUT_SECS"))
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             }),
             None => Self::from_env(),
         }
@@ -247,9 +308,29 @@ pub struct ReviewConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
-    /// Resilience policy for the LLM transport: timeout, retry/backoff, circuit breaker, failover
-    /// (ADR-0039). Always present (defaults applied at resolve time).
+    /// Resilience policy for the LLM transport: timeout, retry/backoff, circuit breaker (ADR-0039).
+    /// Always present (defaults applied at resolve time). These are the **primary** model's per-request
+    /// knobs + the loop-level breaker.
     pub resilience: ResilienceConfig,
+    /// The fallback review model with its OWN per-request config (ADR-0051): own context window,
+    /// generation params, timeout, and retries, applied on a per-turn failover (ADR-0039). `None` =
+    /// single-model behaviour (no failover). Loop-cumulative budgets stay the primary's.
+    pub fallback: Option<FallbackConfig>,
+}
+
+/// The resolved fallback review model (ADR-0051). Each tuning field defaults to the **primary's**
+/// effective value when the operator didn't set it, so a fallback configured with only a model id
+/// behaves exactly as the old `fallback_model` did (inherit the primary), while an operator can now
+/// override the window / params / timeout per the `-pro` model's real characteristics.
+#[derive(Debug, Clone)]
+pub struct FallbackConfig {
+    pub model: String,
+    pub context_window: Option<usize>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub request_timeout_secs: u64,
+    pub max_retries: u32,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -264,8 +345,6 @@ pub struct ResilienceConfig {
     pub max_retries: u32,
     /// Consecutive turn-failures before the per-run circuit breaker trips and the run fails fast.
     pub circuit_breaker_threshold: u32,
-    /// Optional secondary model to fail over to once the primary exhausts its retries on a turn.
-    pub fallback_model: Option<String>,
 }
 
 impl Default for ResilienceConfig {
@@ -274,7 +353,6 @@ impl Default for ResilienceConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             max_retries: DEFAULT_MAX_RETRIES,
             circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
-            fallback_model: None,
         }
     }
 }
@@ -292,10 +370,6 @@ impl ResilienceConfig {
             circuit_breaker_threshold: parse_env_u64("LLM_CIRCUIT_BREAKER_THRESHOLD")
                 .map(|n| n as u32)
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
-            fallback_model: std::env::var("LLM_FALLBACK_MODEL")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -359,6 +433,26 @@ impl ReviewConfig {
             top_p: None,
             max_tokens: None,
             resilience: ResilienceConfig::from_env(),
+            // Env path: `LLM_FALLBACK_MODEL` (a bare id) inherits the primary's env tuning — there are
+            // no per-fallback env vars. The file path (resolve) is where per-model tuning lives.
+            fallback: std::env::var("LLM_FALLBACK_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|model| FallbackConfig {
+                    model,
+                    context_window: parse_env_u64("LLM_CONTEXT_WINDOW")
+                        .map(|n| n as usize)
+                        .filter(|&n| n > 0),
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    request_timeout_secs: parse_env_u64("LLM_REQUEST_TIMEOUT_SECS")
+                        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+                    max_retries: parse_env_u64("LLM_MAX_RETRIES")
+                        .map(|n| n as u32)
+                        .unwrap_or(DEFAULT_MAX_RETRIES),
+                }),
         }))
     }
 
@@ -372,6 +466,33 @@ impl ReviewConfig {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
+        // Primary effective values (file wins, else env, else default). Computed as locals so the
+        // fallback can default each of its per-request knobs to the primary's (ADR-0051).
+        let context_window = r
+            .context_window
+            .or_else(|| parse_env_u64("LLM_CONTEXT_WINDOW").map(|n| n as usize))
+            .filter(|&n| n > 0);
+        let temperature = r.temperature;
+        let top_p = r.top_p;
+        let max_tokens = r.max_tokens;
+        let request_timeout_secs = r
+            .request_timeout_secs
+            .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+        let max_retries = r
+            .max_retries
+            .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
+            .map(|n| n as u32)
+            .unwrap_or(DEFAULT_MAX_RETRIES);
+        let fallback = resolve_fallback(
+            r,
+            context_window,
+            temperature,
+            top_p,
+            max_tokens,
+            request_timeout_secs,
+            max_retries,
+        );
         Ok(Some(Self {
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
@@ -405,45 +526,80 @@ impl ReviewConfig {
                 .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_BATCHES)
                 .max(1),
-            context_window: r
-                .context_window
-                .or_else(|| parse_env_u64("LLM_CONTEXT_WINDOW").map(|n| n as usize))
-                .filter(|&n| n > 0),
-            temperature: r.temperature,
-            top_p: r.top_p,
-            max_tokens: r.max_tokens,
-            // File config wins when set, else the env (so an operator can still tune via env even with
-            // a ConfigMap mounted), else the safe default.
+            context_window,
+            temperature,
+            top_p,
+            max_tokens,
             resilience: ResilienceConfig {
-                request_timeout_secs: r
-                    .request_timeout_secs
-                    .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
-                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-                max_retries: r
-                    .max_retries
-                    .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
-                    .map(|n| n as u32)
-                    .unwrap_or(DEFAULT_MAX_RETRIES),
+                request_timeout_secs,
+                max_retries,
                 circuit_breaker_threshold: r
                     .circuit_breaker_threshold
                     .or_else(|| parse_env_u64("LLM_CIRCUIT_BREAKER_THRESHOLD"))
                     .map(|n| n as u32)
                     .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
-                fallback_model: r
-                    .fallback_model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        std::env::var("LLM_FALLBACK_MODEL")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    }),
             },
+            fallback,
         }))
     }
+}
+
+/// Resolve the fallback model (ADR-0051) from a `review` file block, defaulting each per-request knob
+/// to the primary's effective value (`p_*`). Prefers the nested `fallback { model, config }`; falls
+/// back to the deprecated `fallback_model` string (then `LLM_FALLBACK_MODEL`), which inherits all of
+/// the primary's tuning — i.e. exactly the pre-0051 behaviour. `None` = no failover.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fallback(
+    r: &ReviewFile,
+    p_context_window: Option<usize>,
+    p_temperature: Option<f64>,
+    p_top_p: Option<f64>,
+    p_max_tokens: Option<i64>,
+    p_request_timeout_secs: u64,
+    p_max_retries: u32,
+) -> Option<FallbackConfig> {
+    if let Some(fb) = r.fallback.as_ref().filter(|fb| !fb.model.trim().is_empty()) {
+        let c = fb.config.as_ref();
+        return Some(FallbackConfig {
+            model: fb.model.trim().to_string(),
+            context_window: c
+                .and_then(|c| c.context_window)
+                .filter(|&n| n > 0)
+                .or(p_context_window),
+            temperature: c.and_then(|c| c.temperature).or(p_temperature),
+            top_p: c.and_then(|c| c.top_p).or(p_top_p),
+            max_tokens: c.and_then(|c| c.max_tokens).or(p_max_tokens),
+            request_timeout_secs: c
+                .and_then(|c| c.request_timeout_secs)
+                .unwrap_or(p_request_timeout_secs),
+            max_retries: c
+                .and_then(|c| c.max_retries)
+                .map(|n| n as u32)
+                .unwrap_or(p_max_retries),
+        });
+    }
+    // Deprecated path: a bare `fallback_model` string (or env) inherits all the primary's tuning.
+    let model = r
+        .fallback_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("LLM_FALLBACK_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })?;
+    Some(FallbackConfig {
+        model,
+        context_window: p_context_window,
+        temperature: p_temperature,
+        top_p: p_top_p,
+        max_tokens: p_max_tokens,
+        request_timeout_secs: p_request_timeout_secs,
+        max_retries: p_max_retries,
+    })
 }
 
 /// Load the **required** reviewer system prompt (ADR-0037): the `system_prompt_file` template when a
@@ -512,6 +668,7 @@ mod tests {
                 max_batches: None,
                 context_window: None,
                 fallback_model: None,
+                fallback: None,
             }),
         };
         let err =
@@ -554,6 +711,7 @@ mod tests {
                 // window of zero that would force wind-down on turn 0 (ADR-0045).
                 context_window: Some(0),
                 fallback_model: None,
+                fallback: None,
             }),
         };
         let cfg = ReviewConfig::resolve(Some(&file))
@@ -568,6 +726,80 @@ mod tests {
         assert_eq!(cfg.max_files_read, 1, "max_files_read clamped");
         assert_eq!(cfg.max_searches, 1, "max_searches clamped");
         assert_eq!(cfg.max_batches, 1, "max_batches clamped");
+        std::fs::remove_file(&prompt).ok();
+    }
+
+    // ADR-0051: the fallback gets its OWN per-request config — overrides what it sets, inherits the
+    // primary's effective value for what it doesn't; and a legacy bare `fallback_model` inherits all.
+    #[test]
+    fn fallback_inherits_primary_then_overrides() {
+        let prompt = std::env::temp_dir().join(format!("lci-fb-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let prompt_path = prompt.to_string_lossy().into_owned();
+
+        // Nested fallback: overrides context_window + timeout, inherits temperature from primary.
+        let nested = FileConfig {
+            embeddings: None,
+            review: Some(ReviewFile {
+                base_url: "https://gw/v1".into(),
+                api_key: "k".into(),
+                model: "primary".into(),
+                system_prompt_file: Some(prompt_path.clone()),
+                context_window: Some(100_000),
+                temperature: Some(0.5),
+                request_timeout_secs: Some(180),
+                fallback: Some(FallbackFile {
+                    model: "fb".into(),
+                    config: Some(ModelTuningFile {
+                        context_window: Some(200_000),
+                        request_timeout_secs: Some(240),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+        };
+        let fb = ReviewConfig::resolve(Some(&nested))
+            .unwrap()
+            .unwrap()
+            .fallback
+            .expect("fallback present");
+        assert_eq!(fb.model, "fb");
+        assert_eq!(fb.context_window, Some(200_000), "overridden");
+        assert_eq!(fb.request_timeout_secs, 240, "overridden");
+        assert_eq!(fb.temperature, Some(0.5), "inherited from primary");
+
+        // Legacy bare `fallback_model` (dual-read) inherits ALL the primary's tuning.
+        let legacy = FileConfig {
+            embeddings: None,
+            review: Some(ReviewFile {
+                base_url: "https://gw/v1".into(),
+                api_key: "k".into(),
+                model: "primary".into(),
+                system_prompt_file: Some(prompt_path),
+                context_window: Some(100_000),
+                temperature: Some(0.5),
+                fallback_model: Some("old-fb".into()),
+                ..Default::default()
+            }),
+        };
+        let fb2 = ReviewConfig::resolve(Some(&legacy))
+            .unwrap()
+            .unwrap()
+            .fallback
+            .expect("legacy fallback present");
+        assert_eq!(fb2.model, "old-fb");
+        assert_eq!(
+            fb2.context_window,
+            Some(100_000),
+            "legacy inherits primary window"
+        );
+        assert_eq!(
+            fb2.temperature,
+            Some(0.5),
+            "legacy inherits primary temperature"
+        );
+
         std::fs::remove_file(&prompt).ok();
     }
 }
