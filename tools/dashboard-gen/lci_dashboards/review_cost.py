@@ -28,7 +28,15 @@ regenerated `deploy/observability/dashboards/review-cost.json` (CI diffs it).
 
 from __future__ import annotations
 
-from grafana_foundation_sdk.builders import bargauge, dashboard, stat, table, timeseries
+from grafana_foundation_sdk.builders import (
+    bargauge,
+    dashboard,
+    heatmap,
+    stat,
+    table,
+    timeseries,
+)
+from grafana_foundation_sdk.models.heatmap import HeatmapColorMode, HeatmapColorScale
 
 from .common import POSTGRES, Layout, sql
 
@@ -236,6 +244,40 @@ def dashboard_builder() -> dashboard.Dashboard:
         .grid_pos(layout.place(12, 8))
     )
 
+    # --- Cost-per-review distribution over time ---
+    # One (time, cost) point per review; `calculate(True)` lets Grafana bucket the
+    # cost on the Y axis and count reviews per (day, cost-bucket) cell — so the
+    # SPREAD and outliers show up (e.g. most reviews cheap, a band of expensive
+    # ones), which the daily-total line and the p50/p95 table can't convey.
+    # Exponential color so rare expensive-review cells stay visible.
+    cost_heatmap = (
+        heatmap.Panel()
+        .title("Per-review cost distribution over time")
+        .datasource(POSTGRES)
+        .calculate(True)
+        .color(
+            heatmap.HeatmapColorOptions()
+            .mode(HeatmapColorMode.SCHEME)
+            .scheme("Oranges")
+            .scale(HeatmapColorScale.EXPONENTIAL)
+            .steps(64)
+        )
+        .y_axis(heatmap.YAxisConfig().unit("currencyUSD"))
+        .with_target(
+            sql(
+                f"WITH {_PRICED_CTE}, per_task AS ("
+                "  SELECT t.id, t.created_at, sum(p.cost_usd) AS cost "
+                "  FROM priced p JOIN tasks t ON t.id = p.task_id "
+                "  LEFT JOIN repositories r ON r.id = t.repository_id "
+                f"  WHERE $__timeFilter(t.created_at) AND {_F_REPO} AND {_F_KIND} AND {_F_MODEL} "
+                "  GROUP BY t.id, t.created_at"
+                ") SELECT created_at AS \"time\", cost FROM per_task ORDER BY 1",
+                fmt="time_series",
+            )
+        )
+        .grid_pos(layout.place(24, 8))
+    )
+
     # --- Row 4: the per-review-task table (one row per review × prices) ---
     per_task_table = (
         table.Panel()
@@ -284,5 +326,6 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_panel(avg_by_model)
         .with_panel(cost_per_day)
         .with_panel(cost_per_day_by_model)
+        .with_panel(cost_heatmap)
         .with_panel(per_task_table)
     )
