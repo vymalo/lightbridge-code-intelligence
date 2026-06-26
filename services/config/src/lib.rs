@@ -171,6 +171,37 @@ pub mod de {
             }
         }
     }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+
+    /// Like [`opt_i64`] but for boolean flags (e.g. `review.stream`): accepts a JSON bool or a string
+    /// (`{env:…}` substitution always yields strings), so `"true"`/`"1"`/`"yes"`/`"on"` → `true` and
+    /// `"false"`/`"0"`/`"no"`/`"off"` → `false` (case-insensitive). Empty / null → `None`; any other
+    /// string is an error rather than a silent default.
+    pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        match Option::<BoolOrStr>::deserialize(d)? {
+            None => Ok(None),
+            Some(BoolOrStr::Bool(b)) => Ok(Some(b)),
+            Some(BoolOrStr::Str(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => Ok(Some(true)),
+                    "false" | "0" | "no" | "off" => Ok(Some(false)),
+                    other => Err(D::Error::custom(format!(
+                        "invalid boolean {other:?} (expected true/false/1/0/yes/no/on/off)"
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +310,52 @@ mod tests {
         let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
         assert_eq!(cfg.temperature, Some(0.2), "numeric string coerces to f64");
         assert_eq!(cfg.top_p, Some(0.9), "literal float still works");
+    }
+
+    #[test]
+    fn bool_fields_accept_env_substituted_strings() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Cfg {
+            #[serde(default, deserialize_with = "de::opt_bool")]
+            stream: Option<bool>,
+            #[serde(default, deserialize_with = "de::opt_bool")]
+            literal: Option<bool>,
+            #[serde(default, deserialize_with = "de::opt_bool")]
+            unset: Option<bool>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // `stream` is an env-substituted string ("true"); `literal` is a JSON bool; `unset` resolves to
+        // an empty string and must become None (not an error) — the same shape as an omitted `{env:}`.
+        std::fs::write(
+            &path,
+            r#"{ "stream": "{env:LLM_STREAM:-true}", "literal": false, "unset": "{env:NOPE}" }"#,
+        )
+        .unwrap();
+
+        let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
+        assert_eq!(cfg.stream, Some(true), "bool string from default coerces");
+        assert_eq!(cfg.literal, Some(false), "literal JSON bool still works");
+        assert_eq!(cfg.unset, None, "empty substitution → None, not an error");
+    }
+
+    #[test]
+    fn bool_field_rejects_a_non_boolean_string() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Cfg {
+            // Deserialization is expected to fail, so the field is never read — the test asserts the
+            // error, not the value.
+            #[serde(default, deserialize_with = "de::opt_bool")]
+            #[allow(dead_code)]
+            stream: Option<bool>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, r#"{ "stream": "maybe" }"#).unwrap();
+        // A garbage value is surfaced as an error, not silently defaulted.
+        assert!(load_with::<Cfg>(&path, &env_of(&[])).is_err());
     }
 
     #[test]

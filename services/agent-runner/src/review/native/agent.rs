@@ -227,9 +227,9 @@ pub async fn run_native_agent(
     // it afterwards (even on error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
 ) -> anyhow::Result<ReviewOutcome> {
-    // Streaming (spike): opt-in via LLM_STREAM=1. Collects the SSE response under a per-chunk idle
-    // timeout instead of one whole-request timeout — mitigates long-reasoning turns timing out.
-    let stream_enabled = std::env::var("LLM_STREAM").ok().as_deref() == Some("1");
+    // Streaming (ADR-0039 / #206): opt-in via `review.stream` (config; else the legacy `LLM_STREAM`
+    // env, resolved in bootstrap). Collects the SSE response under a per-chunk idle timeout instead of
+    // one whole-request timeout — mitigates long-reasoning turns timing out (e.g. a model like GLM).
     let chat = ChatClient::with_timeout(
         &review.base_url,
         &review.api_key,
@@ -238,7 +238,7 @@ pub async fn run_native_agent(
     )
     .with_attribution(attribution)
     .with_extra(review.extra.clone())
-    .with_stream(stream_enabled);
+    .with_stream(review.stream);
     let retry_policy = RetryPolicy {
         max_retries: review.resilience.max_retries,
         ..RetryPolicy::default()
@@ -1106,6 +1106,7 @@ mod tests {
             top_p: None,
             max_tokens: None,
             extra: serde_json::Map::new(),
+            stream: false,
             // Fast resilience defaults so the loop tests don't sleep on the (mocked) failure paths.
             resilience: crate::bootstrap::config::ResilienceConfig {
                 request_timeout_secs: 5,
