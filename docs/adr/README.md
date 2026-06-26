@@ -73,3 +73,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0051](0051-per-model-config.md) | Per-model configuration blocks (primary / fallback / embeddings) | Proposed |
 | [0052](0052-index-snapshot-pruning.md) | Index snapshot pruning — keep the latest + in-flight, sweep the rest | Proposed |
 | [0053](0053-remove-review-fallback-model.md) | Remove the review fallback model (single model + retry/breaker; failover dropped) | Accepted |
+| [0054](0054-review-model-and-provider-selection.md) | Stay on MiniMax-M2.7 (FP8) on DeepInfra for the review agent | Accepted |
