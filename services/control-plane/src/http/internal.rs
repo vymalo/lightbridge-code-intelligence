@@ -787,21 +787,25 @@ pub async fn finalize_review(
         pr: context.target_id,
     };
 
-    // 1) Buffered replies → a single consolidated thread comment. **Policy (ADR-0056): only on a
-    // non-PR target** (an issue / @mention question, where the answer *is* a comment). On a **pull
-    // request** the verdict belongs solely in the grouped review (step 2) — a separate issue-comment
-    // would be the duplicate "2× messages" channel, and the agent sometimes buffers progress narration
-    // ("still reviewing…") via add_comment. So on a PR we DROP the buffered replies instead of posting
-    // them. On a successful post (non-PR) we drop the rows immediately, so a re-finalize never
-    // double-posts the reply.
+    // 1) Buffered replies → a single consolidated thread comment. **Policy (ADR-0056):** on a **pull
+    // request that is also posting a review** (inline findings present), the verdict belongs solely in
+    // the grouped review (step 2) — a separate issue-comment would be the duplicate "2× messages"
+    // channel, and the agent sometimes buffers progress narration ("still reviewing…") via add_comment.
+    // So we DROP the buffered replies there. But a PR run with **no findings** is effectively an *answer*
+    // (e.g. an `@mention` question asked on a PR), where the reply IS the content — so we keep it, same
+    // as an issue target. Gating on `!inline.is_empty()` rather than `target_type` alone avoids dropping
+    // a genuine answer (#215 review). On a successful post we drop the rows immediately, so a re-finalize
+    // never double-posts the reply.
     let mut posted_reply = false;
     if !pending.comments.is_empty() {
-        if context.target_type == "pull_request" {
+        if context.target_type == "pull_request" && !pending.inline.is_empty() {
             tracing::info!(
                 task_id = %id, dropped = pending.comments.len(),
-                "PR target: dropping buffered add_comment replies — the review is the only channel (ADR-0056)"
+                "PR review: dropping buffered add_comment replies — the review is the only channel (ADR-0056)"
             );
-            let _ = crate::db::clear_pending_action(pool, id, "comment").await;
+            if let Err(error) = crate::db::clear_pending_action(pool, id, "comment").await {
+                tracing::warn!(%error, task_id = %id, "clearing dropped PR replies failed (non-fatal)");
+            }
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
             match app
@@ -1203,19 +1207,30 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
     {
         Ok(posted) => {
             tracing::info!(task_id = %id, "posted failure notice — review did not finalize (ADR-0056)");
-            // Record it so a retry's failure doesn't post a second notice (dedup via has_posted_to_github).
-            if let Some(cid) = posted.id {
-                let _ = crate::db::store_review_comments(
-                    pool,
-                    id,
-                    &[crate::db::ReviewCommentRef {
-                        github_comment_id: cid,
-                        kind: "failure_notice".to_string(),
-                        file: None,
-                        line: None,
-                    }],
-                )
-                .await;
+            // Record it so a retry's failure doesn't post a second notice (dedup via
+            // has_posted_to_github). If GitHub returned no id, or the store fails, the dedup row is
+            // missing — log it loudly, since a later retry could then post a duplicate notice (#215 review).
+            match posted.id {
+                Some(cid) => {
+                    if let Err(error) = crate::db::store_review_comments(
+                        pool,
+                        id,
+                        &[crate::db::ReviewCommentRef {
+                            github_comment_id: cid,
+                            kind: "failure_notice".to_string(),
+                            file: None,
+                            line: None,
+                        }],
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, task_id = %id, "recording failure notice for dedup failed — a retry may post a duplicate");
+                    }
+                }
+                None => tracing::warn!(
+                    task_id = %id,
+                    "failure notice posted but GitHub returned no comment id — dedup not recorded; a retry may duplicate"
+                ),
             }
         }
         Err(error) => {
