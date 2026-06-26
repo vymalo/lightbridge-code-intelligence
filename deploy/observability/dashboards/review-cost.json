@@ -304,10 +304,73 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 12,
+        "h": 8,
         "w": 24,
         "x": 0,
         "y": 20
+      },
+      "options": {
+        "calculate": true,
+        "cellGap": 1,
+        "color": {
+          "exponent": 0,
+          "fill": "",
+          "mode": "scheme",
+          "reverse": false,
+          "scale": "exponential",
+          "scheme": "Oranges",
+          "steps": 64
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "legend": {
+          "show": true
+        },
+        "showValue": "auto",
+        "tooltip": {
+          "show": false
+        },
+        "yAxis": {
+          "unit": "currencyUSD"
+        }
+      },
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n), per_task AS (  SELECT t.id, t.created_at, sum(p.cost_usd) AS cost   FROM priced p JOIN tasks t ON t.id = p.task_id   LEFT JOIN repositories r ON r.id = t.repository_id   WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')   GROUP BY t.id, t.created_at) SELECT created_at AS \"time\", cost FROM per_task ORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Per-review cost distribution over time",
+      "transformations": [],
+      "transparent": false,
+      "type": "heatmap"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 28
       },
       "options": null,
       "repeatDirection": "h",
