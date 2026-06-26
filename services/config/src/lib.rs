@@ -345,7 +345,10 @@ mod tests {
         use serde::Deserialize;
         #[derive(Deserialize)]
         struct Cfg {
+            // Deserialization is expected to fail, so the field is never read — the test asserts the
+            // error, not the value.
             #[serde(default, deserialize_with = "de::opt_bool")]
+            #[allow(dead_code)]
             stream: Option<bool>,
         }
         let dir = tempfile::tempdir().unwrap();
