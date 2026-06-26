@@ -1547,7 +1547,7 @@ pub async fn get_task_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, 
 /// terminal transition. Fires on ANY terminal status (including `failed`/`cancelled`) so a failed index
 /// never strands reviews forever — the common `succeeded` case is the one that grounds them.
 async fn release_reviews_waiting_on_index(pool: &PgPool, index_task_id: Uuid) {
-    let released: Vec<Uuid> = sqlx::query_scalar(
+    let released: Vec<Uuid> = match sqlx::query_scalar(
         "WITH done AS (SELECT repository_id FROM tasks WHERE id = $1 AND command_text = 'index') \
          UPDATE tasks SET status = 'queued', run_after = now() \
          WHERE repository_id IN (SELECT repository_id FROM done) \
@@ -1557,7 +1557,21 @@ async fn release_reviews_waiting_on_index(pool: &PgPool, index_task_id: Uuid) {
     .bind(index_task_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Do NOT swallow this: a failed release leaves the repo's reviews parked in
+        // `waiting_for_index`, which the claim query never selects — they only recover when a *later*
+        // index task completes. Log loudly so the stall is visible and an operator can requeue (#214
+        // review). The status stamp already succeeded, so we don't fail the caller.
+        Err(error) => {
+            tracing::error!(
+                %error, index_task_id = %index_task_id,
+                "ADR-0055: releasing reviews waiting on the index FAILED — they stay parked until the \
+                 next index completes; a manual requeue may be needed"
+            );
+            return;
+        }
+    };
     if released.is_empty() {
         return;
     }
