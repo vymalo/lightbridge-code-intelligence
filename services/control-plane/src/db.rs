@@ -1864,7 +1864,9 @@ mod tests {
             .expect("review");
         assert_eq!(task_status(&pool, review).await, "waiting_for_index");
 
-        set_task_status(&pool, index, "succeeded", None).await.unwrap();
+        set_task_status(&pool, index, "succeeded", None)
+            .await
+            .unwrap();
         assert_eq!(
             task_status(&pool, review).await,
             "queued",
