@@ -138,14 +138,12 @@ pub struct ReviewFile {
     /// the history grows too large. Unset = no budgeting (unchanged behaviour).
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub context_window: Option<usize>,
-    /// **REMOVED — review failover is gone.** `fallback_model` and `fallback` are still *parsed* (so a
-    /// live `agent.json` that still sets them doesn't break `deny_unknown_fields` on this image) but are
-    /// **ignored**; [`ReviewConfig::resolve`] warns when either is present. Delete these two fields once
-    /// `ai-helm-values` has dropped the `fallbackModel` value.
+    /// Stream the chat response (SSE) and reassemble it client-side instead of awaiting the whole
+    /// completion (ADR-0039 / #206). `Some(true)` enables it; unset falls back to the `LLM_STREAM` env
+    /// (legacy/local toggle), else off. Streaming bounds a long-but-progressing turn by a per-chunk idle
+    /// timeout rather than one whole-request timeout — useful for a heavy-reasoning model (e.g. GLM).
     #[serde(default)]
-    pub fallback_model: Option<String>,
-    #[serde(default)]
-    pub fallback: Option<serde_json::Value>,
+    pub stream: Option<bool>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -282,9 +280,11 @@ pub struct ReviewConfig {
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
     /// Provider-specific passthrough request fields (reasoning budget etc.), from `review.extra`,
-    /// merged verbatim into the chat body. Empty = nothing extra. (Primary model; the fallback gets
-    /// its own in a follow-up.)
+    /// merged verbatim into the chat body. Empty = nothing extra.
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Stream the chat response (SSE) and reassemble client-side (ADR-0039 / #206). From
+    /// `review.stream`, else the `LLM_STREAM` env, else false.
+    pub stream: bool,
     /// Resilience policy for the LLM transport: timeout, retry/backoff, circuit breaker (ADR-0039).
     /// Always present (defaults applied at resolve time). These are the **primary** model's per-request
     /// knobs + the loop-level breaker.
@@ -329,6 +329,13 @@ impl ResilienceConfig {
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
         }
     }
+}
+
+/// Whether streaming is enabled via the legacy/local `LLM_STREAM` env toggle (`"1"` = on). The
+/// file-config `review.stream` takes precedence over this; it exists so a local run or a stale
+/// deploy can still opt in without an `agent.json` change.
+fn stream_from_env() -> bool {
+    std::env::var("LLM_STREAM").ok().as_deref() == Some("1")
 }
 
 /// Parse a `u64` env var, returning `None` when unset, empty, or unparseable (the caller applies its
@@ -392,6 +399,7 @@ impl ReviewConfig {
             // No env var for arbitrary passthrough params — the file path (`review.extra`) is where a
             // reasoning budget is set.
             extra: serde_json::Map::new(),
+            stream: stream_from_env(),
             resilience: ResilienceConfig::from_env(),
         }))
     }
@@ -436,20 +444,6 @@ impl ReviewConfig {
             .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
             .map(|n| n as u32)
             .unwrap_or(DEFAULT_MAX_RETRIES);
-        // Review failover was removed. The config fields are still parsed for deploy-compat, but if a
-        // live config still sets one with a real value, warn loudly and ignore it. An empty string or
-        // a JSON null is treated as unset (no spurious warning in prod logs).
-        let has_fallback_model = r
-            .fallback_model
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty());
-        let has_fallback = r.fallback.as_ref().is_some_and(|v| !v.is_null());
-        if has_fallback_model || has_fallback {
-            tracing::warn!(
-                "review.fallback / review.fallback_model are set but IGNORED — the review fallback \
-                 model was removed; drop them from the config"
-            );
-        }
         Ok(Some(Self {
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
@@ -488,6 +482,8 @@ impl ReviewConfig {
             top_p,
             max_tokens,
             extra,
+            // File wins; else the `LLM_STREAM` env (legacy/local), else off.
+            stream: r.stream.unwrap_or_else(stream_from_env),
             resilience: ResilienceConfig {
                 request_timeout_secs,
                 max_retries,
@@ -567,8 +563,7 @@ mod tests {
                 max_searches: None,
                 max_batches: None,
                 context_window: None,
-                fallback_model: None,
-                fallback: None,
+                stream: None,
             }),
         };
         let err =
@@ -611,8 +606,7 @@ mod tests {
                 // A 0 context window is meaningless — it must resolve to "disabled" (None), not a
                 // window of zero that would force wind-down on turn 0 (ADR-0045).
                 context_window: Some(0),
-                fallback_model: None,
-                fallback: None,
+                stream: None,
             }),
         };
         let cfg = ReviewConfig::resolve(Some(&file))
@@ -630,33 +624,28 @@ mod tests {
         std::fs::remove_file(&prompt).ok();
     }
 
-    // Review failover is removed, but the deprecated `fallback_model` / `fallback` fields must still
-    // PARSE so a live agent.json that still sets them doesn't fail `deny_unknown_fields` on this image —
-    // they are simply ignored. (Transition-safety; delete the fields once ai-helm-values drops them.)
+    // `review.stream` (file config) takes precedence; when unset it falls back to the `LLM_STREAM`
+    // env. Here the file sets it explicitly so the result is deterministic regardless of the ambient
+    // env (#206 streaming toggle, promoted from env-only to a config knob).
     #[test]
-    fn deprecated_fallback_fields_parse_but_are_ignored() {
-        let prompt = std::env::temp_dir().join(format!("lci-fb-{}.md", std::process::id()));
+    fn review_stream_from_file_wins() {
+        let prompt = std::env::temp_dir().join(format!("lci-stream-{}.md", std::process::id()));
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let file = FileConfig {
             embeddings: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".into(),
                 api_key: "k".into(),
-                model: "primary".into(),
+                model: "m".into(),
                 system_prompt_file: Some(prompt.to_string_lossy().into_owned()),
-                // Both the bare-string and the nested-object forms a live config might carry.
-                fallback_model: Some("old-fb".into()),
-                fallback: Some(
-                    serde_json::json!({ "model": "fb", "config": { "max_tokens": 4096 } }),
-                ),
+                stream: Some(true),
                 ..Default::default()
             }),
         };
-        // Resolves cleanly (no error) and yields the primary model; the fallback fields have no effect.
         let cfg = ReviewConfig::resolve(Some(&file))
-            .expect("resolves with deprecated fallback fields set")
+            .expect("resolves with a prompt file")
             .expect("review enabled");
-        assert_eq!(cfg.model, "primary");
+        assert!(cfg.stream, "review.stream=true is honoured over the env");
         std::fs::remove_file(&prompt).ok();
     }
 }
