@@ -74,4 +74,5 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0052](0052-index-snapshot-pruning.md) | Index snapshot pruning — keep the latest + in-flight, sweep the rest | Proposed |
 | [0053](0053-remove-review-fallback-model.md) | Remove the review fallback model (single model + retry/breaker; failover dropped) | Accepted |
 | [0054](0054-review-model-and-provider-selection.md) | Stay on MiniMax-M2.7 (FP8) on DeepInfra for the review agent | Accepted |
+| [0055](0055-review-waits-for-index-readiness.md) | A review waits for index readiness (the `WaitingForIndex` gate; RFC-0002 Phase 1.4) | Accepted |
 | [0056](0056-control-plane-owns-the-posted-output.md) | The control plane owns what gets posted (PR review-only channel + failure notice) | Accepted |

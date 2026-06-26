@@ -806,20 +806,53 @@ pub async fn upsert_repository(
     .await
 }
 
+/// Initial-status SQL for a newly inserted task (ADR-0055 index-readiness gate). A **non-`index`**
+/// task (review / ask — anything that reads the index) starts `waiting_for_index` when an `index` task
+/// is **in flight** for the repo, so it isn't claimed against a half-written snapshot; otherwise it
+/// starts `queued`. Index tasks themselves never wait. Spliced where the bound params are
+/// `$2 = repository_id` and `$7 = command_text` (true for both [`create_task`] and
+/// [`create_explicit_task`]); a `set`-time `EXISTS` is fine — the dispatcher and the
+/// release in [`set_task_status`] handle the (repo, index) lifecycle, not this insert.
+const INITIAL_TASK_STATUS_SQL: &str = "CASE WHEN $7 <> 'index' AND EXISTS ( \
+        SELECT 1 FROM tasks ix WHERE ix.repository_id = $2 AND ix.command_text = 'index' \
+          AND ix.status IN ('queued', 'running', 'posting_result', 'waiting_for_index')) \
+     THEN 'waiting_for_index' ELSE 'queued' END";
+
+/// After inserting a task: wake a listening dispatcher when it's claimable (`queued`), or log that it
+/// was parked behind an in-flight index (`waiting_for_index`, ADR-0055). A waiting task is woken later
+/// by [`set_task_status`] when the repo's index task completes — notifying now would be a no-op (the
+/// claim query only selects `queued`).
+async fn notify_or_log_initial_status(pool: &PgPool, id: Uuid, repository_id: i64, status: &str) {
+    if status == "waiting_for_index" {
+        tracing::info!(
+            task_id = %id, repository_id,
+            "review gated: WaitingForIndex — an index task is in flight; will run once it completes (ADR-0055)"
+        );
+        return;
+    }
+    // Wake a listening dispatcher; harmless if none is connected (the dispatcher also polls).
+    let _ = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(TASK_QUEUED_CHANNEL)
+        .bind(id.to_string())
+        .execute(pool)
+        .await;
+}
+
 /// Enqueue a task idempotently. Returns the new task id, or `None` when an equivalent task already
 /// exists — GitHub can deliver several events for one PR head (e.g. `opened` then `synchronize`),
-/// and the `tasks_idempotency_idx` unique index collapses those to a single `queued` task. On a real
-/// insert, notifies [`TASK_QUEUED_CHANNEL`] so a listening dispatcher reacts immediately.
+/// and the `tasks_idempotency_idx` unique index collapses those to a single task. On a real insert,
+/// the task starts `queued` (→ notifies [`TASK_QUEUED_CHANNEL`]) or `waiting_for_index` when the repo
+/// is mid-index (ADR-0055).
 pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    let inserted: Option<Uuid> = sqlx::query_scalar(
+    let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued') \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
-         RETURNING id",
-    )
+         RETURNING id, status"
+    ))
     .bind(id)
     .bind(task.repository_id)
     .bind(task.installation_id)
@@ -833,15 +866,10 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .fetch_optional(pool)
     .await?;
 
-    if let Some(new_id) = inserted {
-        // Wake a listening dispatcher; harmless if none is connected (the dispatcher also polls).
-        let _ = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(TASK_QUEUED_CHANNEL)
-            .bind(new_id.to_string())
-            .execute(pool)
-            .await;
+    if let Some((new_id, status)) = &inserted {
+        notify_or_log_initial_status(pool, *new_id, task.repository_id, status).await;
     }
-    Ok(inserted)
+    Ok(inserted.map(|(id, _)| id))
 }
 
 /// Enqueue an **explicit human command** (an `@mention`), which must ALWAYS land a task — never
@@ -865,16 +893,16 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
     loop {
         attempt += 1;
         let id = Uuid::new_v4();
-        let result = sqlx::query_scalar::<_, Uuid>(
+        let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
             "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, run_epoch, status) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
-               'queued') \
-             RETURNING id",
-        )
+               {INITIAL_TASK_STATUS_SQL}) \
+             RETURNING id, status"
+        ))
         .bind(id)
         .bind(task.repository_id)
         .bind(task.installation_id)
@@ -887,13 +915,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .fetch_one(pool)
         .await;
         match result {
-            Ok(new_id) => {
-                // Wake a listening dispatcher; harmless if none is connected (it also polls).
-                let _ = sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(TASK_QUEUED_CHANNEL)
-                    .bind(new_id.to_string())
-                    .execute(pool)
-                    .await;
+            Ok((new_id, status)) => {
+                notify_or_log_initial_status(pool, new_id, task.repository_id, &status).await;
                 return Ok(new_id);
             }
             // Lost the epoch race — recompute MAX and try the next epoch.
@@ -1533,6 +1556,53 @@ pub async fn get_task_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, 
 /// `error_detail` so the console can surface why a run did not post a review (and tell a silent no-op
 /// apart from a real clean success). `None` leaves any existing `error_detail` untouched — a later
 /// report without a detail must not erase a reason an earlier one recorded.
+/// When an `index` task reaches a terminal status, flip the repo's `waiting_for_index` tasks — parked
+/// by the ADR-0055 enqueue gate — to `queued` and wake the dispatcher. A no-op when the completed task
+/// is **not** an index task (the `done` CTE is empty), so [`set_task_status`] can call it on every
+/// terminal transition. Fires on ANY terminal status (including `failed`/`cancelled`) so a failed index
+/// never strands reviews forever — the common `succeeded` case is the one that grounds them.
+async fn release_reviews_waiting_on_index(pool: &PgPool, index_task_id: Uuid) {
+    let released: Vec<Uuid> = match sqlx::query_scalar(
+        "WITH done AS (SELECT repository_id FROM tasks WHERE id = $1 AND command_text = 'index') \
+         UPDATE tasks SET status = 'queued', run_after = now() \
+         WHERE repository_id IN (SELECT repository_id FROM done) \
+           AND status = 'waiting_for_index' \
+         RETURNING id",
+    )
+    .bind(index_task_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        // Do NOT swallow this: a failed release leaves the repo's reviews parked in
+        // `waiting_for_index`, which the claim query never selects — they only recover when a *later*
+        // index task completes. Log loudly so the stall is visible and an operator can requeue (#214
+        // review). The status stamp already succeeded, so we don't fail the caller.
+        Err(error) => {
+            tracing::error!(
+                %error, index_task_id = %index_task_id,
+                "ADR-0055: releasing reviews waiting on the index FAILED — they stay parked until the \
+                 next index completes; a manual requeue may be needed"
+            );
+            return;
+        }
+    };
+    if released.is_empty() {
+        return;
+    }
+    tracing::info!(
+        index_task_id = %index_task_id,
+        released = released.len(),
+        "index complete: released tasks that were waiting for the index (ADR-0055)"
+    );
+    // One NOTIFY is enough — the dispatcher drains every `queued` task on any wake.
+    let _ = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(TASK_QUEUED_CHANNEL)
+        .bind(index_task_id.to_string())
+        .execute(pool)
+        .await;
+}
+
 pub async fn set_task_status(
     pool: &PgPool,
     id: Uuid,
@@ -1556,6 +1626,10 @@ pub async fn set_task_status(
     .bind(detail)
     .execute(pool)
     .await?;
+    // ADR-0055: a completed index task releases the repo's reviews that were parked behind it.
+    if terminal {
+        release_reviews_waiting_on_index(pool, id).await;
+    }
     Ok(result.rows_affected() > 0)
 }
 
@@ -1741,6 +1815,96 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0,
         }
+    }
+
+    async fn task_status(pool: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// ADR-0055: a review enqueued while an `index` task is in flight parks in `waiting_for_index`
+    /// (not `queued`), so the dispatcher's claim query never runs it against a half-built index.
+    #[sqlx::test]
+    async fn review_waits_for_index_when_an_index_is_in_flight(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        // An index task is queued = in flight.
+        create_index_task(&pool, repo_id, 99)
+            .await
+            .unwrap()
+            .expect("index task");
+        // A review enqueued now must wait for it.
+        let review = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("review");
+        assert_eq!(task_status(&pool, review).await, "waiting_for_index");
+        // It is NOT claimable (claim only takes `queued`) — the index task is what gets claimed.
+        let claimed = claim_next_task(&pool, "w", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a claimable task");
+        assert_ne!(claimed.id, review, "the waiting review must not be claimed");
+        assert_eq!(claimed.command_text, "index");
+    }
+
+    /// ADR-0055: completing the `index` task releases the repo's waiting reviews to `queued`.
+    #[sqlx::test]
+    async fn index_completion_releases_waiting_reviews(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let index = create_index_task(&pool, repo_id, 99)
+            .await
+            .unwrap()
+            .expect("index task");
+        let review = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("review");
+        assert_eq!(task_status(&pool, review).await, "waiting_for_index");
+
+        set_task_status(&pool, index, "succeeded", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            task_status(&pool, review).await,
+            "queued",
+            "the index completing releases the parked review"
+        );
+    }
+
+    /// ADR-0055: with no index in flight, a review enqueues straight to `queued` (unchanged behaviour).
+    #[sqlx::test]
+    async fn review_is_queued_when_no_index_in_flight(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let review = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("review");
+        assert_eq!(task_status(&pool, review).await, "queued");
+    }
+
+    /// ADR-0055: a FAILED index still releases waiting reviews — a failed index must never strand them.
+    #[sqlx::test]
+    async fn a_failed_index_still_releases_waiting_reviews(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let index = create_index_task(&pool, repo_id, 99)
+            .await
+            .unwrap()
+            .expect("index task");
+        let review = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("review");
+        set_task_status(&pool, index, "failed", Some("boom"))
+            .await
+            .unwrap();
+        assert_eq!(
+            task_status(&pool, review).await,
+            "queued",
+            "a failed index still releases the parked review"
+        );
     }
 
     /// ADR-0056: `has_posted_to_github` is the dedup gate for the failure-fallback notice — false until

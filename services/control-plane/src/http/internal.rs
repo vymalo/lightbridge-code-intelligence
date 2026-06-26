@@ -809,7 +809,13 @@ pub async fn finalize_review(
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
             match app
-                .create_issue_comment(&token, &context.owner, &context.name, context.target_id, &body)
+                .create_issue_comment(
+                    &token,
+                    &context.owner,
+                    &context.name,
+                    context.target_id,
+                    &body,
+                )
                 .await
             {
                 Ok(posted_comment) => {
@@ -1202,7 +1208,13 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
     }
     let body = crate::review::render_failure_notice();
     match app
-        .create_issue_comment(&token, &context.owner, &context.name, context.target_id, &body)
+        .create_issue_comment(
+            &token,
+            &context.owner,
+            &context.name,
+            context.target_id,
+            &body,
+        )
         .await
     {
         Ok(posted) => {
