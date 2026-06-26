@@ -20,6 +20,7 @@ from lci_dashboards import (
     operations,
     overview,
     repositories,
+    review_cost,
     review_quality,
     task_runs,
 )
@@ -34,6 +35,7 @@ DASHBOARDS = {
     "task-runs": task_runs.dashboard_builder,
     "repositories": repositories.dashboard_builder,
     "review-quality": review_quality.dashboard_builder,
+    "review-cost": review_cost.dashboard_builder,
     "feedback": feedback.dashboard_builder,
     "ingress-dispatcher": ingress_dispatcher.dashboard_builder,
     "operations": operations.dashboard_builder,
