@@ -1115,6 +1115,43 @@ mod tests {
         assert_eq!(out.finish_reason.as_deref(), Some("stop"));
     }
 
+    // The streaming path must carry the gateway's rate-limit headers onto the Completion too — the
+    // headers are on the response before the SSE body is consumed. Regression guard alongside the
+    // non-streaming `complete_parses_rate_limit_headers`: the #206 streaming refactor dropped this
+    // wiring on both paths, so each path needs its own guard (lightbridge review on #209).
+    #[tokio::test]
+    async fn stream_parses_rate_limit_headers() {
+        let server = MockServer::start().await;
+        let sse =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-ratelimit-limit", "1000")
+                    .insert_header("x-ratelimit-remaining", "40")
+                    .insert_header("x-ratelimit-reset", "12")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m").with_stream(true);
+        let out = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("stream completes");
+        assert_eq!(out.message.content.as_deref(), Some("ok"));
+        assert_eq!(out.rate_limit.limit, Some(1000));
+        assert_eq!(out.rate_limit.remaining, Some(40));
+        assert_eq!(out.rate_limit.reset, Some(Duration::from_secs(12)));
+        assert!(
+            out.rate_limit.is_low(0.1),
+            "40/1000 is below the 10% threshold"
+        );
+    }
+
     // A stream that closes before a terminal signal ([DONE] / finish_reason) is a truncated response —
     // surfaced as a transient error so the turn retries, not a "successful" partial completion. (#206.)
     #[tokio::test]
