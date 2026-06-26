@@ -142,7 +142,9 @@ pub struct ReviewFile {
     /// completion (ADR-0039 / #206). `Some(true)` enables it; unset falls back to the `LLM_STREAM` env
     /// (legacy/local toggle), else off. Streaming bounds a long-but-progressing turn by a per-chunk idle
     /// timeout rather than one whole-request timeout — useful for a heavy-reasoning model (e.g. GLM).
-    #[serde(default)]
+    /// Bool-tolerant like the numeric knobs above, so a `{env:…}`-substituted string (e.g.
+    /// `"{env:LLM_STREAM:-true}"`) still deserializes instead of failing the config.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_bool")]
     pub stream: Option<bool>,
 }
 
