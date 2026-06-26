@@ -323,6 +323,21 @@ pub async fn store_review_comments(
     Ok(())
 }
 
+/// Whether the control plane already posted **anything** to GitHub for this task — a grouped review
+/// (a `reviews` row) or any recorded comment (`review_comments`: an inline finding, a reply, or a
+/// prior failure notice). Gates the failure-fallback notice (ADR-0056): it must never double-post on
+/// top of a real review, and is idempotent across retries because the notice itself is recorded as a
+/// `review_comments` row.
+pub async fn has_posted_to_github(pool: &PgPool, task_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM reviews WHERE task_id = $1) \
+              OR EXISTS (SELECT 1 FROM review_comments WHERE task_id = $1)",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// A comment the poller should check for reactions, with the repo coordinates + installation needed to
 /// mint a token and hit the reactions API.
 #[derive(Debug, sqlx::FromRow)]
@@ -1726,6 +1741,62 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0,
         }
+    }
+
+    /// ADR-0056: `has_posted_to_github` is the dedup gate for the failure-fallback notice — false until
+    /// a review (or any recorded comment, incl. a prior notice) exists for the task, then true.
+    #[sqlx::test]
+    async fn has_posted_to_github_reflects_reviews_and_comments(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("task");
+        // Nothing posted yet → false (a failed run here SHOULD get a fallback notice).
+        assert!(!has_posted_to_github(&pool, task).await.unwrap());
+
+        // A recorded comment (e.g. the failure notice itself, or an inline finding) flips it to true,
+        // so a retry's failure won't post a second notice.
+        store_review_comments(
+            &pool,
+            task,
+            &[ReviewCommentRef {
+                github_comment_id: 12345,
+                kind: "failure_notice".to_string(),
+                file: None,
+                line: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(has_posted_to_github(&pool, task).await.unwrap());
+    }
+
+    /// ADR-0056: a posted grouped review (a `reviews` row) also counts as "responded" — so a
+    /// finalize-then-crash never posts a fallback notice on top of a real review.
+    #[sqlx::test]
+    async fn has_posted_to_github_true_after_a_review_row(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("task");
+        assert!(!has_posted_to_github(&pool, task).await.unwrap());
+        upsert_review(
+            &pool,
+            task,
+            "summary",
+            "body",
+            0,
+            0,
+            0,
+            &serde_json::json!([]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(has_posted_to_github(&pool, task).await.unwrap());
     }
 
     /// ADR-0033 slice 3: an `issue` target (no SHAs) persists and reads back, and the idempotency key
