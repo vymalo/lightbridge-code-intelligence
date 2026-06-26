@@ -261,7 +261,7 @@ def dashboard_builder() -> dashboard.Dashboard:
                 f"WHERE $__timeFilter(t.created_at) AND {_F_REPO} AND {_F_KIND} AND {_F_MODEL} "
                 "GROUP BY t.id, r.owner, r.name, t.repository_id, t.created_at, "
                 "t.target_type, t.target_id, t.kind, t.status, t.completed_at, t.started_at "
-                "ORDER BY t.created_at DESC LIMIT 500"
+                "ORDER BY t.created_at DESC, t.id DESC LIMIT 500"
             )
         )
         .grid_pos(layout.place(24, 12))
