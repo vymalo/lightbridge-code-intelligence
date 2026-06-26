@@ -484,6 +484,17 @@ pub fn render_answer_body(answer: &str) -> String {
     )
 }
 
+/// The fallback notice posted on a PR when a review task fails terminally **without** finalizing, so
+/// the author isn't left in silence (ADR-0056). Intentionally short and actionable — no findings ran.
+pub fn render_failure_notice() -> String {
+    "## Lightbridge review\n\n\
+     ⚠️ Something went wrong and I couldn't finish this review — no findings were posted.\n\n\
+     Re-mention me on this PR (or push a new commit) to try again.\n\n\
+     ---\n_🤖 AI-generated notice — treat it as untrusted, verify before acting; a human owns the \
+     final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +766,16 @@ mod tests {
             body.contains("AI-generated answer") && body.contains("AI governance"),
             "carries the untrusted-output disclosure"
         );
+    }
+
+    #[test]
+    fn render_failure_notice_is_short_actionable_and_disclosed() {
+        let body = render_failure_notice();
+        assert!(body.starts_with("## Lightbridge review"), "headed: {body}");
+        assert!(
+            body.contains("couldn't finish") && body.to_lowercase().contains("try again"),
+            "says it failed + how to retry"
+        );
+        assert!(body.contains("AI governance"), "carries the disclosure");
     }
 }

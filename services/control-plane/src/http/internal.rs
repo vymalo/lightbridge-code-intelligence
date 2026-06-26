@@ -787,45 +787,51 @@ pub async fn finalize_review(
         pr: context.target_id,
     };
 
-    // 1) Buffered replies → a single consolidated thread comment (works on a PR or an issue). On a
-    // successful post we drop the comment rows immediately, so a re-finalize (e.g. a retried delivery
-    // after a later step failed) never double-posts this reply.
+    // 1) Buffered replies → a single consolidated thread comment. **Policy (ADR-0056): only on a
+    // non-PR target** (an issue / @mention question, where the answer *is* a comment). On a **pull
+    // request** the verdict belongs solely in the grouped review (step 2) — a separate issue-comment
+    // would be the duplicate "2× messages" channel, and the agent sometimes buffers progress narration
+    // ("still reviewing…") via add_comment. So on a PR we DROP the buffered replies instead of posting
+    // them. On a successful post (non-PR) we drop the rows immediately, so a re-finalize never
+    // double-posts the reply.
     let mut posted_reply = false;
     if !pending.comments.is_empty() {
-        let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
-        match app
-            .create_issue_comment(
-                &token,
-                &context.owner,
-                &context.name,
-                context.target_id,
-                &body,
-            )
-            .await
-        {
-            Ok(posted_comment) => {
-                posted_reply = true;
-                // Record the reply's id so the feedback poller can read its reactions (ADR-0035).
-                if let Some(cid) = posted_comment.id {
-                    if let Err(error) = crate::db::store_review_comments(
-                        pool,
-                        id,
-                        &[crate::db::ReviewCommentRef {
-                            github_comment_id: cid,
-                            kind: "reply".to_string(),
-                            file: None,
-                            line: None,
-                        }],
-                    )
-                    .await
-                    {
-                        tracing::warn!(%error, task_id = %id, "storing reply comment id failed (non-fatal)");
+        if context.target_type == "pull_request" {
+            tracing::info!(
+                task_id = %id, dropped = pending.comments.len(),
+                "PR target: dropping buffered add_comment replies — the review is the only channel (ADR-0056)"
+            );
+            let _ = crate::db::clear_pending_action(pool, id, "comment").await;
+        } else {
+            let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
+            match app
+                .create_issue_comment(&token, &context.owner, &context.name, context.target_id, &body)
+                .await
+            {
+                Ok(posted_comment) => {
+                    posted_reply = true;
+                    // Record the reply's id so the feedback poller can read its reactions (ADR-0035).
+                    if let Some(cid) = posted_comment.id {
+                        if let Err(error) = crate::db::store_review_comments(
+                            pool,
+                            id,
+                            &[crate::db::ReviewCommentRef {
+                                github_comment_id: cid,
+                                kind: "reply".to_string(),
+                                file: None,
+                                line: None,
+                            }],
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, task_id = %id, "storing reply comment id failed (non-fatal)");
+                        }
                     }
+                    let _ = crate::db::clear_pending_action(pool, id, "comment").await;
                 }
-                let _ = crate::db::clear_pending_action(pool, id, "comment").await;
-            }
-            Err(error) => {
-                tracing::warn!(%error, task_id = %id, "posting consolidated reply failed (non-fatal)")
+                Err(error) => {
+                    tracing::warn!(%error, task_id = %id, "posting consolidated reply failed (non-fatal)")
+                }
             }
         }
     }
@@ -1099,13 +1105,14 @@ pub async fn set_status(
                     tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
                 }
             }
-            // A terminal failure gets 😕 on the PR (best-effort). Success is acknowledged by the
-            // review post (🎉) in `finalize_review`, so we don't double-react here.
+            // A terminal failure gets 😕 + a fallback "review failed, retry" comment on the PR when the
+            // review never finalized (ADR-0056), so the author isn't left in silence. Success is
+            // acknowledged by the review post (🎉) in `finalize_review`, so we don't double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {
                 let state = state.clone();
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    react_failure(&state, &pool, id).await;
+                    handle_review_failure(&state, &pool, id).await;
                 });
             }
             StatusCode::NO_CONTENT.into_response()
@@ -1145,12 +1152,16 @@ pub async fn get_status(
     }
 }
 
-/// Best-effort 😕 on the PR when a review task fails. Loads the task's PR context + mints a token;
-/// any error (no App, non-PR task, GitHub hiccup) is logged and ignored.
-async fn react_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
-    if !state.review.reactions_enabled() {
-        return;
-    }
+/// Best-effort GitHub feedback when a **PR** review task fails terminally (runner-reported
+/// `failed`/`timed_out`): a 😕 reaction (gated on the reactions toggle), **plus** — when nothing was
+/// posted for this task — a brief "review failed, retry" comment so the author isn't left in silence
+/// (ADR-0056). Loads the task's PR context + mints one token; any error is logged and ignored.
+///
+/// NOTE (ADR-0056 gap): this fires only on the runner-reported path. An *uncatchable* kill
+/// (OOM / SIGKILL / node eviction) never reports — it's detected by the reaper in the **dispatcher**
+/// role, which holds no GitHub App key (ADR-0002), so it can't post. Full coverage needs a serve/poller
+/// component; deferred.
+async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
     let Some(app) = state.github.as_ref() else {
         return;
     };
@@ -1158,16 +1169,57 @@ async fn react_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
         Ok(Some(context)) if context.target_type == "pull_request" => context,
         _ => return,
     };
-    match app.installation_token(context.installation_id).await {
-        Ok(token) => {
-            let target = ReviewTarget {
-                token: &token,
-                owner: &context.owner,
-                repo: &context.name,
-                pr: context.target_id,
-            };
-            react(app, &state.review, &target, "confused").await;
+    let token = match app.installation_token(context.installation_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "review-failure feedback: could not mint token");
+            return;
         }
-        Err(error) => tracing::warn!(%error, task_id = %id, "react 😕: could not mint token"),
+    };
+    // 😕 reaction (same toggle as before).
+    if state.review.reactions_enabled() {
+        let target = ReviewTarget {
+            token: &token,
+            owner: &context.owner,
+            repo: &context.name,
+            pr: context.target_id,
+        };
+        react(app, &state.review, &target, "confused").await;
+    }
+    // Fallback notice — ONLY if nothing was posted for this task (no review, reply, or prior notice),
+    // so a finalize-then-crash never double-posts and retries don't spam.
+    match crate::db::has_posted_to_github(pool, id).await {
+        Ok(true) => return, // a real review/answer already went out — nothing to apologise for
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "review-failure feedback: posted-check failed");
+            return;
+        }
+    }
+    let body = crate::review::render_failure_notice();
+    match app
+        .create_issue_comment(&token, &context.owner, &context.name, context.target_id, &body)
+        .await
+    {
+        Ok(posted) => {
+            tracing::info!(task_id = %id, "posted failure notice — review did not finalize (ADR-0056)");
+            // Record it so a retry's failure doesn't post a second notice (dedup via has_posted_to_github).
+            if let Some(cid) = posted.id {
+                let _ = crate::db::store_review_comments(
+                    pool,
+                    id,
+                    &[crate::db::ReviewCommentRef {
+                        github_comment_id: cid,
+                        kind: "failure_notice".to_string(),
+                        file: None,
+                        line: None,
+                    }],
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "posting failure notice failed (non-fatal)")
+        }
     }
 }
