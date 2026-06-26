@@ -27,6 +27,10 @@ there. Any move must respect that.
 **Stay on MiniMax-M2.7 (FP8) on DeepInfra.** No model or provider change. This ADR records the
 market scan behind that choice and the triggers that would reopen it. The lever for any future change
 is `review.model` in `ai-helm-values` (a one-line, no-rebuild swap per ADR-0051) — not a code change.
+**Scope of "one-line":** that holds for a **same-provider** model swap (the model id is the only thing
+that changes). A **cross-provider** move (e.g. M2.7 → Together, or GLM → Cerebras) also requires
+changing the endpoint `baseUrl` + API key/secret alongside the model id, so it is a config change of a
+few values, still no rebuild.
 
 ## Findings (market scan, mid-2026)
 
@@ -38,8 +42,8 @@ is `review.model` in `ai-helm-values` (a one-line, no-rebuild swap per ADR-0051)
 ### 1. "GLM is slow" was a DeepInfra-serving artifact, not FP4 as a class
 
 GLM-4.7 **full** on DeepInfra is **FP4 at ~22.5 tok/s** — vs **~789.8 tok/s on Cerebras (~35× faster)**
-for the same model. So the slowness was **DeepInfra's GLM kernel**, not FP4 in general and not GLM as a
-model. Our M2.7 is **FP8** (higher quality retention than FP4) and is served well on DeepInfra. Takeaway:
+*for that same GLM-4.7 model* (both numbers are GLM-4.7, DeepInfra vs Cerebras — **not** M2.7). So the
+slowness was **DeepInfra's GLM kernel**, not FP4 in general and not GLM as a model. Our M2.7 is **FP8** (higher quality retention than FP4) and is served well on DeepInfra. Takeaway:
 quant class alone does not predict speed — the **(model × provider)** pairing does.
 
 ### 2. M2.7 on DeepInfra is the price floor, at identical quant
@@ -67,7 +71,10 @@ For M2.7 specifically (other providers, by output speed):
 ### 4. "Faster AND smarter" exists only off DeepInfra (Cerebras), and breaks the cost model
 
 **GLM-4.7 on Cerebras**: ~1,150 tok/s, ranked **#1 on Berkeley Function-Calling (tool use)**,
-**τ²-Bench 87.4 vs MiniMax M2's 77.2** (agentic), ~Sonnet-4.5-class. But Cerebras prices GLM-4.7 as a
+**τ²-Bench 87.4** (agentic), ~Sonnet-4.5-class. *Caveat on the gap:* the natural comparison is against
+the **M2.7** we actually run, **not** the older **M2** (~77.2). Public trackers put M2.7's own τ²-Bench
+materially higher (mid-80s), so the real intelligence gap to GLM-4.7 is **small** — which strengthens,
+not weakens, the case to stay. Treat all three figures as directional. But Cerebras prices GLM-4.7 as a
 **Preview** ($2.25 in / $2.75 out) or via **monthly subscription Code plans** ($50/$200) — a
 rate-limited, non-metered model that does not fit our per-token DeepInfra cost posture.
 
@@ -77,7 +84,7 @@ rate-limited, non-metered model that does not fit our per-token DeepInfra cost p
 |---|---|---|---|---|---|
 | **MiniMax-M2.7** *(current)* | FP8 | 0.25 | 1.00 | ~68 t/s, TTFT <1s | baseline |
 | GLM-4.7 (full) | FP4 | 0.40 | 1.75 | **~22.5 t/s** | slower + dearer — avoid here |
-| GLM-4.7-Flash | FP8 | 0.06 | ~0.14 blended | ~228 t/s, 0.75s TTFT | faster + cheaper, lower ceiling |
+| GLM-4.7-Flash | bf16 | 0.06 | 0.40 | ~228 t/s, 0.75s TTFT | faster + cheaper (blended ~$0.14), lower ceiling |
 | DeepSeek-V4-Flash | — | 0.10 | 0.20 | ~83 t/s | cheaper + faster, intelligence TBD |
 | DeepSeek-V4-Pro | FP4 | 1.30 | 2.60 | — | smarter, pricier |
 | Kimi K2.6 | FP4 | 0.75 | 3.50 | — | strongest agentic, **3.5× output cost** |
@@ -106,7 +113,8 @@ strictly-dominant upgrade inside DeepInfra** over M2.7-FP8 for agentic review.
   **GLM-4.7 on Cerebras** (accepting its non-metered pricing).
 - DeepInfra ships a **fast GLM-full kernel** (current ~22.5 tok/s is the blocker, not the model).
 
-Any swap is a `review.model` change in `ai-helm-values` ([ADR-0051](0051-per-model-config.md)) and
+Any swap is a config change in `ai-helm-values` ([ADR-0051](0051-per-model-config.md)) — `review.model`
+for a same-provider swap, plus the endpoint `baseUrl` + API key/secret for a cross-provider move — and
 should be gated by an eval pass ([ADR-0049](0049-eval-driven-reviewer-prompt-iteration.md)), not shipped
 on leaderboard scores.
 
@@ -117,6 +125,18 @@ on leaderboard scores.
 - [ADR-0051](0051-per-model-config.md) — per-model config block (the swap lever).
 - [ADR-0053](0053-remove-review-fallback-model.md) — single model + retry/breaker (no failover).
 - [ADR-0049](0049-eval-driven-reviewer-prompt-iteration.md) — eval-driven model/prompt changes.
-- Provider/benchmark sources (mid-2026): Artificial Analysis (MiniMax-M2.7, GLM-4.7, Cerebras
-  provider pages), DeepInfra model pages + blog benchmarks, Novita & Fireworks M2.7 model pages,
-  Cerebras GLM-4.7 blog. Throughput/price corroborated; intelligence scores directional.
+- Umbrella: review-agent epic [#177](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/177).
+
+### Provider / benchmark sources (mid-2026)
+
+Throughput/price corroborated across these; intelligence scores are directional (see the Confidence
+note above).
+
+- MiniMax-M2.7 pricing/quant: [DeepInfra](https://deepinfra.com/MiniMaxAI/MiniMax-M2.7),
+  [Novita](https://novita.ai/models/model-detail/minimax-minimax-m2.7),
+  [Fireworks](https://fireworks.ai/models/fireworks/minimax-m2p7).
+- M2.7 cross-provider throughput/TTFT: [Artificial Analysis — MiniMax-M2.7 providers](https://artificialanalysis.ai/models/minimax-m2-7/providers).
+- GLM-4.7 throughput (DeepInfra vs Cerebras): [Artificial Analysis — GLM-4.7 providers](https://artificialanalysis.ai/models/glm-4-7/providers),
+  [Cerebras — GLM-4.7](https://www.cerebras.ai/blog/glm-4-7), [Cerebras pricing](https://www.cerebras.ai/pricing).
+- GLM-4.7-Flash pricing/quant: [DeepInfra — GLM-4.7-Flash](https://deepinfra.com/zai-org/GLM-4.7-Flash).
+- DeepSeek-V4 / Kimi K2.6 / Qwen3 pricing: [DeepInfra pricing](https://deepinfra.com/pricing).
