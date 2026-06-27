@@ -89,6 +89,13 @@ pub fn index_prune_deleted(chunks: u64, graph_nodes: u64) {
     counter!("lci_index_prune_graph_nodes_deleted_total").increment(graph_nodes);
 }
 
+/// Terminal `github_outbox` rows pruned across one sweep (ADR-0059 GC): delivered (`posted`) +
+/// dead-lettered (`failed`) rows past their retention window.
+pub fn outbox_prune_deleted(posted: u64, failed: u64) {
+    counter!("lci_outbox_prune_posted_deleted_total").increment(posted);
+    counter!("lci_outbox_prune_failed_deleted_total").increment(failed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
