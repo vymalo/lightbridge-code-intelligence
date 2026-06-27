@@ -208,6 +208,15 @@ async fn run_opengrep(
         .env("OPENGREP_ENABLE_VERSION_CHECK", "0")
         .env("SEMGREP_SEND_METRICS", "off")
         .env("OPENGREP_SEND_METRICS", "off")
+        // Force UTF-8. opengrep is frozen-CPython and reads its rule files with Python's locale-default
+        // codec; the slim runner image has NO locale set, so that default is **ASCII** and any rule file
+        // with a non-ASCII byte (an em-dash / smart-quote in a rule message — opengrep-rules has many)
+        // crashes the config load with `UnicodeDecodeError`, exit 2, no SARIF (every scan silently fails,
+        // observed live). `PYTHONUTF8=1` is the locale-independent fix (CPython UTF-8 Mode); LANG/LC_ALL
+        // are belt-and-suspenders for any path that consults the locale rather than the interpreter flag.
+        .env("PYTHONUTF8", "1")
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
         .current_dir(&checkout_abs)
         // Scan only the changed files (relative to the checkout cwd).
         .args(targets);
@@ -219,12 +228,15 @@ async fn run_opengrep(
 
     if !sarif_path.exists() {
         // No SARIF written → opengrep didn't run to completion (bad rules path, crash, etc.). Surface
-        // its stderr (bounded) so the failure is diagnosable from the runner log.
+        // BOTH streams (bounded): under `--quiet` a crash traceback can land on stdout, so stderr alone
+        // was empty and undiagnosable on the first live failure — include stdout too.
         let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let detail = format!("{stderr}{stdout}");
         anyhow::bail!(
             "opengrep produced no SARIF (exit {}): {}",
             run.status,
-            truncate(stderr.trim(), 500)
+            truncate(detail.trim(), 600)
         );
     }
     // Bounded read: the scan is scoped to the PR's changed files, so the SARIF is small in practice, but
