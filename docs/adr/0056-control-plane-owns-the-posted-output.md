@@ -1,6 +1,8 @@
 # ADR-0056: The control plane owns what gets posted (PR review-only channel + failure notice)
 
-- **Status:** Accepted
+- **Status:** Accepted — the "control plane owns the post" principle here is reinforced by
+  [ADR-0059](0059-reconciler-owns-all-github-egress.md), which moves the *mechanism* (serve posting
+  synchronously) to a single reconciler-owned egress outbox. The PR review-only channel decision stands.
 - **Date:** 2026-06-26
 - **Deciders:** @stephane-segning
 
