@@ -119,17 +119,22 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
             }
             ReapAction::Fail => {
                 delete_dead_job(launcher, &task).await;
-                db::set_task_status(
+                let marked = db::set_task_status(
                     pool,
                     task.id,
                     "failed",
                     Some("Stuck task exhausted retries; failed by the reaper after its Job stopped reporting."),
                 )
-                .await
-                .map(|_| {
+                .await;
+                if marked.is_ok() {
                     crate::http::metrics::reap_outcome("failed");
                     tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
-                })
+                    // The uncatchable-kill notice (ADR-0057), now via the egress outbox (ADR-0059): the
+                    // keyless dispatcher can't POST, but it CAN write an intent row — the reconciler
+                    // delivers it. No sweep, no settle buffer.
+                    enqueue_reaper_failure_notice(pool, task.id).await;
+                }
+                marked.map(|_| ())
             }
         };
         if let Err(error) = result {
@@ -172,6 +177,25 @@ async fn delete_dead_job<L: TaskLauncher>(launcher: &L, task: &db::ReapableTask)
         if let Err(error) = launcher.delete_job(name).await {
             tracing::warn!(%error, task_id = %task.id, job_name = name, "reaper: failed to delete dead Job before requeue");
         }
+    }
+}
+
+/// Enqueue the ADR-0056 failure notice for a reaper-failed PR task (ADR-0059 egress outbox). A non-PR
+/// task (e.g. an index run) has no audience, so it's skipped. Best-effort: any error is logged. The
+/// `failure_notice` dedup_key means a task that was *also* runner-reported-failed isn't double-notified.
+async fn enqueue_reaper_failure_notice(pool: &sqlx::PgPool, task_id: uuid::Uuid) {
+    let context = match db::get_task_context(pool, task_id).await {
+        Ok(Some(c)) if c.target_type == "pull_request" => c,
+        _ => return,
+    };
+    let t = crate::outbox::Target {
+        task_id: Some(task_id),
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+    };
+    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
+        tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing failure notice failed (non-fatal)");
     }
 }
 

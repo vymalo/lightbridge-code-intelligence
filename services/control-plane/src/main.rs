@@ -32,8 +32,8 @@ mod queue;
 // Foundational modules the groups above build on.
 mod config;
 mod db;
-mod failure_notice;
 mod jwt;
+mod outbox;
 mod review;
 mod types;
 
@@ -416,48 +416,57 @@ async fn main() -> anyhow::Result<()> {
     match role.as_str() {
         "serve" => serve(state).await,
         "dispatcher" => run_dispatcher(state).await,
-        "poller" => run_poller(state).await,
-        other => anyhow::bail!("unknown role {other:?} (expected: serve | dispatcher | poller)"),
+        // `poller` is the legacy alias for `reconciler` (ADR-0058); accept both so the binary and the
+        // Deployment's role string can be flipped in either order across the rename rollout.
+        "poller" | "reconciler" => run_reconciler(state).await,
+        other => anyhow::bail!(
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler [| poller])"
+        ),
     }
 }
 
-/// The poller role (ADR-0035): a single replica that periodically reads reactions on the comments we
-/// posted and reconciles them into `review_feedback`. Requires a database and — unlike serve — the
-/// GitHub App key (to mint installation tokens); run as ONE replica so reactions aren't double-polled.
-async fn run_poller(state: AppState) -> anyhow::Result<()> {
+/// The reconciler role (ADR-0058): a single replica that owns **all GitHub egress** — it drains the
+/// `github_outbox` and posts each intent (ADR-0059) — and reads 👍/👎 reactions back into
+/// `review_feedback` (ADR-0035). Requires a database and — like serve — the GitHub App key; run as ONE
+/// replica so egress isn't double-posted and reactions aren't double-polled.
+async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
     let pool = state
         .db
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("poller requires DATABASE_URL"))?;
+        .ok_or_else(|| anyhow::anyhow!("reconciler requires DATABASE_URL"))?;
     let app = state.github.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "poller requires the GitHub App key (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY)"
+            "reconciler requires the GitHub App key (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY)"
         )
     })?;
     spawn_metrics_server(state.metrics.clone());
-    let interval = std::time::Duration::from_secs(
-        std::env::var("POLLER_INTERVAL_SECS")
+    // Env: prefer RECONCILER_*; fall back to the legacy POLLER_* so the rename doesn't require a
+    // simultaneous values change.
+    let env_u64 = |a: &str, b: &str, default: u64| {
+        std::env::var(a)
+            .or_else(|_| std::env::var(b))
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300),
-    );
-    let within_days = std::env::var("POLLER_WINDOW_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(14);
-    // A window of 0 (or negative) makes every "completed within the last N days" bound empty, silently
-    // disabling BOTH the feedback poll and the failure-notice sweep with no error. Clamp to 1 and say
-    // so, so an operator typo (`POLLER_WINDOW_DAYS=0`) is loud, not invisible (#216 review).
+            .unwrap_or(default)
+    };
+    let interval = std::time::Duration::from_secs(env_u64(
+        "RECONCILER_INTERVAL_SECS",
+        "POLLER_INTERVAL_SECS",
+        300,
+    ));
+    let within_days = env_u64("RECONCILER_WINDOW_DAYS", "POLLER_WINDOW_DAYS", 14) as i32;
+    // A window of 0 (or negative) makes the feedback poll's "completed within the last N days" bound
+    // empty, silently disabling it. Clamp to 1 and say so (#216 review).
     let within_days = if within_days < 1 {
         tracing::warn!(
             within_days,
-            "POLLER_WINDOW_DAYS < 1 would disable polling; clamping to 1"
+            "RECONCILER_WINDOW_DAYS < 1 would disable the feedback poll; clamping to 1"
         );
         1
     } else {
         within_days
     };
-    queue::poller::run(pool, app, interval, within_days).await
+    queue::reconciler::run(pool, app, state.review.clone(), interval, within_days).await
 }
 
 /// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).

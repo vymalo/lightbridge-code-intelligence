@@ -4,6 +4,6 @@
 pub(crate) mod dispatcher;
 pub(crate) mod index_sweeper;
 pub(crate) mod lifecycle;
-pub(crate) mod poller;
 pub(crate) mod reaper;
+pub(crate) mod reconciler;
 pub(crate) mod tasks;
