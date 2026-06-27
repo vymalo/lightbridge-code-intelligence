@@ -366,6 +366,14 @@ fn remove_spans(input: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// Invitation to leave a 👍/👎 reaction so the feedback poller (ADR-0035) has a signal to read. The
+/// reactions were always polled, but nothing ever asked the author to leave one — so the channel sat
+/// idle. Appended to every surface the poller actually reads reactions on: inline findings and the
+/// answer/reply. Deliberately **not** on the review summary (a `reviews` row — GitHub exposes no
+/// reactions endpoint for a PR review body, and the poller doesn't poll it) nor the failure notice
+/// (don't beg feedback on an apology).
+const FEEDBACK_FOOTER: &str = "\n\n---\n> Was this useful? React 👍/👎 to give us feedback";
+
 fn inline_body(finding: &Finding) -> String {
     // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
     // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
@@ -381,6 +389,7 @@ fn inline_body(finding: &Finding) -> String {
         body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
     }
     body.push_str(&resources_block(finding));
+    body.push_str(FEEDBACK_FOOTER);
     body
 }
 
@@ -479,8 +488,9 @@ pub fn render_answer_body(answer: &str) -> String {
     format!(
         "## Lightbridge answer\n\n{}\n\n---\n_🤖 AI-generated answer — treat it as untrusted, \
          verify before acting; a human owns the final decision \
-         ([AI governance](https://adorsys-gis.github.io/ai-governance/))._",
-        strip_model_artifacts(answer)
+         ([AI governance](https://adorsys-gis.github.io/ai-governance/))._{}",
+        strip_model_artifacts(answer),
+        FEEDBACK_FOOTER
     )
 }
 
@@ -553,6 +563,30 @@ mod tests {
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));
         assert!(body.contains("**Resources**\n- https://cwe.mitre.org/data/definitions/476.html"));
+    }
+
+    /// The 👍/👎 invitation rides only on the surfaces the feedback poller actually reads reactions on
+    /// (inline findings + the answer/reply) — not the review summary (no reactions endpoint, not polled)
+    /// nor the failure notice (don't beg feedback on an apology).
+    #[test]
+    fn feedback_footer_only_on_reaction_polled_surfaces() {
+        let cta = "Was this useful? React 👍/👎";
+        assert!(
+            inline_body(&finding("a.rs", 1, "x")).contains(cta),
+            "inline finding invites a reaction"
+        );
+        assert!(
+            render_answer_body("hi").contains(cta),
+            "the answer/reply invites a reaction"
+        );
+        assert!(
+            !render_body("verdict", &[], &[]).contains(cta),
+            "the review summary is not reaction-pollable — no false invitation"
+        );
+        assert!(
+            !render_failure_notice().contains(cta),
+            "the failure notice does not solicit feedback"
+        );
     }
 
     #[test]
