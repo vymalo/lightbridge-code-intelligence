@@ -328,6 +328,11 @@ pub struct ReviewConfig {
     /// Always present (defaults applied at resolve time). These are the **primary** model's per-request
     /// knobs + the loop-level breaker.
     pub resilience: ResilienceConfig,
+    /// FAST tier (ADR-0062): when `true` the agent runs a single diff-only turn with **no retrieval
+    /// tools** and no investigation loop (SAST still posts independently). This is a **per-task** flag —
+    /// NOT from file config — set by `main.rs` from the task context's `tier` (`fast` → `true`); a Job
+    /// runs one task, so mutating it per-run on the resolved config is sound. Defaults to `false` (deep).
+    pub fast: bool,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -440,6 +445,7 @@ impl ReviewConfig {
             extra: serde_json::Map::new(),
             stream: stream_from_env(),
             resilience: ResilienceConfig::from_env(),
+            fast: false, // per-task; main.rs sets it from the task tier (ADR-0062)
         }))
     }
 
@@ -532,6 +538,7 @@ impl ReviewConfig {
                     .map(|n| n as u32)
                     .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
             },
+            fast: false, // per-task; main.rs sets it from the task tier (ADR-0062)
         }))
     }
 }

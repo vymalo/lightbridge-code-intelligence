@@ -94,6 +94,10 @@ pub struct TaskContextResponse {
     /// Run kind (ADR-0033): `review` (diff-scoped findings, the default) or `ask` (a conversational
     /// answer posted as a single reply comment). The runner branches on this.
     pub kind: String,
+    /// Review tier (ADR-0062): `fast` (automatic `pull_request opened` — SAST + one diff-only LLM turn,
+    /// no retrieval) or `deep` (`@mention` — full retrieval, multi-turn). The runner shapes its loop on
+    /// this. Defaults to `deep` (the full/safe behavior) for any task that didn't set it.
+    pub tier: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo has a reusable semantic index — i.e. a latest indexed snapshot exists
@@ -210,6 +214,7 @@ pub async fn get_context(
         target_id: context.target_id,
         command: context.command_text,
         kind: context.kind,
+        tier: context.tier,
         base_sha: context.base_sha,
         head_sha: context.head_sha,
         repo_indexed,

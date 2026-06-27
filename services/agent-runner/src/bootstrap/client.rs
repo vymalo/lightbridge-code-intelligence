@@ -24,6 +24,11 @@ pub struct TaskContext {
     /// runner branches on this. Defaults to `review` if an older control plane omits the field.
     #[serde(default = "default_run_kind")]
     pub kind: String,
+    /// Review tier (ADR-0062): `fast` (automatic `pull_request opened` — SAST + one diff-only LLM turn,
+    /// no retrieval) or `deep` (`@mention` — full retrieval, multi-turn). Defaults to `deep` (the full,
+    /// safe behavior) if an older control plane omits the field.
+    #[serde(default = "default_tier")]
+    pub tier: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo already has a semantic index — review reuses it instead of re-indexing
@@ -46,6 +51,12 @@ pub struct TaskContext {
 /// Default run kind when the control plane omits it (back-compat): a diff-scoped review.
 fn default_run_kind() -> String {
     "review".to_string()
+}
+
+/// Default review tier when the control plane omits it (back-compat): the full `deep` review, so an
+/// older control plane never silently downgrades a run to the fast/shallow path.
+fn default_tier() -> String {
+    "deep".to_string()
 }
 
 impl TaskContext {
@@ -566,6 +577,7 @@ mod tests {
             target_id: 7,
             command: "review".into(),
             kind: "review".into(),
+            tier: "deep".into(),
             base_sha: None,
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,

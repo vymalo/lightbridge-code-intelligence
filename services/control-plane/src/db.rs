@@ -943,6 +943,10 @@ pub struct NewTask {
     /// automatic first review uses `0`). The explicit `@mention` path goes through
     /// [`create_explicit_task`], which computes the epoch inside the INSERT and ignores this field.
     pub run_epoch: i32,
+    /// Review tier (ADR-0062): `"fast"` (automatic `pull_request opened` — SAST + one diff-only LLM
+    /// turn, no retrieval) or `"deep"` (`@mention` — full retrieval, multi-turn). The runner reads it
+    /// from the task context. Index tasks don't set it (the column defaults to `deep`, ignored).
+    pub tier: String,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -1030,8 +1034,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, {INITIAL_TASK_STATUS_SQL}) \
+         target_id, command_text, base_sha, head_sha, run_epoch, tier, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -1046,6 +1050,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.base_sha)
     .bind(&task.head_sha)
     .bind(task.run_epoch)
+    .bind(&task.tier)
     .fetch_optional(pool)
     .await?;
 
@@ -1078,8 +1083,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
             "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-             target_id, command_text, base_sha, head_sha, run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+             target_id, command_text, base_sha, head_sha, tier, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -1095,6 +1100,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(&task.command_text)
         .bind(&task.base_sha)
         .bind(&task.head_sha)
+        .bind(&task.tier)
         .fetch_one(pool)
         .await;
         match result {
@@ -1711,6 +1717,9 @@ pub struct TaskContextRow {
     /// Run kind (ADR-0033): `review` or `ask`. The runner branches on this — a `review` produces
     /// diff-scoped findings, an `ask` produces a conversational answer.
     pub kind: String,
+    /// Review tier (ADR-0062): `fast` (auto PR-opened — SAST + one diff-only LLM turn, no retrieval) or
+    /// `deep` (`@mention` — full retrieval, multi-turn). The runner branches on this for the loop shape.
+    pub tier: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
 }
@@ -1723,7 +1732,7 @@ pub async fn get_task_context(
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
-                t.target_type, t.target_id, t.command_text, t.kind, t.base_sha, t.head_sha \
+                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )
@@ -2019,6 +2028,7 @@ mod tests {
             base_sha: Some("base".to_string()),
             head_sha: Some(head.to_string()),
             run_epoch: 0,
+            tier: "fast".to_string(),
         }
     }
 
@@ -2270,6 +2280,7 @@ mod tests {
             base_sha: None,
             head_sha: None,
             run_epoch: 0,
+            tier: "deep".to_string(),
         };
         let issue_id = create_task(&pool, &issue)
             .await
@@ -2337,6 +2348,7 @@ mod tests {
             base_sha: Some("base".to_string()),
             head_sha: Some(head.to_string()),
             run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
+            tier: "deep".to_string(),
         };
 
         let first = create_explicit_task(&pool, &mention("h1")).await.unwrap();
@@ -2527,6 +2539,7 @@ mod tests {
                     base_sha: None,
                     head_sha: None,
                     run_epoch: 0,
+                    tier: "deep".to_string(),
                 },
             )
             .await
@@ -3084,7 +3097,38 @@ mod tests {
         assert_eq!(context.installation_id, 99);
         assert_eq!(context.command_text, "review");
         assert_eq!(context.kind, "review", "run kind round-trips (ADR-0033)");
+        assert_eq!(
+            context.tier, "fast",
+            "the automatic PR review is the FAST tier (ADR-0062)"
+        );
         assert_eq!(context.head_sha.as_deref(), Some("head1"));
+
+        // The DEEP tier (an @mention) round-trips too.
+        let deep_id = create_explicit_task(
+            &pool,
+            &NewTask {
+                repository_id: repo_id,
+                installation_id: 99,
+                github_delivery_id: "d1".to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: 8,
+                command_text: "@lightbridge review".to_string(),
+                base_sha: None,
+                head_sha: Some("head2".to_string()),
+                run_epoch: 0,
+                tier: "deep".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let deep_ctx = get_task_context(&pool, deep_id)
+            .await
+            .unwrap()
+            .expect("deep task exists");
+        assert_eq!(
+            deep_ctx.tier, "deep",
+            "an @mention review is the DEEP tier (ADR-0062)"
+        );
 
         assert!(
             get_task_context(&pool, Uuid::nil())

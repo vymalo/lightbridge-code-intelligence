@@ -249,6 +249,11 @@ async fn run(
     let mut review_detail: Option<String> = None;
     let review_summary = match review_config.filter(|_| context.command != "index") {
         Some(review) => {
+            // Two-tier review (ADR-0062): the task's tier shapes the loop. `fast` (automatic PR-opened)
+            // runs SAST + a single diff-only LLM turn with no retrieval; `deep` (@mention) is the full
+            // run. Tier is per-task; own a copy of the resolved config to stamp it (one task per Job).
+            let mut review = review.clone();
+            review.fast = context.tier == "fast";
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
@@ -278,7 +283,7 @@ async fn run(
             let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
             let mut transcript = Vec::new();
             let outcome = review::run_native_agent(
-                review,
+                &review,
                 &context.command,
                 diff.as_ref(),
                 repo_instructions.as_deref(),

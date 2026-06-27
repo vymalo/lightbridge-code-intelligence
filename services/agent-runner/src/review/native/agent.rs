@@ -270,6 +270,8 @@ pub async fn run_native_agent(
         max_retries = review.resilience.max_retries,
         circuit_breaker_threshold = review.resilience.circuit_breaker_threshold,
         stream = review.stream,
+        // Review tier (ADR-0062): `fast` = single diff-only turn, no retrieval; `deep` = full loop.
+        tier = if review.fast { "fast" } else { "deep" },
         // The `review.extra` passthrough actually in force (e.g. `reasoning_effort`) — serialized into
         // every chat body. Logged so a run proves *from the logs* which reasoning budget was applied,
         // not just which one the ConfigMap claims. Empty `{}` = nothing extra sent.
@@ -317,7 +319,9 @@ pub async fn run_native_agent(
 
     // Operator-tunable turn budget (#137): a tight ceiling used to exhaust mid-PR with findings still
     // buffered. Generous default lives in config; a turn is ~6s on the deepseek model.
-    let max_turns = review.max_turns;
+    // Two-tier review (ADR-0062): the FAST tier (automatic PR-opened) is a SINGLE diff-only turn — no
+    // investigation loop — so a cheap signal posts on every PR; the deep `@mention` run uses the budget.
+    let max_turns = if review.fast { 1 } else { review.max_turns };
     // Risk-first batching (ADR-0042): how many read-only tool calls we run concurrently per turn.
     let max_batch_size = review.max_batch_size.max(1);
     // Once the model has recorded ≥1 finding we nudge it to call `finish` so a wandering run doesn't burn
@@ -423,7 +427,11 @@ pub async fn run_native_agent(
         let files_spent = files_read >= max_files_read;
         let searches_spent = searches >= max_searches;
         let turn_defs_owned: Vec<ToolDef>;
-        let turn_defs: &[ToolDef] = if in_winddown {
+        let turn_defs: &[ToolDef] = if review.fast {
+            // FAST tier (ADR-0062): never offer retrieval/read_file — the single turn records findings
+            // (from the diff + SAST digest in the prompt) and finishes. Same reduced set as wind-down.
+            &winddown_defs
+        } else if in_winddown {
             &winddown_defs
         } else if files_spent || searches_spent || suppress_record {
             turn_defs_owned = defs
@@ -806,7 +814,9 @@ pub async fn run_native_agent(
             // the explicit list so a single run accounts for the whole change instead of finding one
             // issue and stopping. After the wind-down boundary the #173 convergence wins — we never
             // bounce there, so this can't reopen the rabbit-hole the wind-down exists to close.
-            if !coverage_bounced && turn < winddown {
+            // The FAST tier (ADR-0062) is a single diff-only turn — no coverage bounce (it would waste
+            // the only turn and never finalize). The deep run still enforces full-diff coverage.
+            if !review.fast && !coverage_bounced && turn < winddown {
                 let uncovered: Vec<&str> = changed_files
                     .difference(&engaged_files)
                     .map(String::as_str)
@@ -830,7 +840,9 @@ pub async fn run_native_agent(
             // verification turn — re-check each against its cited evidence and `retract_finding` the
             // ones that don't hold. One-shot; this is the lever that kills confidently-wrong blockers
             // (the actual quality gap), which a self-reported confidence label would not catch.
-            if !refute_bounced && p0p1_recorded > 0 {
+            // FAST tier (ADR-0062): no refute bounce — it would consume the single turn. SAST is
+            // deterministic and the lone LLM turn is a light pass; deep `@mention` runs the refute pass.
+            if !review.fast && !refute_bounced && p0p1_recorded > 0 {
                 refute_bounced = true;
                 tracing::info!(
                     task_id = %task_id,
@@ -1162,6 +1174,7 @@ mod tests {
                 max_retries: 0,
                 circuit_breaker_threshold: 3,
             },
+            fast: false,
         }
     }
 
@@ -2099,6 +2112,97 @@ mod tests {
             user_text[4].contains("Turn budget almost spent"),
             "budget message injected by the wind-down turn: {:?}",
             user_text[4]
+        );
+    }
+
+    // ── Two-tier review (ADR-0062): the FAST tier is a SINGLE diff-only turn with NO retrieval/read_file
+    // tools offered. Even though `max_turns` is generous in config, `review.fast` caps the loop to one
+    // turn; the model records from the diff (+ SAST digest) and finishes. ─────────────────────────────
+    #[tokio::test]
+    async fn fast_tier_runs_one_turn_with_no_retrieval_tools() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let user_text = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: user_text.clone(),
+                // The single turn finishes immediately (the realistic fast-tier shape).
+                response: tool_call_reply("finish", r#"{"summary":"Fast pass — see SAST."}"#),
+            })
+            .mount(&chat)
+            .await;
+
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        // Only the finish-summary endpoint is needed — a fast run never calls search/graph.
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.max_turns = 150; // generous budget — `fast` must override it to a single turn.
+        review.fast = true;
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("fast tier finishes cleanly");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "fast tier finishes in one turn; got {outcome:?}"
+        );
+
+        let offered = offered.lock().unwrap();
+        assert_eq!(offered.len(), 1, "fast tier is exactly one chat turn");
+        let set = &offered[0];
+        for forbidden in [
+            super::super::tools::VECTOR_SEMANTIC_SEARCH,
+            super::super::tools::GRAPH_FIND_SYMBOL,
+            super::super::tools::GRAPH_GET_CALLERS,
+            super::super::tools::READ_FILE,
+        ] {
+            assert!(
+                !set.iter().any(|n| n == forbidden),
+                "fast tier offers no retrieval/read_file ({forbidden}): {set:?}"
+            );
+        }
+        assert!(set.iter().any(|n| n == FINISH), "fast tier keeps finish");
+        assert!(
+            set.iter().any(|n| n == ADD_REVIEW_COMMENT),
+            "fast tier keeps add_review_comment (diff present): {set:?}"
         );
     }
 

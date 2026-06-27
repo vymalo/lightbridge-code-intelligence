@@ -315,6 +315,7 @@ mod tests {
                 base_sha: None,
                 head_sha: Some("head1".to_string()),
                 run_epoch: 0,
+                tier: "deep".to_string(),
             },
         )
         .await
