@@ -378,6 +378,10 @@ pub async fn run_native_agent(
     let context_window = review.context_window;
     let mut overflow_finalize = false;
 
+    // Resolve the reasoning-log cap once (it can't change mid-run): `std::env::var` takes the process
+    // env lock on every call, and a review runs many turns. (Gemini/lightbridge review on #220.)
+    let reasoning_log_cap = reasoning_log_chars();
+
     for turn in 0..max_turns {
         let turn_started = Instant::now();
 
@@ -546,6 +550,9 @@ pub async fn run_native_agent(
         let usage = completion.usage;
         let rate_limit = completion.rate_limit;
         let reasoning = completion.reasoning;
+        // Decode the chain-of-thought length once and reuse it across both log lines below (the string
+        // can be many KB). (Gemini/lightbridge review on #220.)
+        let reasoning_chars = reasoning.as_deref().map(|r| r.chars().count()).unwrap_or(0);
         let assistant = completion.message;
         let calls = assistant.tool_calls.clone();
 
@@ -563,7 +570,7 @@ pub async fn run_native_agent(
             reasoning_tokens = usage.and_then(|u| u.reasoning_tokens()).unwrap_or(-1),
             // Chars of chain-of-thought this turn — the reliable "how far did it think" signal when the
             // gateway folds reasoning into `completion_tokens` and reports `reasoning_tokens: 0` (GLM-5.2).
-            reasoning_chars = reasoning.as_deref().map(|r| r.chars().count()).unwrap_or(0),
+            reasoning_chars,
             ratelimit_remaining = rate_limit.remaining.map(|r| r as i64).unwrap_or(-1),
             ratelimit_limit = rate_limit.limit.map(|l| l as i64).unwrap_or(-1),
             latency_ms = turn_latency_ms,
@@ -589,16 +596,15 @@ pub async fn run_native_agent(
         // [`REASONING_LOG_CHARS_DEFAULT`]; `0` = unbounded) because a heavy reasoner (GLM-5.2) can emit
         // thousands of chars per turn; the full count is logged alongside via `reasoning_chars`.
         if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
-            let cap = reasoning_log_chars();
-            let shown = if cap == 0 {
+            let shown = if reasoning_log_cap == 0 {
                 reasoning
             } else {
-                truncate_on_boundary(reasoning, cap)
+                truncate_on_boundary(reasoning, reasoning_log_cap)
             };
             tracing::info!(
                 task_id = %task_id,
                 turn,
-                reasoning_chars = reasoning.chars().count(),
+                reasoning_chars,
                 reasoning = %shown,
                 "agent reasoning"
             );
