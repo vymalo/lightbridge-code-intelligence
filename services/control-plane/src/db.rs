@@ -323,15 +323,25 @@ pub async fn store_review_comments(
     Ok(())
 }
 
-/// Whether the control plane already posted **anything** to GitHub for this task — a grouped review
-/// (a `reviews` row) or any recorded comment (`review_comments`: an inline finding, a reply, or a
-/// prior failure notice). Gates the failure-fallback notice (ADR-0056): it must never double-post on
-/// top of a real review, and is idempotent across retries because the notice itself is recorded as a
-/// `review_comments` row.
-pub async fn has_posted_to_github(pool: &PgPool, task_id: Uuid) -> Result<bool, sqlx::Error> {
+/// Whether the task has already responded **or is about to** — anything posted to GitHub (a `reviews`
+/// row, or any recorded `review_comments`: an inline finding, a reply, or a prior failure notice) OR a
+/// `review`/`reply` intent still in flight (`pending`/`posted`) in the egress outbox. This is the gate
+/// the reconciler's failure-notice handler uses (ADR-0056/0059): it must never post a notice on top of a
+/// real review, and — because the `reviews` row is now written at *drain* time — a review intent that's
+/// enqueued-but-not-yet-delivered (e.g. transiently backing off) would otherwise read as "nothing posted"
+/// and let a misleading failure notice race ahead of it (#219 review). A `failed` (dead-lettered) review
+/// intent is deliberately excluded — then the review truly won't post, so the notice *should* fire.
+/// Idempotent across retries because the notice itself is recorded as a `review_comments` row.
+pub async fn has_responded_or_pending_content(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM reviews WHERE task_id = $1) \
-              OR EXISTS (SELECT 1 FROM review_comments WHERE task_id = $1)",
+              OR EXISTS (SELECT 1 FROM review_comments WHERE task_id = $1) \
+              OR EXISTS (SELECT 1 FROM github_outbox \
+                         WHERE task_id = $1 AND kind IN ('review', 'reply') \
+                           AND status IN ('pending', 'posted'))",
     )
     .bind(task_id)
     .fetch_one(pool)
@@ -404,9 +414,14 @@ pub async fn enqueue_github_post(
 }
 
 /// Claim up to `limit` due outbox rows in `(created_at, id)` order — `id` breaks the `created_at` ties
-/// that one-transaction enqueues share (`now()` is transaction-stable). `FOR UPDATE SKIP LOCKED` is a
-/// belt-and-braces guard; the reconciler is single-replica so claims never actually contend. The caller
-/// posts each, then [`mark_outbox_posted`] / [`mark_outbox_failed`].
+/// that one-transaction enqueues share (`now()` is transaction-stable). The caller posts each, then
+/// [`mark_outbox_posted`] / [`mark_outbox_failed`].
+///
+/// `FOR UPDATE SKIP LOCKED` only holds the row lock for the duration of *this* statement (no enclosing
+/// transaction), so it does **not** protect the claim→post→mark gap — two replicas could each claim a
+/// distinct disjoint set, then both deliver. Correctness here rests on the **single-replica** invariant
+/// (ADR-0058/0059), not the lock; the `SKIP LOCKED` just avoids a self-collision if a claim ever overlaps
+/// an in-flight one.
 pub async fn claim_outbox_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
     sqlx::query_as::<_, OutboxRow>(
         "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts \
@@ -2025,20 +2040,20 @@ mod tests {
         );
     }
 
-    /// ADR-0056: `has_posted_to_github` is the dedup gate for the failure-fallback notice — false until
-    /// a review (or any recorded comment, incl. a prior notice) exists for the task, then true.
+    /// ADR-0056: the failure-notice gate is false until the task has responded — then a posted review
+    /// (a `reviews` row) OR any recorded comment (an inline finding, a reply, or a prior notice) flips it
+    /// true, so a retry's failure never posts a second notice on top of real output.
     #[sqlx::test]
-    async fn has_posted_to_github_reflects_reviews_and_comments(pool: PgPool) {
+    async fn has_responded_reflects_posted_reviews_and_comments(pool: PgPool) {
         let repo_id = seed(&pool).await;
         let task = create_task(&pool, &pr_task(repo_id, "head1"))
             .await
             .unwrap()
             .expect("task");
-        // Nothing posted yet → false (a failed run here SHOULD get a fallback notice).
-        assert!(!has_posted_to_github(&pool, task).await.unwrap());
+        // Nothing posted or queued → false (a failed run here SHOULD get a fallback notice).
+        assert!(!has_responded_or_pending_content(&pool, task).await.unwrap());
 
-        // A recorded comment (e.g. the failure notice itself, or an inline finding) flips it to true,
-        // so a retry's failure won't post a second notice.
+        // A recorded comment (the failure notice itself, or an inline finding) flips it true.
         store_review_comments(
             &pool,
             task,
@@ -2051,22 +2066,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_posted_to_github(&pool, task).await.unwrap());
-    }
+        assert!(has_responded_or_pending_content(&pool, task).await.unwrap());
 
-    /// ADR-0056: a posted grouped review (a `reviews` row) also counts as "responded" — so a
-    /// finalize-then-crash never posts a fallback notice on top of a real review.
-    #[sqlx::test]
-    async fn has_posted_to_github_true_after_a_review_row(pool: PgPool) {
-        let repo_id = seed(&pool).await;
-        let task = create_task(&pool, &pr_task(repo_id, "head1"))
+        // A posted grouped review (a `reviews` row) also counts as responded.
+        let task2 = create_task(&pool, &pr_task(repo_id, "head2"))
             .await
             .unwrap()
             .expect("task");
-        assert!(!has_posted_to_github(&pool, task).await.unwrap());
+        assert!(!has_responded_or_pending_content(&pool, task2)
+            .await
+            .unwrap());
         upsert_review(
             &pool,
-            task,
+            task2,
             "summary",
             "body",
             0,
@@ -2078,7 +2090,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_posted_to_github(&pool, task).await.unwrap());
+        assert!(has_responded_or_pending_content(&pool, task2)
+            .await
+            .unwrap());
     }
 
     /// ADR-0059: an enqueued intent is claimable in order, idempotent on `dedup_key`, and the
@@ -2125,6 +2139,47 @@ mod tests {
         assert!(
             claim_outbox_batch(&pool, 10).await.unwrap().is_empty(),
             "a just-failed row is backed off, not immediately re-claimable"
+        );
+    }
+
+    /// #219 review: the failure-notice gate must treat a still-in-flight review intent as "responding",
+    /// so a transiently-backing-off review doesn't let a misleading apology race ahead of it — but a
+    /// dead-lettered (`failed`) review must NOT suppress the notice (then the review truly won't land).
+    #[sqlx::test]
+    async fn has_responded_or_pending_content_covers_in_flight_review(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "h"))
+            .await
+            .unwrap()
+            .expect("task");
+        let payload = serde_json::json!({ "pr": 7 });
+        assert!(
+            !has_responded_or_pending_content(&pool, task).await.unwrap(),
+            "nothing posted or queued yet"
+        );
+
+        // A pending review intent → counts as responding (suppress the notice).
+        enqueue_github_post(&pool, Some(task), 99, "o", "r", "review", &payload, "rk")
+            .await
+            .unwrap();
+        assert!(
+            has_responded_or_pending_content(&pool, task).await.unwrap(),
+            "a pending review intent means a review is coming"
+        );
+
+        // Once that review intent dead-letters, it no longer suppresses (the review won't post).
+        let id = claim_outbox_batch(&pool, 10).await.unwrap()[0].id;
+        for _ in 0..OUTBOX_MAX_ATTEMPTS {
+            sqlx::query("UPDATE github_outbox SET next_attempt_at = now() - interval '1 minute' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            mark_outbox_failed(&pool, id, "boom").await.unwrap();
+        }
+        assert!(
+            !has_responded_or_pending_content(&pool, task).await.unwrap(),
+            "a dead-lettered review no longer suppresses the failure notice"
         );
     }
 

@@ -173,10 +173,13 @@ async fn deliver(
             Ok(posted.id)
         }
         "failure_notice" => {
-            // Re-check the ADR-0056 dedup gate at post time: a finalize-then-fail may have already posted
-            // a real review, in which case there's nothing to apologise for — consume the row silently.
+            // Re-check the dedup gate at post time and consume silently if the task already responded —
+            // OR is *about to*: a `review`/`reply` intent still pending in the outbox (e.g. one that
+            // transiently 502'd and is backing off) means a real review is coming, so don't race a
+            // misleading apology ahead of it (#219 review). A dead-lettered (`failed`) review is excluded,
+            // so a review that truly can't be delivered still yields a notice.
             if let Some(task) = row.task_id {
-                if crate::db::has_posted_to_github(pool, task)
+                if crate::db::has_responded_or_pending_content(pool, task)
                     .await
                     .unwrap_or(false)
                 {
