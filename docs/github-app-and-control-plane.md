@@ -23,6 +23,10 @@ See [ADR-0001](adr/0001-use-github-app.md) for why a GitHub App is preferred ove
 - `installation_repositories`
 - `issue_comment`
 - `pull_request`
+- `push` — **required for index freshness.** A push to the **default branch** (e.g. a merged PR)
+  re-indexes the repo (`handle_push`); without this subscription the base index only ever runs once
+  (on approval) and goes stale, so retrieval returns 0 hits on new code. Needs the `Contents: Read`
+  permission (already listed above). See [ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md).
 - `pull_request_review`
 - `pull_request_review_comment`
 - `pull_request_review_thread`

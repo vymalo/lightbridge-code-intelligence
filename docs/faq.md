@@ -36,6 +36,17 @@ short-lived installation tokens. See [ADR-0001](adr/0001-use-github-app.md).
 Lightbridge first builds a baseline index. During that time, it can reply that indexing is still in
 progress.
 
+## My repo was indexed once but never again — why?
+
+The baseline index runs once when the repo is approved. After that it is kept fresh by a
+**push-driven re-index**: every push to the **default branch** (e.g. a merged PR) queues a new
+`index` task. If indexing only ever ran once and now returns stale/0-hit results on new code, the
+cause is almost always that the **GitHub App is not subscribed to the `push` event**. Add the *Push*
+subscription (it needs only `Contents: Read`, already granted) — see
+[the GitHub App setup](github-app-and-control-plane.md#recommended-webhook-subscriptions). The
+control plane's `handle_push` then re-indexes on each default-branch move (deduped against an
+in-flight index).
+
 ## Can Lightbridge review PRs from forks?
 
 Yes, but the execution profile should be stricter. For untrusted input, disable unnecessary
