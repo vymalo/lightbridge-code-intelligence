@@ -1,6 +1,6 @@
 # ADR-0060: Capture the model's reasoning (proof-of-work) + the GLM-5.2 latency finding
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @stephane-segning
 
@@ -78,9 +78,11 @@ Conclusions:
   that needs a control-plane handler + migration. A follow-up if we want it in the UI proof-of-work.
 - **Cost / limits:** full chain-of-thought can be verbose; `REASONING_LOG_CHARS` bounds the live log
   (the magnitude is always logged via `reasoning_chars`).
-- **Reopens** [ADR-0054](0054-review-model-and-provider-selection.md): the data above is the trigger that
-  ADR named; a decision to revert prod to M2.7 (or move GLM to a faster provider) belongs in a follow-up
-  to 0054, not here.
+- **Reopened then re-settled** [ADR-0054](0054-review-model-and-provider-selection.md): the data above is
+  the latency trigger that ADR named. Acting on it, the operator **reverted prod to `adorsys-reviewer`
+  (MiniMax-M2.7)** on 2026-06-27 — a `review.model` change in `ai-helm-values`, no rebuild — which
+  realigns prod with ADR-0054's standing decision and resolves the GLM-5.2 drift. This ADR's instrumentation
+  stands regardless of the model in force.
 
 ## References
 
