@@ -32,6 +32,7 @@ mod queue;
 // Foundational modules the groups above build on.
 mod config;
 mod db;
+mod failure_notice;
 mod jwt;
 mod review;
 mod types;
@@ -444,6 +445,18 @@ async fn run_poller(state: AppState) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(14);
+    // A window of 0 (or negative) makes every "completed within the last N days" bound empty, silently
+    // disabling BOTH the feedback poll and the failure-notice sweep with no error. Clamp to 1 and say
+    // so, so an operator typo (`POLLER_WINDOW_DAYS=0`) is loud, not invisible (#216 review).
+    let within_days = if within_days < 1 {
+        tracing::warn!(
+            within_days,
+            "POLLER_WINDOW_DAYS < 1 would disable polling; clamping to 1"
+        );
+        1
+    } else {
+        within_days
+    };
     queue::poller::run(pool, app, interval, within_days).await
 }
 

@@ -44,13 +44,13 @@ grouped review on `finalize`** ([ADR-0037](0037-agent-acts-via-mediated-tools.md
   behaving). A failed review is no longer silent to the author. Both changes live where the trust
   boundary already is — the control plane owns the post ([ADR-0002](0002-rust-control-plane-trust-boundary.md),
   [ADR-0022](0022-review-writeback-control-plane.md)).
-- **Limit — the uncatchable-kill gap (deliberately scoped).** The failure notice fires on the
-  **runner-reported** path (`POST /internal/tasks/{id}/status` → serve role). An **uncatchable** kill
-  (OOM / SIGKILL / node eviction) never reports; it is detected by the **reaper** in the **dispatcher**
-  role, which holds **no GitHub App key** (ADR-0002) and so cannot post. Covering that needs a
-  serve/poller-side component (the poller already loops with the App key, or a `NOTIFY` from
-  `set_task_status` to a serve listener) — deferred as a follow-up. The common case (the agent hits an
-  error and reports it) is covered now.
+- **Limit — the uncatchable-kill gap (now closed by [ADR-0057](0057-poller-posts-failure-notice-on-uncatchable-kill.md)).**
+  The failure notice here fires on the **runner-reported** path (`POST /internal/tasks/{id}/status` →
+  serve role). An **uncatchable** kill (OOM / SIGKILL / node eviction) never reports; it is detected by
+  the **reaper** in the **dispatcher** role, which holds **no GitHub App key** (ADR-0002) and so cannot
+  post. ADR-0057 closes this: the **poller** (which already loops with the App key) sweeps terminally
+  failed PR tasks with nothing posted and posts the same notice via a shared helper. This ADR ships the
+  common case (the agent hits an error and reports it); ADR-0057 ships the rest.
 - **Note:** `add_comment` is **not** removed — it remains the correct channel for an issue or an
   @mention question (no diff → the answer is a comment). The gate is by `target_type`, not a deletion.
 

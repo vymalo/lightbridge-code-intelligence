@@ -1167,10 +1167,12 @@ pub async fn get_status(
 /// posted for this task — a brief "review failed, retry" comment so the author isn't left in silence
 /// (ADR-0056). Loads the task's PR context + mints one token; any error is logged and ignored.
 ///
-/// NOTE (ADR-0056 gap): this fires only on the runner-reported path. An *uncatchable* kill
-/// (OOM / SIGKILL / node eviction) never reports — it's detected by the reaper in the **dispatcher**
-/// role, which holds no GitHub App key (ADR-0002), so it can't post. Full coverage needs a serve/poller
-/// component; deferred.
+/// The notice itself is posted by the shared [`crate::failure_notice::post_if_unposted`], which the
+/// poller's sweep also uses to cover the path serve can't: an *uncatchable* kill (OOM / SIGKILL / node
+/// eviction) the runner never reports, marked `failed` by the reaper in the keyless dispatcher
+/// (ADR-0057). The 😕 reaction stays here because it needs the review config the poller doesn't carry;
+/// the reaper-path notice therefore lands without the reaction, which is fine — the comment is what
+/// breaks the silence.
 async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
     let Some(app) = state.github.as_ref() else {
         return;
@@ -1196,57 +1198,5 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
         };
         react(app, &state.review, &target, "confused").await;
     }
-    // Fallback notice — ONLY if nothing was posted for this task (no review, reply, or prior notice),
-    // so a finalize-then-crash never double-posts and retries don't spam.
-    match crate::db::has_posted_to_github(pool, id).await {
-        Ok(true) => return, // a real review/answer already went out — nothing to apologise for
-        Ok(false) => {}
-        Err(error) => {
-            tracing::warn!(%error, task_id = %id, "review-failure feedback: posted-check failed");
-            return;
-        }
-    }
-    let body = crate::review::render_failure_notice();
-    match app
-        .create_issue_comment(
-            &token,
-            &context.owner,
-            &context.name,
-            context.target_id,
-            &body,
-        )
-        .await
-    {
-        Ok(posted) => {
-            tracing::info!(task_id = %id, "posted failure notice — review did not finalize (ADR-0056)");
-            // Record it so a retry's failure doesn't post a second notice (dedup via
-            // has_posted_to_github). If GitHub returned no id, or the store fails, the dedup row is
-            // missing — log it loudly, since a later retry could then post a duplicate notice (#215 review).
-            match posted.id {
-                Some(cid) => {
-                    if let Err(error) = crate::db::store_review_comments(
-                        pool,
-                        id,
-                        &[crate::db::ReviewCommentRef {
-                            github_comment_id: cid,
-                            kind: "failure_notice".to_string(),
-                            file: None,
-                            line: None,
-                        }],
-                    )
-                    .await
-                    {
-                        tracing::warn!(%error, task_id = %id, "recording failure notice for dedup failed — a retry may post a duplicate");
-                    }
-                }
-                None => tracing::warn!(
-                    task_id = %id,
-                    "failure notice posted but GitHub returned no comment id — dedup not recorded; a retry may duplicate"
-                ),
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, task_id = %id, "posting failure notice failed (non-fatal)")
-        }
-    }
+    crate::failure_notice::post_if_unposted(pool, app, &token, &context, id).await;
 }

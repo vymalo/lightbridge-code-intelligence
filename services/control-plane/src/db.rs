@@ -338,6 +338,45 @@ pub async fn has_posted_to_github(pool: &PgPool, task_id: Uuid) -> Result<bool, 
     .await
 }
 
+/// PR tasks that ended terminally (`failed`/`timed_out`) with **nothing posted** — no review, reply,
+/// or prior failure notice — and so are owed an ADR-0056 fallback notice. The poller sweeps these to
+/// cover an *uncatchable* kill the runner never reported: the reaper marks it `failed` in the keyless
+/// dispatcher (ADR-0002), so the key-holding poller posts (ADR-0057).
+///
+/// Scoped by `target_type = 'pull_request'` only — **not** `kind` — to match the serve path
+/// (`handle_review_failure` guards on `target_type` alone). A failed `ask`-on-PR is rare but also
+/// deserves a word over silence, and narrowing here would strand exactly those the serve path covers.
+///
+/// Bounded two ways, which keep the sweep cheap and self-limiting:
+/// - **only recent** — completed within the last `within_days`; an ancient failure is abandoned, not
+///   re-litigated (its author has long moved on), and the scan never walks the whole history.
+/// - **settled for a beat** — completed more than a couple of minutes ago, long enough that the
+///   synchronous serve path has already posted on a *reported* failure, so the two paths don't race a
+///   double-notice. A reaper-marked kill simply waits out this short buffer.
+///
+/// Once a notice is posted, its `failure_notice` `review_comments` row drops the task from this set on
+/// the next cycle (the `NOT EXISTS` below), so the sweep is idempotent and quiesces to empty.
+pub async fn failed_pr_tasks_without_feedback(
+    pool: &PgPool,
+    within_days: i32,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT t.id FROM tasks t \
+         WHERE t.status IN ('failed', 'timed_out') \
+           AND t.target_type = 'pull_request' \
+           AND t.completed_at IS NOT NULL \
+           AND t.completed_at < now() - interval '2 minutes' \
+           AND t.completed_at > now() - make_interval(days => $1) \
+           AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.task_id = t.id) \
+           AND NOT EXISTS (SELECT 1 FROM review_comments rc WHERE rc.task_id = t.id) \
+         ORDER BY t.completed_at DESC, t.id DESC \
+         LIMIT 200",
+    )
+    .bind(within_days)
+    .fetch_all(pool)
+    .await
+}
+
 /// A comment the poller should check for reactions, with the repo coordinates + installation needed to
 /// mint a token and hit the reactions API.
 #[derive(Debug, sqlx::FromRow)]
@@ -1961,6 +2000,68 @@ mod tests {
         .await
         .unwrap();
         assert!(has_posted_to_github(&pool, task).await.unwrap());
+    }
+
+    /// ADR-0057: the poller's sweep set. A PR task that failed a while ago with nothing posted is owed
+    /// a notice; the buffer hides a *just*-failed one (serve still owns that), and a recorded notice
+    /// removes it (idempotent).
+    #[sqlx::test]
+    async fn failed_pr_tasks_without_feedback_is_the_unposted_settled_set(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let owed = create_task(&pool, &pr_task(repo_id, "owed"))
+            .await
+            .unwrap()
+            .expect("task");
+        set_task_status(&pool, owed, "failed", Some("OOMKilled by the node"))
+            .await
+            .unwrap();
+        // Back-date past the settle buffer so it counts as a reaper-marked, runner-never-reported kill.
+        sqlx::query("UPDATE tasks SET completed_at = now() - interval '10 minutes' WHERE id = $1")
+            .bind(owed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            failed_pr_tasks_without_feedback(&pool, 14).await.unwrap(),
+            vec![owed],
+            "a settled, unposted PR failure is owed a notice"
+        );
+
+        // A second PR failure that *just* happened is still inside the buffer — serve's synchronous
+        // path owns it this instant, so the sweep must not race it.
+        let fresh = create_task(&pool, &pr_task(repo_id, "fresh"))
+            .await
+            .unwrap()
+            .expect("task");
+        set_task_status(&pool, fresh, "failed", Some("boom"))
+            .await
+            .unwrap();
+        assert_eq!(
+            failed_pr_tasks_without_feedback(&pool, 14).await.unwrap(),
+            vec![owed],
+            "a just-failed task is left to the serve path (still within the settle buffer)"
+        );
+
+        // Recording the notice (a `failure_notice` comment) drops the owed task from the set.
+        store_review_comments(
+            &pool,
+            owed,
+            &[ReviewCommentRef {
+                github_comment_id: 999,
+                kind: "failure_notice".to_string(),
+                file: None,
+                line: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed_pr_tasks_without_feedback(&pool, 14)
+                .await
+                .unwrap()
+                .is_empty(),
+            "once the notice is posted the sweep quiesces (idempotent)"
+        );
     }
 
     /// ADR-0033 slice 3: an `issue` target (no SHAs) persists and reads back, and the idempotency key

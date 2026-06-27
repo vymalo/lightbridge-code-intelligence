@@ -484,11 +484,13 @@ pub fn render_answer_body(answer: &str) -> String {
     )
 }
 
-/// The fallback notice posted on a PR when a review task fails terminally **without** finalizing, so
-/// the author isn't left in silence (ADR-0056). Intentionally short and actionable — no findings ran.
+/// The fallback notice posted on a PR when a task fails terminally **without** finalizing, so the
+/// author isn't left in silence (ADR-0056). Intentionally short and actionable. The body avoids
+/// "review"/"findings" because the sweep is `kind`-agnostic — a failed `ask`-on-PR gets this too
+/// (ADR-0057) — so it must read true for a question as well as a review.
 pub fn render_failure_notice() -> String {
     "## Lightbridge review\n\n\
-     ⚠️ Something went wrong and I couldn't finish this review — no findings were posted.\n\n\
+     ⚠️ Something went wrong and I couldn't finish — nothing was posted.\n\n\
      Re-mention me on this PR (or push a new commit) to try again.\n\n\
      ---\n_🤖 AI-generated notice — treat it as untrusted, verify before acting; a human owns the \
      final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._"
