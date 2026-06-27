@@ -1577,20 +1577,33 @@ pub async fn repository_installation_id(
 }
 
 /// Enqueue a standalone **index** task for a repository's default branch (Epic #75, Milestone B —
-/// runs on admin approval). Skips if an index task is already active for the repo (so re-approving
-/// doesn't pile up duplicates). Returns the new task id, or `None` if one was already pending/running.
-/// Unlike review tasks it has no originating delivery (`github_delivery_id` NULL) and no SHA (the
-/// runner indexes the default-branch HEAD).
+/// runs on admin approval, and on every default-branch push via `handle_push`). Skips if an index task
+/// is already active for the repo (so a burst of pushes / a re-approve doesn't pile up duplicates).
+/// Returns the new task id, or `None` if one was already pending/running. Unlike review tasks it has no
+/// originating delivery (`github_delivery_id` NULL) and no SHA (the runner indexes the default-branch
+/// HEAD).
+///
+/// `run_epoch` is computed as `MAX+1` over the same columns as `tasks_idempotency_idx` (minus
+/// `run_epoch`), exactly like [`create_explicit_task`]. This is **load-bearing**: an index task carries
+/// a NULL `head_sha`, so every re-index of a repo shares the idempotency tuple
+/// `(repo, 'repository', repo, 'index', NULL, run_epoch)` — and `tasks_idempotency_idx` is
+/// `NULLS NOT DISTINCT`. Hardcoding `run_epoch = 0` (the original bug) meant the *second* index for a
+/// repo passed the `NOT EXISTS` active-guard (the first index was terminal, not active) but then
+/// **collided on the unique index** → `duplicate key` error → a repo was only ever indexed once.
 pub async fn create_index_task(
     pool: &PgPool,
     repository_id: i64,
     installation_id: i64,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    let inserted: Option<Uuid> = sqlx::query_scalar(
+    let inserted = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO tasks (id, repository_id, installation_id, target_type, target_id, \
          command_text, run_epoch, status) \
-         SELECT $1, $2, $3, 'repository', $2, 'index', 0, 'queued' \
+         SELECT $1, $2, $3, 'repository', $2, 'index', \
+           (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
+              WHERE repository_id = $2 AND target_type = 'repository' AND target_id = $2 \
+                AND command_text = 'index' AND head_sha IS NULL), \
+           'queued' \
          WHERE NOT EXISTS ( \
            SELECT 1 FROM tasks WHERE repository_id = $2 AND command_text = 'index' \
              AND status IN ('queued', 'running', 'posting_result') \
@@ -1601,7 +1614,16 @@ pub async fn create_index_task(
     .bind(repository_id)
     .bind(installation_id)
     .fetch_optional(pool)
-    .await?;
+    .await;
+
+    // A concurrent push that cleared the `NOT EXISTS` guard at the same instant can race us to the same
+    // computed epoch and trip `tasks_idempotency_idx` — that's a benign dedup (the other push queued the
+    // index), not an error to surface.
+    let inserted = match inserted {
+        Ok(v) => v,
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => None,
+        Err(e) => return Err(e),
+    };
 
     if let Some(new_id) = inserted {
         let _ = sqlx::query("SELECT pg_notify($1, $2)")
@@ -2676,13 +2698,33 @@ mod tests {
             "installation_id recorded for the clone token"
         );
 
-        assert!(
-            create_index_task(&pool, id, 555).await.unwrap().is_some(),
-            "first approve enqueues an index task"
-        );
+        let first = create_index_task(&pool, id, 555).await.unwrap();
+        assert!(first.is_some(), "first approve enqueues an index task");
         assert!(
             create_index_task(&pool, id, 555).await.unwrap().is_none(),
             "no duplicate while one index task is active"
+        );
+
+        // Regression: once the first index reaches a terminal state, a later default-branch push MUST
+        // be able to enqueue a fresh index. The old code hardcoded `run_epoch = 0`, so the second insert
+        // cleared the active-guard but then collided on `tasks_idempotency_idx` (NULL head_sha, epoch 0)
+        // → `duplicate key` → a repo was only ever indexed once.
+        set_task_status(&pool, first.unwrap(), "succeeded", None)
+            .await
+            .unwrap();
+        let second = create_index_task(&pool, id, 555).await.unwrap();
+        assert!(
+            second.is_some(),
+            "a push after the first index completed enqueues a new index (fresh run_epoch)"
+        );
+        let epoch: i32 = sqlx::query_scalar("SELECT run_epoch FROM tasks WHERE id = $1")
+            .bind(second.unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            epoch, 1,
+            "the re-index bumps run_epoch past the first index"
         );
     }
 
