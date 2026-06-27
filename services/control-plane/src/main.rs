@@ -32,6 +32,7 @@ mod queue;
 // Foundational modules the groups above build on.
 mod config;
 mod db;
+mod failure_notice;
 mod jwt;
 mod review;
 mod types;
