@@ -7,8 +7,10 @@
 #       1. the Rust runner binary (orchestration: clone, embed→pgvector, report)
 #       2. Python + Graphify (`graphifyy`) — the 36-language structural-graph extractor it spawns
 #       3. git + ca-certificates — clone the target repo, TLS to the control plane
+#       4. opengrep + a vendored ruleset — the deterministic SAST pass (ADR-0061)
 #   • `review` — a leaner image WITHOUT the Python/Graphify venv (debian-slim + git + ca-certs +
-#       the runner binary). The review path never invokes Graphify, so it needs no Python runtime.
+#       the runner binary + opengrep). The review path never invokes Graphify, so it needs no Python
+#       runtime, but it IS where the SAST pass runs, so it carries opengrep + the rules.
 #
 # Build context = repo root (the Cargo workspace). Pick a target with `--target`:
 #   docker build -f services/agent-runner/Dockerfile --target indexer -t lightbridge-agent-runner .
@@ -40,6 +42,27 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir "graphifyy==0.8.44" \
   && graphify --help >/dev/null
 
+# ── Stage 2b: opengrep (SAST engine + vendored rules, ADR-0061) ───────────────────────────────────
+# opengrep (the LGPL Semgrep fork) has NO official image, so we fetch the release binary by arch and
+# vendor a pinned ruleset, so scans are hermetic — no registry fetch at runtime. The Linux asset arch
+# token is `x86`/`aarch64` (NOT Docker's `amd64`/`arm64`), so we map `TARGETARCH`; `manylinux` = glibc,
+# matching both debian/python-slim runtimes below. The single-file binary needs no Python runtime.
+FROM debian:bookworm-slim AS opengrep
+ARG OPENGREP_VERSION=v1.23.0
+ARG TARGETARCH
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates git \
+  && rm -rf /var/lib/apt/lists/* \
+  && arch="$([ "$TARGETARCH" = "arm64" ] && echo aarch64 || echo x86)" \
+  && curl -fsSL -o /usr/local/bin/opengrep \
+       "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_${arch}" \
+  && chmod +x /usr/local/bin/opengrep \
+  && opengrep --version \
+  # Vendor the ruleset (upstream is archived/frozen, so a shallow clone of the default branch is a
+  # stable pin); drop .git so the copied layer is just the rule files.
+  && git clone --depth 1 https://github.com/opengrep/opengrep-rules /opt/opengrep-rules \
+  && rm -rf /opt/opengrep-rules/.git
+
 # ── Stage 3a: indexer runtime (DEFAULT) ──────────────────────────────────────────────────────────
 # The full image: python-slim + Graphify venv + the runner. Used for `index` Jobs, which run the
 # heavy structural-graph extraction. This is the default target so a bare `docker build` (and any
@@ -55,6 +78,9 @@ RUN apt-get update \
 # Graphify (venv) + the Rust runner.
 COPY --from=pybuild /opt/venv /opt/venv
 COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
+# opengrep + vendored rules for the deterministic SAST pass (ADR-0061).
+COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
+COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
 USER 1000
 ENV PATH="/opt/venv/bin:$PATH" \
     WORKDIR=/workspace \
@@ -79,6 +105,10 @@ RUN apt-get update \
   && useradd --uid 1000 --create-home --user-group app \
   && mkdir -p /workspace && chown 1000:1000 /workspace
 COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
+# opengrep + vendored rules for the deterministic SAST pass (ADR-0061). The review path is where SAST
+# runs, so this leaner image carries it too.
+COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
+COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
 USER 1000
 ENV WORKDIR=/workspace \
     RUST_LOG=info

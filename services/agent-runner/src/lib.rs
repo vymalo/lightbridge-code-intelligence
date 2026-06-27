@@ -13,6 +13,8 @@
 //!   semantic index.
 //! - [`review`] — the native review agent loop (ADR-0026/0037): it investigates with retrieval tools
 //!   and acts via mediated write tools the control plane flushes as one grouped review.
+//! - [`sast`] — a deterministic opengrep pass over the PR's changed files (ADR-0061), whose findings
+//!   ride the same review buffer; the agent is made aware of them but never gates them.
 //! - [`ratelimit`] — parsing the AI gateway's rate-limit response headers (advisory budget telemetry)
 //!   and the shared `Retry-After` parser the chat/embeddings clients honour on a 429.
 
@@ -21,3 +23,4 @@ pub mod clone;
 pub mod indexer;
 pub mod ratelimit;
 pub mod review;
+pub mod sast;

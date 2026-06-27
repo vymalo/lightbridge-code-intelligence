@@ -230,6 +230,9 @@ pub async fn run_native_agent(
     // Per-repo feedback memory (M1, ADR-0044): findings rejected (👎) here before, injected so the run
     // doesn't re-raise known false positives.
     repo_memory: Option<&str>,
+    // Deterministic SAST digest (ADR-0061): a compact list of what opengrep already flagged on this diff,
+    // injected so the agent doesn't redundantly re-report those lines (the findings post independently).
+    sast_digest: Option<&str>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -304,6 +307,7 @@ pub async fn run_native_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
+        sast_digest,
     );
 
     // Per-run circuit breaker (ADR-0039): consecutive turn-failures. The Job is ephemeral, so this is
@@ -881,6 +885,7 @@ pub async fn run_native_agent(
 /// Assemble the system (operator prompt + tool-protocol) and user (request + diff) messages. The
 /// system prompt is the **required** operator-owned guidance (ADR-0037 — no built-in default); the
 /// tool-protocol is appended last so it's the final instruction the model sees.
+#[allow(clippy::too_many_arguments)]
 fn build_messages(
     review: &ReviewConfig,
     command: &str,
@@ -888,6 +893,7 @@ fn build_messages(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    sast_digest: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
 
@@ -914,6 +920,15 @@ fn build_messages(
             "\n\nNo diff is available for this run; answer or review against the working tree and \
              keep every claim grounded in the tools.",
         ),
+    }
+
+    // Deterministic SAST findings (ADR-0061): what opengrep already flagged on this diff. Injected right
+    // after the diff because it's *about* the diff — the agent is made aware so it doesn't re-report
+    // those lines and can deepen a lead, but these findings post independently regardless (they're not
+    // gated by the model). `None` when SAST is off or found nothing, so a normal run reads as before.
+    if let Some(sast) = sast_digest {
+        user.push_str("\n\n");
+        user.push_str(sast);
     }
 
     // Prior-review context (A, #137): the agent's own most recent review of this target, so a re-review
@@ -1161,6 +1176,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
@@ -1183,7 +1199,8 @@ mod tests {
         let review = review_config("http://unused/v1".to_string());
         let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
 
-        let with_prior = build_messages(&review, "review again", None, None, Some(prior), None);
+        let with_prior =
+            build_messages(&review, "review again", None, None, Some(prior), None, None);
         let user = with_prior[1].content.as_deref().expect("user content");
         assert!(
             user.contains("Your previous review of this pull request"),
@@ -1197,6 +1214,7 @@ mod tests {
             None,
             None,
             Some("## Memory: findings rejected here before (👎)\n- a.rs:1 — bogus nit"),
+            None,
         );
         assert!(
             with_mem[1]
@@ -1207,7 +1225,7 @@ mod tests {
             "repo-memory block reaches prompt"
         );
 
-        let without = build_messages(&review, "review again", None, None, None, None);
+        let without = build_messages(&review, "review again", None, None, None, None, None);
         let user = without[1].content.as_deref().expect("user content");
         assert!(
             !user.contains("previous review"),
@@ -1313,6 +1331,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1380,6 +1399,7 @@ mod tests {
                 &review,
                 "review",
                 Some(&diff),
+                None,
                 None,
                 None,
                 None,
@@ -1460,6 +1480,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &[],
                 &cpc,
                 &embc,
@@ -1532,6 +1553,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             None,
@@ -1629,6 +1651,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1706,6 +1729,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1776,6 +1800,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1813,6 +1838,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -1842,6 +1868,7 @@ mod tests {
         let outcome = run_native_agent(
             &review,
             "review",
+            None,
             None,
             None,
             None,
@@ -2008,6 +2035,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             None,
@@ -2198,6 +2226,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -2313,6 +2342,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &cpc,
             &embc,
@@ -2383,6 +2413,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             None,
@@ -2472,6 +2503,7 @@ mod tests {
             &review,
             "review",
             Some(&diff),
+            None,
             None,
             None,
             None,
