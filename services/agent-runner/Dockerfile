@@ -59,11 +59,19 @@ RUN apt-get update \
   && chmod +x /usr/local/bin/opengrep \
   && opengrep --version \
   # Vendor the ruleset (upstream is archived/frozen, so a shallow clone of the default branch is a
-  # stable pin); drop .git so the copied layer is just the rule files. (opengrep emits a harmless
-  # "invalid configuration file found" warning for the repo's non-rule top-level YAML and still writes
-  # SARIF from the valid rules; pruning that cruft is a deferred cleanup, not load-bearing.)
+  # stable pin). Then PRUNE the repo's non-rule YAML — this is LOAD-BEARING, not cleanup: opengrep
+  # (semgrep semantics) treats a SINGLE invalid config under `--config <dir>` as fatal to the WHOLE
+  # ruleset — it loads ZERO rules and every scan returns no findings (verified: the repo's
+  # `.pre-commit-config.yaml` alone zeroed the ruleset → `rules:[]`). Rules live ONLY in the language
+  # subdirs, so drop every top-level FILE (docs / packaging / `.pre-commit-config.yaml` / ignore files)
+  # plus the non-rule dirs that ship YAML (`.git`, `.github`, `stats`, `scripts`). Verified in-image:
+  # after this prune opengrep loads the rules and reports findings (exit 0, no config errors). The
+  # `test -d` guard fails the build loudly if a future upstream layout change removes the rule dirs.
   && git clone --depth 1 https://github.com/opengrep/opengrep-rules /opt/opengrep-rules \
-  && rm -rf /opt/opengrep-rules/.git
+  && find /opt/opengrep-rules -maxdepth 1 -type f -delete \
+  && rm -rf /opt/opengrep-rules/.git /opt/opengrep-rules/.github \
+            /opt/opengrep-rules/stats /opt/opengrep-rules/scripts \
+  && test -d /opt/opengrep-rules/python && test -d /opt/opengrep-rules/rust
 
 # ── Stage 3a: indexer runtime (DEFAULT) ──────────────────────────────────────────────────────────
 # The full image: python-slim + Graphify venv + the runner. Used for `index` Jobs, which run the
