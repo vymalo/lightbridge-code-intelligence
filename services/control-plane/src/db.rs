@@ -482,27 +482,42 @@ pub async fn mark_outbox_failed(pool: &PgPool, id: i64, error: &str) -> Result<(
 /// no `posted_at`; the few hours of retries between enqueue and dead-letter are negligible against the
 /// multi-week window). `pending` rows are in-flight and never touched, whatever their age. Returns
 /// `(posted_deleted, failed_deleted)`.
+///
+/// A non-positive window is treated as **skip that prune**, never "delete everything": `now() -
+/// make_interval(days => 0)` is `now()`, so a `0` would make `posted_at < now()` match every delivered
+/// row. The dispatcher already floors its config to a positive default; this second guard keeps the
+/// public helper safe for any direct/test caller. The day count binds as `int8` and is narrowed in SQL
+/// via `$1::int` (what `make_interval(days …)` — an `int` arg — wants), so an out-of-range value errors
+/// loudly (`integer out of range`) instead of silently wrapping like a Rust `as i32` would.
 pub async fn prune_outbox(
     pool: &PgPool,
     posted_retention_days: i64,
     failed_retention_days: i64,
 ) -> Result<(u64, u64), sqlx::Error> {
-    let posted = sqlx::query(
-        "DELETE FROM github_outbox \
-         WHERE status = 'posted' AND posted_at < now() - make_interval(days => $1)",
-    )
-    .bind(posted_retention_days as i32)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    let failed = sqlx::query(
-        "DELETE FROM github_outbox \
-         WHERE status = 'failed' AND created_at < now() - make_interval(days => $1)",
-    )
-    .bind(failed_retention_days as i32)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let posted = if posted_retention_days > 0 {
+        sqlx::query(
+            "DELETE FROM github_outbox \
+             WHERE status = 'posted' AND posted_at < now() - make_interval(days => $1::int)",
+        )
+        .bind(posted_retention_days)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
+    let failed = if failed_retention_days > 0 {
+        sqlx::query(
+            "DELETE FROM github_outbox \
+             WHERE status = 'failed' AND created_at < now() - make_interval(days => $1::int)",
+        )
+        .bind(failed_retention_days)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
     Ok((posted, failed))
 }
 

@@ -51,12 +51,12 @@ mod tests {
             "INSERT INTO github_outbox \
                  (installation_id, owner, repo, kind, payload, dedup_key, status, created_at, posted_at) \
              VALUES (1, 'o', 'r', 'reaction', '{}'::jsonb, $1, $2, \
-                     now() - make_interval(days => $3), \
-                     CASE WHEN $2 = 'posted' THEN now() - make_interval(days => $3) END)",
+                     now() - make_interval(days => $3::int), \
+                     CASE WHEN $2 = 'posted' THEN now() - make_interval(days => $3::int) END)",
         )
         .bind(dedup_key)
         .bind(status)
-        .bind(age_days as i32)
+        .bind(age_days)
         .execute(pool)
         .await
         .unwrap();
@@ -107,5 +107,22 @@ mod tests {
         let (posted, failed) = db::prune_outbox(&pool, 7, 30).await.unwrap();
 
         assert_eq!((posted, failed), (2, 1));
+    }
+
+    /// A non-positive retention window is a **skip**, never a "delete everything": `now() -
+    /// make_interval(days => 0)` is `now()`, so an unguarded `0` would match every terminal row.
+    #[sqlx::test]
+    async fn non_positive_retention_skips_deletion(pool: PgPool) {
+        insert_row(&pool, "posted-ancient", "posted", 999).await;
+        insert_row(&pool, "failed-ancient", "failed", 999).await;
+
+        let (posted, failed) = db::prune_outbox(&pool, 0, -5).await.unwrap();
+
+        assert_eq!(
+            (posted, failed),
+            (0, 0),
+            "no deletes for a 0/negative window"
+        );
+        assert_eq!(surviving_keys(&pool).await.len(), 2, "both rows survive");
     }
 }
