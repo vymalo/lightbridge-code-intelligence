@@ -51,8 +51,8 @@ pub async fn run(
 
 /// Backstop for ADR-0056 (ADR-0057): an *uncatchable* kill — OOM / SIGKILL / node eviction — never lets
 /// the runner report its failure, so the reaper marks the task `failed` in the **dispatcher**, which
-/// holds no GitHub App key (ADR-0002) and can't post. The poller can. Each cycle, find PR review tasks
-/// that ended terminally with nothing posted and post the "review failed, try again" notice.
+/// holds no GitHub App key (ADR-0002) and can't post. The poller can. Each cycle, find PR tasks that
+/// ended terminally with nothing posted and post the "something went wrong, try again" notice.
 ///
 /// Idempotent and race-free with the serve path: [`crate::db::failed_pr_tasks_without_feedback`] hides
 /// a just-failed task behind a short settle buffer (serve posts synchronously on a *reported* failure),

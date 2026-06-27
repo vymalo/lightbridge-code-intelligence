@@ -338,10 +338,14 @@ pub async fn has_posted_to_github(pool: &PgPool, task_id: Uuid) -> Result<bool, 
     .await
 }
 
-/// PR review tasks that ended terminally (`failed`/`timed_out`) with **nothing posted** — no review,
-/// reply, or prior failure notice — and so are owed an ADR-0056 fallback notice. The poller sweeps
-/// these to cover an *uncatchable* kill the runner never reported: the reaper marks it `failed` in the
-/// keyless dispatcher (ADR-0002), so the key-holding poller posts (ADR-0057).
+/// PR tasks that ended terminally (`failed`/`timed_out`) with **nothing posted** — no review, reply,
+/// or prior failure notice — and so are owed an ADR-0056 fallback notice. The poller sweeps these to
+/// cover an *uncatchable* kill the runner never reported: the reaper marks it `failed` in the keyless
+/// dispatcher (ADR-0002), so the key-holding poller posts (ADR-0057).
+///
+/// Scoped by `target_type = 'pull_request'` only — **not** `kind` — to match the serve path
+/// (`handle_review_failure` guards on `target_type` alone). A failed `ask`-on-PR is rare but also
+/// deserves a word over silence, and narrowing here would strand exactly those the serve path covers.
 ///
 /// Bounded two ways, which keep the sweep cheap and self-limiting:
 /// - **only recent** — completed within the last `within_days`; an ancient failure is abandoned, not
@@ -365,7 +369,7 @@ pub async fn failed_pr_tasks_without_feedback(
            AND t.completed_at > now() - make_interval(days => $1) \
            AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.task_id = t.id) \
            AND NOT EXISTS (SELECT 1 FROM review_comments rc WHERE rc.task_id = t.id) \
-         ORDER BY t.completed_at DESC \
+         ORDER BY t.completed_at DESC, t.id DESC \
          LIMIT 200",
     )
     .bind(within_days)

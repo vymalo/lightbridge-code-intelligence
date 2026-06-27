@@ -26,10 +26,12 @@ way to reach GitHub.
 role that loops on a timer **and holds the GitHub App key** — the exact shape this needs. Each cycle,
 after the feedback poll, it runs a **failure-notice sweep**:
 
-1. `failed_pr_tasks_without_feedback(within_days)` selects PR review tasks that ended terminally
+1. `failed_pr_tasks_without_feedback(within_days)` selects PR tasks that ended terminally
    (`failed`/`timed_out`) with **nothing posted** — no `reviews` row, no `review_comments` row — bounded
    to those completed within the last `within_days` (ancient failures are abandoned, not re-litigated)
-   **and** more than a couple of minutes ago.
+   **and** more than a couple of minutes ago. Scoped by `target_type` only, **not** `kind`, to match
+   the serve path — a failed `ask`-on-PR is rare but also deserves a word over silence, and the notice
+   wording is kept neutral (no "review"/"findings") so it reads true for a question too.
 2. For each, it posts the same notice via the shared
    [`failure_notice::post_if_unposted`](../../services/control-plane/src/failure_notice.rs), which the
    serve path now also calls. That helper re-checks `has_posted_to_github` under the same dedup gate and
