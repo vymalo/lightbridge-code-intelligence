@@ -49,9 +49,14 @@ We also now have a **deterministic, near-instant** finding source — SAST via o
   `@mention` body is free-form; deep mode handles it per target.
 
 ### Cross-cutting
-- **One model for both tiers.** Tiers differ in tool-set + `reasoning_effort` + `max_turns` + timeout,
-  **never** the model. (A per-tier model override stays *possible* via the ADR-0051 config machinery, but
-  is not the default lever and is discouraged.)
+- **Per-tier config — independent blocks (amended 2026-06-27).** This ADR originally said "one model,
+  two loop shapes" — vary tools/effort/turns, never the model. **Superseded in practice:** the operator
+  wants a cheap fast model + a strong deep model (e.g. GLM-5.2 on `@mention`), so each tier gets a
+  **fully-independent config block** (`review.fast` / `review.deep` in ai-helm-values — own model,
+  gateway, prompt, reasoning budget, timeout). The runner accepts BOTH the flat `review.*` (legacy: both
+  tiers share it) and the nested blocks, so it deploys before the values are restructured (transition-
+  safe, `deny_unknown_fields`). The structural fast behavior (single diff-only turn, no retrieval) is
+  still keyed on the tier, independent of which model the fast block names.
 - **Same system prompt for both.** The persona/standards are constant; only the toolset and budget
   differ. Caveat: the prompt's "how you investigate" section assumes retrieval — the fast tier simply
   does not register those tools (the model only ever sees the tools it has), and the fast-tier prompt

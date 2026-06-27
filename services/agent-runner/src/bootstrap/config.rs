@@ -183,6 +183,18 @@ pub struct ReviewFile {
     /// `"{env:LLM_STREAM:-true}"`) still deserializes instead of failing the config.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_bool")]
     pub stream: Option<bool>,
+    /// Two-tier review (ADR-0062): a fully-independent config for the FAST tier (automatic
+    /// `pull_request opened`). When present it is a COMPLETE review block (its own model, gateway, prompt,
+    /// reasoning budget, timeout, …) — NOT an overlay on the flat fields. When absent, the FAST tier
+    /// falls back to the flat `review.*` block (back-compat: an older values file with no tier blocks).
+    /// A nested block's own `fast`/`deep` are ignored.
+    #[serde(default)]
+    pub fast: Option<Box<ReviewFile>>,
+    /// Two-tier review (ADR-0062): a fully-independent config for the DEEP tier (`@mention`). Same shape
+    /// and fallback as `fast`. This is where the strong model + 2h timeout live; the FAST block carries
+    /// the cheap model + short timeout.
+    #[serde(default)]
+    pub deep: Option<Box<ReviewFile>>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -456,6 +468,13 @@ impl ReviewConfig {
         let Some(r) = file.and_then(|f| f.review.as_ref()) else {
             return Self::from_env();
         };
+        Self::from_review_file(r)
+    }
+
+    /// Resolve ONE review block — the flat `review.*`, or a per-tier `review.fast`/`review.deep` block,
+    /// each a *complete* config (ADR-0062) — into a [`ReviewConfig`]. `Ok(None)` when the model is empty
+    /// (review disabled). Any nested `fast`/`deep` on `r` is ignored (tiers don't nest).
+    fn from_review_file(r: &ReviewFile) -> anyhow::Result<Option<Self>> {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
@@ -538,8 +557,59 @@ impl ReviewConfig {
                     .map(|n| n as u32)
                     .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
             },
-            fast: false, // per-task; main.rs sets it from the task tier (ADR-0062)
+            fast: false, // set by resolve_tiers / main per the task tier (ADR-0062)
         }))
+    }
+
+    /// Resolve BOTH review tiers (ADR-0062). Each tier uses its own complete block when present
+    /// (`review.fast` / `review.deep`), else falls back to the flat `review.*` block — so a values file
+    /// with no tier blocks (the legacy shape) keeps working, with both tiers on the flat config. The
+    /// returned FAST config carries the structural `fast` flag (single diff-only turn, no retrieval); the
+    /// DEEP config does not. Transition-safe: this runner accepts BOTH the flat and the nested shapes, so
+    /// it can deploy before the values are restructured.
+    pub fn resolve_tiers(file: Option<&FileConfig>) -> anyhow::Result<ReviewConfigs> {
+        let Some(r) = file.and_then(|f| f.review.as_ref()) else {
+            // Local/dev env path: one config from env, used for both tiers.
+            let deep = Self::from_env()?;
+            let mut fast = deep.clone();
+            if let Some(c) = fast.as_mut() {
+                c.fast = true;
+            }
+            return Ok(ReviewConfigs { fast, deep });
+        };
+        let deep = match r.deep.as_deref() {
+            Some(d) => Self::from_review_file(d)?,
+            None => Self::from_review_file(r)?,
+        };
+        let mut fast = match r.fast.as_deref() {
+            Some(f) => Self::from_review_file(f)?,
+            None => Self::from_review_file(r)?,
+        };
+        if let Some(c) = fast.as_mut() {
+            c.fast = true;
+        }
+        Ok(ReviewConfigs { fast, deep })
+    }
+}
+
+/// Resolved review configs for both tiers (ADR-0062). The runner picks one per task by its tier; each
+/// is a complete, independent config (own model/gateway/prompt/budget). Either side is `None` when that
+/// tier's model is empty (review disabled).
+#[derive(Debug, Clone)]
+pub struct ReviewConfigs {
+    pub fast: Option<ReviewConfig>,
+    pub deep: Option<ReviewConfig>,
+}
+
+impl ReviewConfigs {
+    /// The config to run a task of this tier: `fast` → the fast config, anything else → deep. Returns
+    /// `None` when that tier is disabled (no model). The selected fast config already carries the
+    /// structural `fast` flag set by [`ReviewConfig::resolve_tiers`].
+    pub fn for_tier(&self, tier: &str) -> Option<&ReviewConfig> {
+        match tier {
+            "fast" => self.fast.as_ref(),
+            _ => self.deep.as_ref(),
+        }
     }
 }
 
@@ -691,6 +761,8 @@ mod tests {
                 max_batches: None,
                 context_window: None,
                 stream: None,
+                fast: None,
+                deep: None,
             }),
         };
         let err =
@@ -735,6 +807,8 @@ mod tests {
                 // window of zero that would force wind-down on turn 0 (ADR-0045).
                 context_window: Some(0),
                 stream: None,
+                fast: None,
+                deep: None,
             }),
         };
         let cfg = ReviewConfig::resolve(Some(&file))
@@ -749,6 +823,87 @@ mod tests {
         assert_eq!(cfg.max_files_read, 1, "max_files_read clamped");
         assert_eq!(cfg.max_searches, 1, "max_searches clamped");
         assert_eq!(cfg.max_batches, 1, "max_batches clamped");
+        std::fs::remove_file(&prompt).ok();
+    }
+
+    /// A minimal review block with the given model (and a shared prompt file), every other knob unset.
+    #[cfg(test)]
+    fn review_block(model: &str, prompt_file: &str) -> ReviewFile {
+        ReviewFile {
+            base_url: "https://gw/v1".to_string(),
+            api_key: "k".to_string(),
+            model: model.to_string(),
+            system_prompt_file: Some(prompt_file.to_string()),
+            max_diff_chars: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            extra: None,
+            request_timeout_secs: None,
+            max_retries: None,
+            circuit_breaker_threshold: None,
+            max_turns: None,
+            max_batch_size: None,
+            max_files_read: None,
+            max_searches: None,
+            max_batches: None,
+            context_window: None,
+            stream: None,
+            fast: None,
+            deep: None,
+        }
+    }
+
+    // Two-tier review (ADR-0062): with `review.fast`/`review.deep` present, each tier resolves to its own
+    // complete config (own model); the fast config carries the structural `fast` flag, deep does not.
+    #[test]
+    fn resolve_tiers_uses_independent_per_tier_blocks() {
+        let prompt = std::env::temp_dir().join(format!("lci-tiers-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let p = prompt.to_string_lossy().into_owned();
+        let mut flat = review_block("flat-model", &p);
+        flat.fast = Some(Box::new(review_block("fast-model", &p)));
+        flat.deep = Some(Box::new(review_block("deep-model", &p)));
+        let file = FileConfig {
+            embeddings: None,
+            sast: None,
+            review: Some(flat),
+        };
+        let tiers = ReviewConfig::resolve_tiers(Some(&file)).expect("resolves");
+        let fast = tiers.for_tier("fast").expect("fast enabled");
+        let deep = tiers.for_tier("deep").expect("deep enabled");
+        assert_eq!(fast.model, "fast-model");
+        assert!(fast.fast, "fast tier carries the structural fast flag");
+        assert_eq!(deep.model, "deep-model");
+        assert!(!deep.fast, "deep tier is the full run");
+        std::fs::remove_file(&prompt).ok();
+    }
+
+    // Back-compat: a flat `review.*` block with NO tier sub-blocks resolves both tiers to the flat config
+    // (the fast one still flagged). This is the transition shape — the runner deploys before the values
+    // are restructured.
+    #[test]
+    fn resolve_tiers_falls_back_to_flat_block() {
+        let prompt = std::env::temp_dir().join(format!("lci-flat-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let p = prompt.to_string_lossy().into_owned();
+        let file = FileConfig {
+            embeddings: None,
+            sast: None,
+            review: Some(review_block("only-model", &p)),
+        };
+        let tiers = ReviewConfig::resolve_tiers(Some(&file)).expect("resolves");
+        let fast = tiers.for_tier("fast").expect("fast enabled");
+        let deep = tiers.for_tier("deep").expect("deep enabled");
+        assert_eq!(
+            fast.model, "only-model",
+            "fast falls back to the flat block"
+        );
+        assert_eq!(
+            deep.model, "only-model",
+            "deep falls back to the flat block"
+        );
+        assert!(fast.fast && !deep.fast, "flags still set per tier");
         std::fs::remove_file(&prompt).ok();
     }
 
