@@ -45,6 +45,9 @@ pub async fn run(
                 "reconciler: feedback poll started"
             );
             let mut tick = tokio::time::interval(interval);
+            // A slow cycle (e.g. GitHub stalling) must not make the next ticks burst-fire to catch up and
+            // spike DB + API load — skip the missed ticks instead (gemini #219).
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
                 match poll_once(&pool, &app, within_days, interval_secs).await {
@@ -58,37 +61,55 @@ pub async fn run(
 }
 
 /// The GitHub-egress drain loop (ADR-0059): wake on `NOTIFY github_outbox` (timer fallback), then drain
-/// every due intent before sleeping again.
+/// every due intent before sleeping again. If the `LISTEN` connection drops, reconnect a fresh listener
+/// (gemini #219) — the timer fallback keeps draining throughout, so a lost connection degrades latency,
+/// never liveness.
 async fn run_outbox_drain(
     pool: PgPool,
     app: GithubApp,
     review: Arc<ReviewSection>,
 ) -> anyhow::Result<()> {
-    let mut listener = PgListener::connect_with(&pool).await?;
-    listener.listen(crate::db::GITHUB_OUTBOX_CHANNEL).await?;
-    tracing::info!("reconciler: github-egress drain started");
     loop {
-        // Drain everything currently due, in batches, before parking on the listener.
+        let mut listener = match connect_listener(&pool).await {
+            Ok(l) => {
+                tracing::info!("reconciler: github-egress drain listening");
+                l
+            }
+            Err(error) => {
+                tracing::warn!(%error, "outbox LISTEN connect failed; retrying after fallback");
+                tokio::time::sleep(DRAIN_FALLBACK).await;
+                continue;
+            }
+        };
+        // Drain + park until the listener drops, then reconnect via the outer loop.
         loop {
-            match drain_once(&pool, &app, &review).await {
-                Ok(0) => break,
-                Ok(n) => tracing::debug!(posted = n, "outbox drain batch"),
-                Err(error) => {
-                    tracing::warn!(%error, "outbox drain failed (will retry on next wake)");
-                    break;
+            loop {
+                match drain_once(&pool, &app, &review).await {
+                    Ok(0) => break,
+                    Ok(n) => tracing::debug!(posted = n, "outbox drain batch"),
+                    Err(error) => {
+                        tracing::warn!(%error, "outbox drain failed (will retry on next wake)");
+                        break;
+                    }
                 }
             }
-        }
-        tokio::select! {
-            res = listener.recv() => {
-                if let Err(error) = res {
-                    tracing::warn!(%error, "outbox LISTEN dropped; relying on timer fallback");
-                    tokio::time::sleep(DRAIN_FALLBACK).await;
+            tokio::select! {
+                res = listener.recv() => {
+                    if let Err(error) = res {
+                        tracing::warn!(%error, "outbox LISTEN dropped; reconnecting");
+                        break; // → outer loop reconnects a fresh listener
+                    }
                 }
+                _ = tokio::time::sleep(DRAIN_FALLBACK) => {}
             }
-            _ = tokio::time::sleep(DRAIN_FALLBACK) => {}
         }
     }
+}
+
+async fn connect_listener(pool: &PgPool) -> anyhow::Result<PgListener> {
+    let mut listener = PgListener::connect_with(pool).await?;
+    listener.listen(crate::db::GITHUB_OUTBOX_CHANNEL).await?;
+    Ok(listener)
 }
 
 /// Claim one batch and deliver each intent. Marks every row `posted` (with the returned id) or backs it

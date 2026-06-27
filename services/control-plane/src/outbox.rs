@@ -56,14 +56,16 @@ pub struct ReviewPayload {
     pub label_error: bool,
 }
 
-/// Enqueue the grouped PR review — one per task (`<task>:review`).
+/// Enqueue the grouped PR review — one per task (`<task>:review`). Propagates a serialization failure
+/// instead of enqueuing a `Null` payload that would silently dead-letter (#219 review) — the caller
+/// returns 500 and the runner re-finalizes (idempotent on the dedup_key).
 pub async fn enqueue_review(
     pool: &PgPool,
     t: &Target<'_>,
     payload: &ReviewPayload,
-) -> Result<bool, sqlx::Error> {
+) -> anyhow::Result<bool> {
     let key = format!("{}:review", t.key_prefix(payload.pr));
-    let value = serde_json::to_value(payload).unwrap_or_default();
+    let value = serde_json::to_value(payload)?;
     crate::db::enqueue_github_post(
         pool,
         t.task_id,
@@ -75,6 +77,7 @@ pub async fn enqueue_review(
         &key,
     )
     .await
+    .map_err(Into::into)
 }
 
 /// Enqueue a consolidated reply / `ask` answer (issue comment) — one per task (`<task>:reply`).
