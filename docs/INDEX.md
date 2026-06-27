@@ -9,6 +9,7 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 - [Architecture overview](architecture.md)
 - [Components and data models](components-and-data-models.md)
 - [GitHub App and Rust control plane](github-app-and-control-plane.md)
+- [Control-plane roles & GitHub egress](control-plane-roles-and-github-egress.md) — the three roles (serve / dispatcher / reconciler) and the single-egress outbox (ADR-0058/0059)
 - [Jobs and task lifecycle](jobs-and-lifecycle.md) — the two job kinds, state machine, cancellation + purge (with diagrams)
 - [Indexing and storage](indexing-and-storage.md)
 - [OpenCode ACP and MCP integration](opencode-acp-mcp.md)
@@ -39,9 +40,10 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 1. [Architecture overview](architecture.md)
 2. [Components and data models](components-and-data-models.md)
 3. [GitHub App and Rust control plane](github-app-and-control-plane.md)
-4. [Indexing and storage](indexing-and-storage.md) — reviews reuse the base index ([ADR-0025](adr/0025-review-reuses-base-index.md)) by pinning retrieval + the skip-check to the latest indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)), so a PR review doesn't re-index from scratch.
-5. [Jobs and task lifecycle](jobs-and-lifecycle.md)
-6. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker/failover + structured logging). Prompt engineering (epic #177): [ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md) (grounding & uncertainty — empty retrieval ≠ absence), [ADR-0048](adr/0048-review-prompt-structure-and-technique.md) (prompt structure & technique for the GLM model) + the [revised-prompt draft](drafts/review-system-prompt.md), [ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md) (eval-driven prompt iteration). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
+4. [Control-plane roles & GitHub egress](control-plane-roles-and-github-egress.md) — the serve/dispatcher/reconciler split and how every GitHub write flows through one outbox ([ADR-0058](adr/0058-rename-poller-role-to-reconciler.md)/[ADR-0059](adr/0059-reconciler-owns-all-github-egress.md)).
+5. [Indexing and storage](indexing-and-storage.md) — reviews reuse the base index ([ADR-0025](adr/0025-review-reuses-base-index.md)) by pinning retrieval + the skip-check to the latest indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)), so a PR review doesn't re-index from scratch.
+6. [Jobs and task lifecycle](jobs-and-lifecycle.md)
+7. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker/failover + structured logging). Prompt engineering (epic #177): [ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md) (grounding & uncertainty — empty retrieval ≠ absence), [ADR-0048](adr/0048-review-prompt-structure-and-technique.md) (prompt structure & technique for the GLM model) + the [revised-prompt draft](drafts/review-system-prompt.md), [ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md) (eval-driven prompt iteration). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
 
 ### Platform engineer path
 1. [Architecture overview](architecture.md)
