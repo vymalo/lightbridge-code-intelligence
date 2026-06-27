@@ -190,6 +190,9 @@ async fn handle_pull_request(
                 base_sha: pr["base"]["sha"].as_str().map(str::to_string),
                 head_sha: pr["head"]["sha"].as_str().map(str::to_string),
                 run_epoch: 0, // the automatic first review
+                // ADR-0062: the automatic on-open review is the FAST tier (SAST + one diff-only LLM
+                // turn, no retrieval). The deep, repo-aware review is `@mention`-only.
+                tier: "fast".to_string(),
             };
             create_review_task(state, pool, task, owner, name, delivery_id).await;
         }
@@ -398,6 +401,9 @@ async fn handle_issue_comment(
         base_sha,
         head_sha,
         run_epoch: 0,
+        // ADR-0062: an `@mention` always triggers the DEEP tier — full retrieval, multi-turn — whether
+        // the target is a PR (deep review) or an issue (conversational answer).
+        tier: "deep".to_string(),
     };
     tracing::info!(
         delivery_id,
