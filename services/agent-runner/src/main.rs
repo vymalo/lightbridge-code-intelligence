@@ -12,7 +12,9 @@
 //! review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
-use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig, SastConfig};
+use agent_runner::bootstrap::config::{
+    EmbeddingsConfig, ReviewConfig, ReviewConfigs, RunnerConfig, SastConfig,
+};
 use agent_runner::clone;
 use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review, sast};
@@ -64,9 +66,10 @@ async fn main() -> std::process::ExitCode {
     // The embeddings client is built inside `run()` once the task context is known, so it can carry
     // the per-project attribution headers (epic #89).
 
-    // Review is optional (no model → indexing-only). But if it's half-configured, surface it.
-    let review_config = match ReviewConfig::resolve(file_config.as_ref()) {
-        Ok(cfg) => cfg,
+    // Review is optional (no model → indexing-only). But if it's half-configured, surface it. Two-tier
+    // review (ADR-0062): resolve BOTH tiers up front; the runner picks one per task by its tier.
+    let review_configs = match ReviewConfig::resolve_tiers(file_config.as_ref()) {
+        Ok(cfgs) => cfgs,
         Err(error) => {
             let detail = error.to_string();
             tracing::error!(%detail, "invalid review (LLM) configuration");
@@ -88,7 +91,7 @@ async fn main() -> std::process::ExitCode {
     //     (e.g. mid-deploy) a cancelled task's pod would otherwise run to completion. Polling our own
     //     status lets us self-cancel within ~10s regardless of the reaper.
     let outcome = tokio::select! {
-        result = run(&config, &client, &embeddings_config, review_config.as_ref(), sast_config.as_ref()) => result,
+        result = run(&config, &client, &embeddings_config, &review_configs, sast_config.as_ref()) => result,
         _ = terminated() => {
             tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
             return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
@@ -183,7 +186,7 @@ async fn run(
     config: &RunnerConfig,
     client: &ControlPlaneClient,
     embeddings_config: &EmbeddingsConfig,
-    review_config: Option<&ReviewConfig>,
+    review_configs: &ReviewConfigs,
     sast_config: Option<&SastConfig>,
 ) -> anyhow::Result<RunResult> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
@@ -247,13 +250,14 @@ async fn run(
     // task (target_type `repository`, Epic #75) has no PR, so skip review regardless of LLM config.
     // Tracks an optional review-failure/exhaustion/abort detail to attach to the FINAL status (#137).
     let mut review_detail: Option<String> = None;
-    let review_summary = match review_config.filter(|_| context.command != "index") {
+    // Two-tier review (ADR-0062): pick the per-tier config by the task's tier (`fast` → single diff-only
+    // turn, no retrieval; `deep` → full run). An `index` task runs no review. The selected fast config
+    // already carries the structural `fast` flag (set in `resolve_tiers`).
+    let selected_review = (context.command != "index")
+        .then(|| review_configs.for_tier(&context.tier))
+        .flatten();
+    let review_summary = match selected_review {
         Some(review) => {
-            // Two-tier review (ADR-0062): the task's tier shapes the loop. `fast` (automatic PR-opened)
-            // runs SAST + a single diff-only LLM turn with no retrieval; `deep` (@mention) is the full
-            // run. Tier is per-task; own a copy of the resolved config to stamp it (one task per Job).
-            let mut review = review.clone();
-            review.fast = context.tier == "fast";
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
@@ -283,7 +287,7 @@ async fn run(
             let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
             let mut transcript = Vec::new();
             let outcome = review::run_native_agent(
-                &review,
+                review,
                 &context.command,
                 diff.as_ref(),
                 repo_instructions.as_deref(),
