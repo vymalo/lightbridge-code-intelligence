@@ -471,6 +471,41 @@ pub async fn mark_outbox_failed(pool: &PgPool, id: i64, error: &str) -> Result<(
     .map(|_| ())
 }
 
+/// Prune terminal outbox rows past their retention window (ADR-0059 GC). `github_outbox` is
+/// append-mostly — every delivered intent settles to `posted` (a 👀 reaction alone leaves a permanent
+/// row per PR) and every dead-lettered one to `failed`, and nothing ever deletes them — so the table,
+/// and the `ON CONFLICT (dedup_key)` probe every enqueue pays against it, grow without bound.
+///
+/// `posted` rows are deleted `posted_retention_days` after delivery (the feedback-join id was recorded
+/// at post time, so the row has served its purpose); `failed` rows are kept `failed_retention_days` —
+/// longer, for post-mortem inspection — then deleted, keyed off `created_at` (a dead-lettered row has
+/// no `posted_at`; the few hours of retries between enqueue and dead-letter are negligible against the
+/// multi-week window). `pending` rows are in-flight and never touched, whatever their age. Returns
+/// `(posted_deleted, failed_deleted)`.
+pub async fn prune_outbox(
+    pool: &PgPool,
+    posted_retention_days: i64,
+    failed_retention_days: i64,
+) -> Result<(u64, u64), sqlx::Error> {
+    let posted = sqlx::query(
+        "DELETE FROM github_outbox \
+         WHERE status = 'posted' AND posted_at < now() - make_interval(days => $1)",
+    )
+    .bind(posted_retention_days as i32)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let failed = sqlx::query(
+        "DELETE FROM github_outbox \
+         WHERE status = 'failed' AND created_at < now() - make_interval(days => $1)",
+    )
+    .bind(failed_retention_days as i32)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok((posted, failed))
+}
+
 /// A comment the poller should check for reactions, with the repo coordinates + installation needed to
 /// mint a token and hit the reactions API.
 #[derive(Debug, sqlx::FromRow)]

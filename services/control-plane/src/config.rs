@@ -112,9 +112,18 @@ pub struct DispatcherSection {
     pub launch_backoff_seconds: Option<u64>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub reap_interval_seconds: Option<u64>,
-    /// How often the index sweeper prunes stale `(repo, commit)` snapshots (ADR-0052).
+    /// How often the index sweeper prunes stale `(repo, commit)` snapshots (ADR-0052). The outbox
+    /// sweeper (ADR-0059) shares this same GC tick.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub prune_interval_seconds: Option<u64>,
+    /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it
+    /// (ADR-0059). Default 7.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    pub outbox_posted_retention_days: Option<i64>,
+    /// Days a dead-lettered (`failed`) `github_outbox` row is kept — longer, for inspection — before
+    /// pruning (ADR-0059). Default 30.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    pub outbox_failed_retention_days: Option<i64>,
 }
 
 /// Load the control-plane config file if it exists. `Ok(None)` when absent (use env); `Err` when it

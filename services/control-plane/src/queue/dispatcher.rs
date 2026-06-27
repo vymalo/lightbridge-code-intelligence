@@ -24,6 +24,10 @@ const DEFAULT_REAP_INTERVAL_SECS: u64 = 30;
 /// Storage GC isn't urgent (it only reclaims space, never affects correctness), so it runs far less
 /// often than the reaper — every 10 minutes by default.
 const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 600;
+/// Outbox retention defaults (ADR-0059): delivered rows go after a week; dead-lettered rows linger a
+/// month so a post-mortem can still read them.
+const DEFAULT_OUTBOX_POSTED_RETENTION_DAYS: i64 = 7;
+const DEFAULT_OUTBOX_FAILED_RETENTION_DAYS: i64 = 30;
 
 /// Tunable dispatcher loop timings.
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +41,13 @@ pub struct DispatcherConfig {
     pub launch_backoff: Duration,
     /// How often the reaper reconciles stuck (lease-expired) tasks against their Jobs.
     pub reap_interval: Duration,
-    /// How often the index sweeper prunes stale `(repo, commit)` index snapshots (ADR-0052).
+    /// How often the index sweeper prunes stale `(repo, commit)` index snapshots (ADR-0052). The
+    /// outbox sweeper (ADR-0059) shares this same GC tick.
     pub prune_interval: Duration,
+    /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it.
+    pub outbox_posted_retention_days: i64,
+    /// Days a dead-lettered (`failed`) `github_outbox` row is kept — longer, for inspection.
+    pub outbox_failed_retention_days: i64,
 }
 
 impl DispatcherConfig {
@@ -48,6 +57,9 @@ impl DispatcherConfig {
         let secs = |value: Option<u64>, default: u64| {
             Duration::from_secs(value.filter(|&s| s > 0).unwrap_or(default))
         };
+        // Retention windows are in days; a zero/negative value falls back to the default rather than
+        // pruning everything (`interval '0 days'` would delete every terminal row).
+        let days = |value: Option<i64>, default: i64| value.filter(|&d| d > 0).unwrap_or(default);
         Self {
             claim_lease: secs(
                 section.and_then(|s| s.claim_lease_seconds),
@@ -68,6 +80,14 @@ impl DispatcherConfig {
             prune_interval: secs(
                 section.and_then(|s| s.prune_interval_seconds),
                 DEFAULT_PRUNE_INTERVAL_SECS,
+            ),
+            outbox_posted_retention_days: days(
+                section.and_then(|s| s.outbox_posted_retention_days),
+                DEFAULT_OUTBOX_POSTED_RETENTION_DAYS,
+            ),
+            outbox_failed_retention_days: days(
+                section.and_then(|s| s.outbox_failed_retention_days),
+                DEFAULT_OUTBOX_FAILED_RETENTION_DAYS,
             ),
         }
     }
@@ -120,17 +140,31 @@ pub async fn run<L: TaskLauncher>(
                 crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
             }
             _ = prune_tick.tick() => {
-                // Reap stale `(repo, commit)` index snapshots from pgvector + Neo4j (ADR-0052). Run it
-                // OFF the loop so a large prune never adds head-of-line latency to task dispatch — the
-                // sweep is idempotent + keep-set-guarded, so an occasional overlap (a sweep outliving
-                // `prune_interval`) is harmless. `PgPool` + the `Arc<Graph>` are cheap to clone.
-                let pool = pool.clone();
-                let neo4j = neo4j.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = crate::queue::index_sweeper::sweep_once(&pool, neo4j.as_deref()).await {
-                        tracing::error!(%error, "index sweeper cycle failed");
-                    }
-                });
+                // Storage GC shares this tick. Every sweep runs OFF the loop so a large prune never adds
+                // head-of-line latency to task dispatch — each is idempotent, so an occasional overlap
+                // (a sweep outliving `prune_interval`) is harmless. `PgPool`/`Arc<Graph>` clone cheaply.
+                {
+                    // Reap stale `(repo, commit)` index snapshots from pgvector + Neo4j (ADR-0052).
+                    let pool = pool.clone();
+                    let neo4j = neo4j.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::queue::index_sweeper::sweep_once(&pool, neo4j.as_deref()).await {
+                            tracing::error!(%error, "index sweeper cycle failed");
+                        }
+                    });
+                }
+                {
+                    // Prune terminal `github_outbox` rows past their retention window (ADR-0059) — the
+                    // table is append-only otherwise (a 👀 reaction leaves a permanent `posted` row per PR).
+                    let pool = pool.clone();
+                    let posted_days = cfg.outbox_posted_retention_days;
+                    let failed_days = cfg.outbox_failed_retention_days;
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::queue::outbox_sweeper::sweep_once(&pool, posted_days, failed_days).await {
+                            tracing::error!(%error, "outbox sweeper cycle failed");
+                        }
+                    });
+                }
             }
             _ = tokio::time::sleep(cfg.poll_fallback) => {}
             // Graceful shutdown (e.g. a deploy SIGTERMs the pod): stop the loop between iterations so

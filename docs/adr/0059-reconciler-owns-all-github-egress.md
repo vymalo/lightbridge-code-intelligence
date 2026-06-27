@@ -107,6 +107,13 @@ created_at · posted_at · github_id (the posted review/comment id)
   is load-bearing: rows enqueued in one transaction share `created_at` (Postgres `now()` is
   transaction-stable), so `created_at` alone is not a total order. Ordering also assumes the
   **single-replica** invariant above.
+- **Cost — the table is append-only and needs GC.** Delivered rows settle to `posted` and dead-lettered
+  ones to `failed`, and the drain never deletes either — a 👀 reaction alone leaves a permanent `posted`
+  row per PR, and every enqueue pays an `ON CONFLICT (dedup_key)` probe against the growing table. A
+  retention sweeper (`queue::outbox_sweeper`) runs on the dispatcher's storage-GC tick alongside the index
+  sweeper ([ADR-0052](0052-index-snapshot-pruning.md)): it deletes `posted` rows after a configurable
+  window (default 7 days — their feedback-join id was recorded at post time) and `failed` rows after a
+  longer one (default 30 days, for post-mortem). `pending` rows are never touched.
 - **Risk — double-delivery is possible, and `dedup_key` does not fully close it.** At-least-once means a
   crash *between* the GitHub POST and the `posted` mark can repost on retry — and a *local* check can't
   prevent it, because GitHub accepted the write while Postgres never recorded the id, and GitHub exposes
