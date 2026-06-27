@@ -616,8 +616,10 @@ fn repo_identity(repo: &serde_json::Value) -> Option<(i64, &str, &str)> {
     Some((id, owner, name))
 }
 
-/// Best-effort 👀 on the PR to acknowledge a review has started. Never fails the webhook: a missing
-/// App, a token-mint error, or a GitHub hiccup is logged and ignored.
+/// Best-effort 👀 on the PR to acknowledge a review has started. **Enqueues** the reaction to the
+/// egress outbox (ADR-0059) — serve no longer posts; the reconciler delivers it (near-instant via the
+/// NOTIFY). Never fails the webhook: no DB or a queue hiccup is logged and ignored. Keyed per-PR so a
+/// re-review doesn't churn a fresh 👀 (it's already there — the reaction is idempotent on GitHub too).
 async fn react_seen(
     state: &crate::AppState,
     owner: &str,
@@ -628,18 +630,17 @@ async fn react_seen(
     if !state.review.reactions_enabled() {
         return;
     }
-    let Some(app) = state.github.as_ref() else {
+    let Some(pool) = state.db.as_ref() else {
         return;
     };
-    let token = match app.installation_token(installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(%error, pr, "react 👀: could not mint token (non-fatal)");
-            return;
-        }
+    let t = crate::outbox::Target {
+        task_id: None,
+        installation_id,
+        owner,
+        repo,
     };
-    if let Err(error) = app.add_reaction(&token, owner, repo, pr, "eyes").await {
-        tracing::warn!(%error, pr, "react 👀 failed (non-fatal)");
+    if let Err(error) = crate::outbox::enqueue_reaction(pool, &t, pr, "eyes").await {
+        tracing::warn!(%error, pr, "enqueueing 👀 failed (non-fatal)");
     }
 }
 

@@ -780,23 +780,24 @@ pub async fn finalize_review(
             return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
         }
     };
-    let target = ReviewTarget {
-        token: &token,
+    // serve keeps the App key for READS only (ADR-0059): we mint a token to fetch the PR diff so the
+    // review is fully *shaped* here (pre-rendered body + validated inline comments). Nothing is posted —
+    // every GitHub write is enqueued to `github_outbox` and the reconciler delivers it.
+    let t = crate::outbox::Target {
+        task_id: Some(id),
+        installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
-        pr: context.target_id,
     };
 
-    // 1) Buffered replies → a single consolidated thread comment. **Policy (ADR-0056):** on a **pull
-    // request that is also posting a review** (inline findings present), the verdict belongs solely in
-    // the grouped review (step 2) — a separate issue-comment would be the duplicate "2× messages"
-    // channel, and the agent sometimes buffers progress narration ("still reviewing…") via add_comment.
-    // So we DROP the buffered replies there. But a PR run with **no findings** is effectively an *answer*
-    // (e.g. an `@mention` question asked on a PR), where the reply IS the content — so we keep it, same
-    // as an issue target. Gating on `!inline.is_empty()` rather than `target_type` alone avoids dropping
-    // a genuine answer (#215 review). On a successful post we drop the rows immediately, so a re-finalize
-    // never double-posts the reply.
-    let mut posted_reply = false;
+    // 1) Buffered replies → ONE consolidated reply intent. **Policy (ADR-0056):** on a **pull request
+    // that is also posting a review** (inline findings present), the verdict belongs solely in the
+    // grouped review (step 2) — a separate issue-comment would be the duplicate "2× messages" channel,
+    // and the agent sometimes buffers progress narration ("still reviewing…") via add_comment. So we
+    // DROP the buffered replies there. But a PR run with **no findings** is effectively an *answer* (an
+    // `@mention` question on a PR), where the reply IS the content — keep it, like an issue target.
+    // On a successful enqueue we drop the rows; a re-finalize re-enqueues idempotently (dedup_key).
+    let mut queued_reply = false;
     if !pending.comments.is_empty() {
         if context.target_type == "pull_request" && !pending.inline.is_empty() {
             tracing::info!(
@@ -808,51 +809,27 @@ pub async fn finalize_review(
             }
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
-            match app
-                .create_issue_comment(
-                    &token,
-                    &context.owner,
-                    &context.name,
-                    context.target_id,
-                    &body,
-                )
-                .await
-            {
-                Ok(posted_comment) => {
-                    posted_reply = true;
-                    // Record the reply's id so the feedback poller can read its reactions (ADR-0035).
-                    if let Some(cid) = posted_comment.id {
-                        if let Err(error) = crate::db::store_review_comments(
-                            pool,
-                            id,
-                            &[crate::db::ReviewCommentRef {
-                                github_comment_id: cid,
-                                kind: "reply".to_string(),
-                                file: None,
-                                line: None,
-                            }],
-                        )
-                        .await
-                        {
-                            tracing::warn!(%error, task_id = %id, "storing reply comment id failed (non-fatal)");
-                        }
-                    }
+            match crate::outbox::enqueue_reply(pool, &t, context.target_id, &body).await {
+                Ok(_) => {
+                    queued_reply = true;
                     let _ = crate::db::clear_pending_action(pool, id, "comment").await;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, task_id = %id, "posting consolidated reply failed (non-fatal)")
+                    tracing::error!(%error, task_id = %id, "enqueueing reply failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue reply")
+                        .into_response();
                 }
             }
         }
     }
 
-    // 2) Inline findings + summary → one grouped PR review (PR targets only). Also covers the
-    // empty-run backstop (post a default clean review) and a summary-only verdict.
+    // 2) Inline findings + summary → ONE review intent (PR targets only). Always enqueued when a review
+    // is due — including the empty-buffer backstop (a default clean review) and a summary-only verdict —
+    // so an @mention review never goes silent.
     let has_inline = !pending.inline.is_empty();
     let post_pr_review = context.target_type == "pull_request"
         && (has_inline || pending.summary.is_some() || pending.is_empty());
-    let mut posted_review = false;
-    let mut review_failed = false;
+    let mut queued_review = false;
     if post_pr_review {
         let pr = context.target_id;
         let findings: Vec<crate::review::Finding> = pending
@@ -879,6 +856,7 @@ pub async fn finalize_review(
             .unwrap_or(DEFAULT_CLEAN_SUMMARY)
             .to_string();
 
+        // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
             match app
                 .list_pr_files(&token, &context.owner, &context.name, pr)
@@ -902,107 +880,59 @@ pub async fn finalize_review(
             let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
             commentable.contains_key(trimmed) || commentable.contains_key(&f.file)
         };
-        let label_has_findings = findings.iter().any(in_scope);
-        let label_has_error = findings.iter().any(|f| f.priority() == "P0" && in_scope(f));
+        let label_findings = findings.iter().any(in_scope);
+        let label_error = findings.iter().any(|f| f.priority() == "P0" && in_scope(f));
         let findings_json = serde_json::to_value(&findings).unwrap_or_default();
 
         let validated = crate::review::validate(findings, &commentable);
         let body =
             crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope);
-        let comments: Vec<crate::integrations::github::ReviewComment> = validated
+        let comments: Vec<crate::outbox::ReviewCommentPayload> = validated
             .inline
             .iter()
-            .map(|c| crate::integrations::github::ReviewComment {
+            .map(|c| crate::outbox::ReviewCommentPayload {
                 path: c.path.clone(),
                 line: c.line,
-                side: "RIGHT",
                 body: c.body.clone(),
             })
             .collect();
         let (inline_n, deferred_n, out_of_scope_n) = (
-            comments.len(),
-            validated.deferred.len(),
-            validated.out_of_scope.len(),
+            comments.len() as i32,
+            validated.deferred.len() as i32,
+            validated.out_of_scope.len() as i32,
         );
+        let payload = crate::outbox::ReviewPayload {
+            pr,
+            body,
+            summary,
+            comments,
+            inline_n,
+            deferred_n,
+            out_of_scope_n,
+            findings_json,
+            label_findings,
+            label_error,
+        };
 
-        match app
-            .create_pr_review(&token, &context.owner, &context.name, pr, &body, &comments)
-            .await
-        {
-            Ok(posted) => {
-                posted_review = true;
-                tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review flushed");
-                if let Err(error) = crate::db::upsert_review(
-                    pool,
-                    id,
-                    &summary,
-                    &body,
-                    inline_n as i32,
-                    deferred_n as i32,
-                    out_of_scope_n as i32,
-                    &findings_json,
-                    posted.html_url.as_deref(),
-                    posted.id,
-                )
-                .await
-                {
-                    tracing::warn!(%error, task_id = %id, "persisting review copy failed (non-fatal)");
-                }
-                react(app, &state.review, &target, "hooray").await;
-                add_review_labels(
-                    app,
-                    &state.review,
-                    &target,
-                    label_has_findings,
-                    label_has_error,
-                )
-                .await;
-                // Capture the inline comment ids (the create-review response omits them) so the
-                // feedback poller can read each one's reactions (ADR-0035). Best-effort.
-                if let Some(review_id) = posted.id {
-                    match app
-                        .list_review_comments(&token, &context.owner, &context.name, pr, review_id)
-                        .await
-                    {
-                        Ok(refs) => {
-                            let stored: Vec<crate::db::ReviewCommentRef> = refs
-                                .into_iter()
-                                .map(|c| crate::db::ReviewCommentRef {
-                                    github_comment_id: c.id,
-                                    kind: "inline".to_string(),
-                                    file: c.path,
-                                    line: c.line.map(|l| l as i32),
-                                })
-                                .collect();
-                            if let Err(error) =
-                                crate::db::store_review_comments(pool, id, &stored).await
-                            {
-                                tracing::warn!(%error, task_id = %id, "storing review comment ids failed (non-fatal)");
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, task_id = %id, "fetching review comment ids failed (non-fatal)")
-                        }
-                    }
-                }
-                // Drop the inline + summary rows now that the review is on GitHub, so a re-finalize
-                // doesn't post a duplicate review.
+        match crate::outbox::enqueue_review(pool, &t, &payload).await {
+            Ok(_) => {
+                queued_review = true;
+                tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review queued for egress");
+                // Drop the inline + summary rows now the intent is durably queued, so a re-finalize
+                // doesn't re-shape (the dedup_key would no-op the re-enqueue anyway).
                 let _ = crate::db::clear_pending_action(pool, id, "inline").await;
                 let _ = crate::db::clear_pending_action(pool, id, "summary").await;
             }
             Err(error) => {
-                tracing::error!(%error, task_id = %id, "flushing PR review failed");
-                react(app, &state.review, &target, "confused").await;
-                // Leave the inline/summary rows intact so a re-finalize can post the review; don't
-                // bail early, so the kind is still recorded and any posted reply isn't lost.
-                review_failed = true;
+                tracing::error!(%error, task_id = %id, "enqueueing review failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue review")
+                    .into_response();
             }
         }
     }
 
-    // 3) Record the emergent run kind (ADR-0037). The buffer was cleared per-part as each post
-    // succeeded; any rows left belong to a part that failed and a re-finalize will retry.
-    let kind = match (has_inline, posted_reply) {
+    // 3) Record the emergent run kind (ADR-0037).
+    let kind = match (has_inline, queued_reply) {
         (true, true) => "mixed",
         (true, false) => "review",
         (false, true) => "ask",
@@ -1010,71 +940,8 @@ pub async fn finalize_review(
     };
     let _ = crate::db::set_task_kind(pool, id, kind).await;
 
-    if review_failed {
-        return (StatusCode::BAD_GATEWAY, "could not post review").into_response();
-    }
-    Json(serde_json::json!({ "kind": kind, "review": posted_review, "reply": posted_reply }))
+    Json(serde_json::json!({ "kind": kind, "review": queued_review, "reply": queued_reply }))
         .into_response()
-}
-
-/// Where a review reaction/label is applied: the minted token + the PR coordinates.
-struct ReviewTarget<'a> {
-    token: &'a str,
-    owner: &'a str,
-    repo: &'a str,
-    pr: i64,
-}
-
-/// Best-effort PR reaction for review lifecycle feedback (👀 started / 🎉 done / 😕 errored). A
-/// disabled toggle or any GitHub error is a no-op — review delivery never fails over a reaction.
-async fn react(
-    app: &crate::integrations::github::GithubApp,
-    review: &crate::config::ReviewSection,
-    target: &ReviewTarget<'_>,
-    content: &str,
-) {
-    if !review.reactions_enabled() {
-        return;
-    }
-    if let Err(error) = app
-        .add_reaction(target.token, target.owner, target.repo, target.pr, content)
-        .await
-    {
-        tracing::warn!(%error, pr = target.pr, content, "review reaction failed (non-fatal)");
-    }
-}
-
-/// Best-effort outcome labels from config: `label_reviewed` always (when set), `label_findings` when
-/// the review had in-scope findings, `label_error` when any were `error`-severity.
-async fn add_review_labels(
-    app: &crate::integrations::github::GithubApp,
-    review: &crate::config::ReviewSection,
-    target: &ReviewTarget<'_>,
-    has_findings: bool,
-    has_error: bool,
-) {
-    let mut labels = Vec::new();
-    if let Some(label) = &review.label_reviewed {
-        labels.push(label.clone());
-    }
-    if has_findings {
-        if let Some(label) = &review.label_findings {
-            labels.push(label.clone());
-        }
-    }
-    if has_error {
-        if let Some(label) = &review.label_error {
-            labels.push(label.clone());
-        }
-    }
-    if !labels.is_empty() {
-        if let Err(error) = app
-            .add_labels(target.token, target.owner, target.repo, target.pr, &labels)
-            .await
-        {
-            tracing::warn!(%error, pr = target.pr, "adding review labels failed (non-fatal)");
-        }
-    }
 }
 
 /// The runner's status report. `detail` is optional free text for diagnostics — persisted to the
@@ -1162,41 +1029,30 @@ pub async fn get_status(
     }
 }
 
-/// Best-effort GitHub feedback when a **PR** review task fails terminally (runner-reported
-/// `failed`/`timed_out`): a 😕 reaction (gated on the reactions toggle), **plus** — when nothing was
-/// posted for this task — a brief "review failed, retry" comment so the author isn't left in silence
-/// (ADR-0056). Loads the task's PR context + mints one token; any error is logged and ignored.
-///
-/// The notice itself is posted by the shared [`crate::failure_notice::post_if_unposted`], which the
-/// poller's sweep also uses to cover the path serve can't: an *uncatchable* kill (OOM / SIGKILL / node
-/// eviction) the runner never reports, marked `failed` by the reaper in the keyless dispatcher
-/// (ADR-0057). The 😕 reaction stays here because it needs the review config the poller doesn't carry;
-/// the reaper-path notice therefore lands without the reaction, which is fine — the comment is what
-/// breaks the silence.
+/// GitHub feedback when a **PR** review task fails terminally (runner-reported `failed`/`timed_out`):
+/// **enqueue** a 😕 reaction (gated on the toggle) and the ADR-0056 failure notice. Both ride the
+/// egress outbox (ADR-0059) — serve no longer posts — and the reconciler re-checks `has_posted_to_github`
+/// before the notice, so a finalize-then-fail stays quiet. The *uncatchable*-kill path (no status report
+/// reaches serve) is covered by the reaper enqueueing the same notice (ADR-0057, now via the outbox).
 async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
-    let Some(app) = state.github.as_ref() else {
-        return;
-    };
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(context)) if context.target_type == "pull_request" => context,
         _ => return,
     };
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(%error, task_id = %id, "review-failure feedback: could not mint token");
-            return;
-        }
+    let t = crate::outbox::Target {
+        task_id: Some(id),
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
     };
-    // 😕 reaction (same toggle as before).
     if state.review.reactions_enabled() {
-        let target = ReviewTarget {
-            token: &token,
-            owner: &context.owner,
-            repo: &context.name,
-            pr: context.target_id,
-        };
-        react(app, &state.review, &target, "confused").await;
+        if let Err(error) =
+            crate::outbox::enqueue_reaction(pool, &t, context.target_id, "confused").await
+        {
+            tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
+        }
     }
-    crate::failure_notice::post_if_unposted(pool, app, &token, &context, id).await;
+    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
+        tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
+    }
 }
