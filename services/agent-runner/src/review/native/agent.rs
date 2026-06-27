@@ -74,6 +74,20 @@ commands.";
 /// findings and finish.
 const WINDDOWN_MIN_TURNS: usize = 2;
 
+/// Default cap on how many chars of a turn's `reasoning_content` we echo to the live log. Generous on
+/// purpose: a heavy reasoner (GLM-5.2) emits thousands of chars per turn and the old 600-char cap hid
+/// "how far it thinks". Override with the `REASONING_LOG_CHARS` env (`0` = unbounded).
+const REASONING_LOG_CHARS_DEFAULT: usize = 4000;
+
+/// Resolve the reasoning-log cap from `REASONING_LOG_CHARS`, falling back to [`REASONING_LOG_CHARS_DEFAULT`].
+/// A non-numeric or absent value uses the default; `0` means log the whole chain-of-thought.
+fn reasoning_log_chars() -> usize {
+    std::env::var("REASONING_LOG_CHARS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(REASONING_LOG_CHARS_DEFAULT)
+}
+
 /// The first turn index at which the wind-down (reduced tool set + budget message) kicks in. Reserves
 /// `max(WINDDOWN_MIN_TURNS, max_turns / 10)` turns at the tail of the budget, clamped so it never lands
 /// before turn 1 (we always allow at least one full-toolset turn). A `max_turns=1` budget is degenerate
@@ -252,6 +266,11 @@ pub async fn run_native_agent(
         request_timeout_secs = review.resilience.request_timeout_secs,
         max_retries = review.resilience.max_retries,
         circuit_breaker_threshold = review.resilience.circuit_breaker_threshold,
+        stream = review.stream,
+        // The `review.extra` passthrough actually in force (e.g. `reasoning_effort`) — serialized into
+        // every chat body. Logged so a run proves *from the logs* which reasoning budget was applied,
+        // not just which one the ConfigMap claims. Empty `{}` = nothing extra sent.
+        extra = %serde_json::Value::Object(review.extra.clone()),
         "review agent starting"
     );
 
@@ -358,6 +377,10 @@ pub async fn run_native_agent(
     // run short so the tail can finalize (flush findings) rather than fail. `None` = no budgeting.
     let context_window = review.context_window;
     let mut overflow_finalize = false;
+
+    // Resolve the reasoning-log cap once (it can't change mid-run): `std::env::var` takes the process
+    // env lock on every call, and a review runs many turns. (Gemini/lightbridge review on #220.)
+    let reasoning_log_cap = reasoning_log_chars();
 
     for turn in 0..max_turns {
         let turn_started = Instant::now();
@@ -526,6 +549,10 @@ pub async fn run_native_agent(
 
         let usage = completion.usage;
         let rate_limit = completion.rate_limit;
+        let reasoning = completion.reasoning;
+        // Decode the chain-of-thought length once and reuse it across both log lines below (the string
+        // can be many KB). (Gemini/lightbridge review on #220.)
+        let reasoning_chars = reasoning.as_deref().map(|r| r.chars().count()).unwrap_or(0);
         let assistant = completion.message;
         let calls = assistant.tool_calls.clone();
 
@@ -541,6 +568,9 @@ pub async fn run_native_agent(
             prompt_tokens = usage.and_then(|u| u.prompt_tokens).unwrap_or(-1),
             completion_tokens = usage.and_then(|u| u.completion_tokens).unwrap_or(-1),
             reasoning_tokens = usage.and_then(|u| u.reasoning_tokens()).unwrap_or(-1),
+            // Chars of chain-of-thought this turn — the reliable "how far did it think" signal when the
+            // gateway folds reasoning into `completion_tokens` and reports `reasoning_tokens: 0` (GLM-5.2).
+            reasoning_chars,
             ratelimit_remaining = rate_limit.remaining.map(|r| r as i64).unwrap_or(-1),
             ratelimit_limit = rate_limit.limit.map(|l| l as i64).unwrap_or(-1),
             latency_ms = turn_latency_ms,
@@ -560,18 +590,22 @@ pub async fn run_native_agent(
                 "gateway rate-limit budget low"
             );
         }
-        // Proof-of-work (epic #137): log the model's reasoning for this turn (bounded) so a run is
-        // legible from a live log tail, not just the DB transcript. Skip when the turn was pure
-        // tool-calls with no prose.
-        if let Some(reasoning) = assistant
-            .content
-            .as_deref()
-            .filter(|c| !c.trim().is_empty())
-        {
+        // Proof-of-work (epic #137): log the model's chain-of-thought (`reasoning_content`) for this
+        // turn so a run is legible from a live log tail. This is the model's *thinking*, not the visible
+        // answer — present even on pure tool-call turns. Bounded by `REASONING_LOG_CHARS` (default
+        // [`REASONING_LOG_CHARS_DEFAULT`]; `0` = unbounded) because a heavy reasoner (GLM-5.2) can emit
+        // thousands of chars per turn; the full count is logged alongside via `reasoning_chars`.
+        if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
+            let shown = if reasoning_log_cap == 0 {
+                reasoning
+            } else {
+                truncate_on_boundary(reasoning, reasoning_log_cap)
+            };
             tracing::info!(
                 task_id = %task_id,
                 turn,
-                reasoning = %truncate_on_boundary(reasoning, 600),
+                reasoning_chars,
+                reasoning = %shown,
                 "agent reasoning"
             );
         }

@@ -147,6 +147,11 @@ pub struct Completion {
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
     pub rate_limit: RateLimitSnapshot,
+    /// The model's chain-of-thought for this turn (`reasoning_content` — DeepSeek/GLM lineage),
+    /// reassembled from the stream or read off the non-stream message. `None` when the model/gateway
+    /// doesn't emit it. Kept off [`ChatMessage`] on purpose: it is for the transcript/logs only and is
+    /// **not** echoed back to the model on the next turn. See [`StreamDelta::reasoning_content`].
+    pub reasoning: Option<String>,
 }
 
 /// Token usage for one completion, as reported by the OpenAI-compatible API. All optional — some
@@ -162,6 +167,13 @@ pub struct Usage {
     /// reasoning. Absent on non-reasoning models / gateways that omit it.
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Some gateways (e.g. camer.digital's, observed in prod) report the reasoning slice at the **top
+    /// level** of `usage` rather than nested under `completion_tokens_details`. Read both so we don't
+    /// silently lose the count. Note: GLM-5.2 via that gateway folds its thinking into
+    /// `completion_tokens` and reports this as `0`, so the *text length* of [`Completion::reasoning`]
+    /// is the more reliable "how much did it think" signal.
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -171,10 +183,12 @@ pub struct CompletionTokensDetails {
 }
 
 impl Usage {
-    /// Reasoning tokens for the turn, if the model reported the breakdown.
+    /// Reasoning tokens for the turn, if the model reported the breakdown. Prefers the OpenAI-style
+    /// nested field, falling back to the top-level one some gateways use.
     pub fn reasoning_tokens(&self) -> Option<i64> {
         self.completion_tokens_details
             .and_then(|d| d.reasoning_tokens)
+            .or(self.reasoning_tokens)
     }
 }
 
@@ -225,6 +239,9 @@ struct ResponseMessage {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// The non-stream chain-of-thought (DeepSeek/GLM lineage), surfaced into [`Completion::reasoning`].
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
@@ -266,11 +283,10 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning-model thinking deltas (DeepSeek/GLM lineage). Parsed so the chunk deserializes, but
-    /// not surfaced in the `Completion` (the non-stream path doesn't either — reasoning lives in
-    /// `usage`). A production follow-up could thread it into the transcript.
+    /// Reasoning-model thinking deltas (DeepSeek/GLM lineage), reassembled across chunks into
+    /// [`Completion::reasoning`] for the transcript/logs (epic #137 proof-of-work). Not echoed back to
+    /// the model on the next turn.
     #[serde(default)]
-    #[allow(dead_code)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
@@ -645,6 +661,10 @@ impl ChatClient {
             finish_reason: choice.finish_reason,
             usage,
             rate_limit,
+            reasoning: choice
+                .message
+                .reasoning_content
+                .filter(|r| !r.trim().is_empty()),
             message: ChatMessage {
                 role: choice
                     .message
@@ -679,6 +699,7 @@ impl ChatClient {
         // events. (Gemini/Codex review on #206.)
         let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
         let mut tools: Vec<ToolCallAcc> = Vec::new();
@@ -735,6 +756,9 @@ impl ChatClient {
                     if let Some(c) = choice.delta.content {
                         content.push_str(&c);
                     }
+                    if let Some(r) = choice.delta.reasoning_content {
+                        reasoning.push_str(&r);
+                    }
                     for tc in choice.delta.tool_calls {
                         if tools.len() <= tc.index {
                             tools.resize_with(tc.index + 1, ToolCallAcc::default);
@@ -782,6 +806,7 @@ impl ChatClient {
             finish_reason,
             usage,
             rate_limit,
+            reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content: (!content.is_empty()).then_some(content),
@@ -1087,6 +1112,82 @@ mod tests {
         assert_eq!(call.function.arguments, r#"{"query":"auth"}"#);
         // Usage from the final chunk is captured.
         assert_eq!(out.usage.and_then(|u| u.prompt_tokens), Some(10));
+    }
+
+    // Non-stream: a GLM/DeepSeek `reasoning_content` on the message is surfaced into
+    // `Completion::reasoning`, and a top-level `usage.reasoning_tokens` (the shape camer.digital's
+    // gateway returns) is read even though it isn't nested under `completion_tokens_details`.
+    #[tokio::test]
+    async fn non_stream_captures_reasoning_content_and_top_level_reasoning_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Final answer.",
+                        "reasoning_content": "Let me think step by step: 1, 2, 3."
+                    }
+                }],
+                "usage": { "prompt_tokens": 19, "completion_tokens": 219, "reasoning_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "glm-5");
+        let out = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("completes");
+
+        assert_eq!(
+            out.reasoning.as_deref(),
+            Some("Let me think step by step: 1, 2, 3.")
+        );
+        assert_eq!(out.message.content.as_deref(), Some("Final answer."));
+        // Top-level reasoning_tokens is found by the accessor (here it's the gateway's `0`, not absent).
+        assert_eq!(out.usage.and_then(|u| u.reasoning_tokens()), Some(0));
+    }
+
+    // Streaming: `reasoning_content` deltas are reassembled into `Completion::reasoning`, separate from
+    // the visible `content`, and not echoed into the assistant message.
+    #[tokio::test]
+    async fn stream_reassembles_reasoning_content_deltas() {
+        let server = MockServer::start().await;
+        let events = [
+            serde_json::json!({"choices":[{"delta":{"role":"assistant","reasoning_content":"think "}}]}),
+            serde_json::json!({"choices":[{"delta":{"reasoning_content":"harder"}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"the answer"}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":9}}),
+        ];
+        let mut sse = String::new();
+        for e in &events {
+            sse.push_str(&format!("data: {e}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            ChatClient::new(&format!("{}/v1", server.uri()), "key", "glm-5").with_stream(true);
+        let out = client
+            .complete(&[ChatMessage::user("hi")], &[], ChatParams::default())
+            .await
+            .expect("stream completes");
+
+        assert_eq!(out.reasoning.as_deref(), Some("think harder"));
+        assert_eq!(out.message.content.as_deref(), Some("the answer"));
     }
 
     // CRLF SSE (standards-compliant gateways) must parse identically: the byte buffer strips `\r`, so
