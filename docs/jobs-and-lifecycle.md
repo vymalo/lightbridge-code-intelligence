@@ -15,7 +15,7 @@ task's `command` + `target_type`:
 
 | Job | `command` | `target_type` | Triggered by |
 |---|---|---|---|
-| **Index** | `index` | `repository` | A repository is **approved** by an admin (`enqueue_index_on_approve`). Indexes the default branch. |
+| **Index** | `index` | `repository` | A repository is **approved** by an admin (`enqueue_index_on_approve`), **or a push to the default branch** (e.g. a merged PR — `handle_push`, requires the App's `push` subscription) keeps the base index fresh. Indexes the default branch; deduped against an in-flight index. |
 | **Review** | `review` | `pull_request` | A PR is **opened** (the automatic first review), or a PR comment **`@<app-handle> …`** requests a re-review. |
 
 Other lifecycle events don't create tasks: PR `synchronize`/`reopened` do nothing (ask for a re-review
@@ -164,9 +164,13 @@ repo**. A review on an already-indexed repo **skips the re-index** and reviews a
 (searched via the MCP tools) + the PR diff. So in the flow diagram, the `semantic/graph index` steps
 run for index jobs and cold-start reviews; warm reviews go straight to the review step.
 
-Trade-off: the base index tracks the **default branch**, so it can go stale as that branch moves.
-Follow-up (not yet built): a periodic/push-driven re-index of the default branch, or incremental
-diff-only indexing for reviews, so search also covers brand-new PR symbols.
+The base index tracks the **default branch**, so it can go stale as that branch moves. This is now
+kept fresh by a **push-driven re-index**: a push to the default branch (e.g. a merged PR) queues an
+`index` task (`handle_push`, deduped against an in-flight index), and retrieval otherwise reuses the
+latest indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)). **This
+requires the GitHub App to subscribe to the `push` event** — without it the base index only ever runs
+once (on approval) and goes stale. Still future: incremental diff-only indexing for reviews so search
+also covers brand-new PR symbols before they are merged.
 
 ## Future direction (proposed ADRs 0028–0031)
 

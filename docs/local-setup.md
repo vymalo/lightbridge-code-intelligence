@@ -81,8 +81,9 @@ A task is created by a GitHub event (PR opened / `@mention`) or a repo approval.
 
 1. **Create a GitHub App** (Settings → Developer settings → GitHub Apps): permissions
    *Contents: read*, *Pull requests: read & write*, *Issues: read & write*, *Metadata: read*;
-   subscribe to *Pull request* + *Issue comment* events. Generate a **private key** and note the
-   **App ID** + **webhook secret**.
+   subscribe to *Pull request*, *Issue comment*, and *Push* events (Push is what re-indexes the
+   default branch on a merge — omit it and the index only ever runs once, on approval). Generate a
+   **private key** and note the **App ID** + **webhook secret**.
 2. **Proxy webhooks to localhost**:
    ```bash
    pnpm dlx smee-client --url https://smee.io/<your-channel> \
