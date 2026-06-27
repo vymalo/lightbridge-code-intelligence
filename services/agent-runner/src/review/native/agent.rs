@@ -451,6 +451,14 @@ pub async fn run_native_agent(
         } else {
             &defs
         };
+        // FAST tier (ADR-0062): the offered set excludes retrieval/read_file, but a model steered by the
+        // shared system prompt may still *emit* calls to them — and the dispatcher would otherwise run any
+        // tool by name. So in the fast tier we enforce the offered set: a call to a non-offered tool is
+        // refused (a synthetic result), never dispatched, keeping the pass truly diff-only. (Deep is
+        // unchanged — its budgets already shape the offered set and we don't refuse there.)
+        let offered: std::collections::HashSet<&str> =
+            turn_defs.iter().map(|t| t.function.name.as_str()).collect();
+        let fast_refuse = |tool: &str| review.fast && !offered.contains(tool);
         // One-turn suppression: the guard's effect on `turn_defs` is now baked in for this turn.
         suppress_record = false;
         if in_winddown && !winddown_announced {
@@ -684,7 +692,12 @@ pub async fn run_native_agent(
         let read_only: Vec<usize> = calls
             .iter()
             .enumerate()
-            .filter(|(_, c)| is_read_only_tool(c.function.name.as_str()))
+            .filter(|(_, c)| {
+                let n = c.function.name.as_str();
+                // A fast-tier call to a non-offered read-only tool is refused below, not dispatched —
+                // keep it out of the concurrent batch so the gateway/datastore is never hit.
+                is_read_only_tool(n) && !fast_refuse(n)
+            })
             .map(|(i, _)| i)
             .collect();
         // Advance the cumulative read budgets (ADR-0042) — a turn that issued any read-only call is one
@@ -719,9 +732,20 @@ pub async fn run_native_agent(
         let mut abort_reason = None;
         for (i, call) in calls.iter().enumerate() {
             let tool = call.function.name.as_str();
-            let outcome = match batched.remove(&i) {
-                Some(o) => o,
-                None => tools.dispatch(call).await,
+            let outcome = if fast_refuse(tool) {
+                // FAST tier: the model called a tool not offered this pass (e.g. retrieval/read_file,
+                // which the shared prompt still mentions). Refuse with a steer instead of dispatching —
+                // the fast pass reviews the diff (+ SAST digest) directly and finishes.
+                tracing::info!(task_id = %task_id, turn, tool, "fast tier: refusing non-offered tool call");
+                ToolOutcome::Continue(format!(
+                    "`{tool}` is not available in this fast review pass — review the diff directly, \
+                     record any findings with add_review_comment, then call finish."
+                ))
+            } else {
+                match batched.remove(&i) {
+                    Some(o) => o,
+                    None => tools.dispatch(call).await,
+                }
             };
             match outcome {
                 ToolOutcome::Finish => should_finish = true,
@@ -2203,6 +2227,76 @@ mod tests {
         assert!(
             set.iter().any(|n| n == ADD_REVIEW_COMMENT),
             "fast tier keeps add_review_comment (diff present): {set:?}"
+        );
+    }
+
+    // Two-tier review (ADR-0062): the fast tier removes retrieval from the OFFERED set, but a model
+    // steered by the shared prompt can still EMIT a retrieval call — and the dispatcher runs any tool by
+    // name. So the fast tier must REFUSE a non-offered tool call (never hit the control plane). Live
+    // dogfood (task 5ad4e553) showed M2.7 doing read_file + search in its fast turn before this guard.
+    #[tokio::test]
+    async fn fast_tier_refuses_a_retrieval_call_instead_of_dispatching() {
+        let chat = MockServer::start().await;
+        // The single fast turn emits a retrieval call (what M2.7 did live). It must be refused.
+        mount_chat(
+            &chat,
+            vec![tool_call_reply(
+                "lightbridge_vector_semantic_search",
+                r#"{"query":"anything"}"#,
+            )],
+        )
+        .await;
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        // The control plane: a search endpoint that MUST NOT be hit (the refusal happens before dispatch).
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.fast = true;
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("fast tier completes");
+        // One turn, no finish → Exhausted (the caller finalizes buffered SAST/findings).
+        assert!(
+            matches!(outcome, ReviewOutcome::Exhausted),
+            "fast retrieval call refused, single turn → Exhausted; got {outcome:?}"
+        );
+        // The control plane's search endpoint was NEVER hit — the call was refused, not dispatched.
+        let cp_hits = cp.received_requests().await.unwrap();
+        assert!(
+            !cp_hits.iter().any(|r| r.url.path().ends_with("/search")),
+            "fast tier must not dispatch the retrieval call to the control plane"
         );
     }
 
