@@ -373,9 +373,7 @@ fn remove_spans(input: &str, open: &str, close: &str) -> String {
 /// reactions endpoint for a PR review body, and the poller doesn't poll it) nor the failure notice
 /// (don't beg feedback on an apology).
 ///
-/// No leading `---`: the answer body already ends with one (under its AI-governance disclosure), so the
-/// rule is added at the `inline_body` call site instead — avoids a double horizontal rule on the answer
-/// (#217 review).
+/// No leading `---`: the CTA is a quiet quoted line, not a section break — no horizontal rule before it.
 const FEEDBACK_FOOTER: &str = "\n\n> Was this useful? React 👍/👎 to give us feedback";
 
 fn inline_body(finding: &Finding) -> String {
@@ -393,7 +391,6 @@ fn inline_body(finding: &Finding) -> String {
         body.push_str(&format!("\n\n```suggestion\n{suggestion}\n```"));
     }
     body.push_str(&resources_block(finding));
-    body.push_str("\n\n---");
     body.push_str(FEEDBACK_FOOTER);
     body
 }
