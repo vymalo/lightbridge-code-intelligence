@@ -741,6 +741,22 @@ pub async fn set_review_summary(
     }
 }
 
+/// Whether a finalize run posts a PR review/verdict — inline findings, a verdict summary, or the
+/// empty-buffer backstop (a default "no issues" review). This is the ADR-0056 policy gate: when a PR
+/// review is going out, the verdict belongs solely in the grouped review, so the agent's buffered
+/// `add_comment` narration is dropped. Crucially it is NOT keyed on finding count — a clean review (a
+/// summary with zero findings) is still a review (regression: docs PR #224, where add_comment
+/// verification narration leaked as a "Lightbridge answer" issue comment). Pure, so the policy is
+/// unit-tested independently of the DB/outbox.
+fn posts_pr_review(
+    target_type: &str,
+    has_inline: bool,
+    has_summary: bool,
+    buffer_empty: bool,
+) -> bool {
+    target_type == "pull_request" && (has_inline || has_summary || buffer_empty)
+}
+
 /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer (ADR-0037). Posts the
 /// inline findings + summary as **one grouped PR review** (re-validated against the diff here, the
 /// authority), consolidates buffered replies into **one** thread comment, records the emergent run
@@ -790,16 +806,30 @@ pub async fn finalize_review(
         repo: &context.name,
     };
 
+    // Whether this run posts a PR review/verdict at all — findings, a verdict summary, or the
+    // empty-buffer backstop. This is the ADR-0056 policy gate for BOTH the reply-drop (step 1) and the
+    // review enqueue (step 2), so compute it once up front.
+    let has_inline = !pending.inline.is_empty();
+    let post_pr_review = posts_pr_review(
+        &context.target_type,
+        has_inline,
+        pending.summary.is_some(),
+        pending.is_empty(),
+    );
+
     // 1) Buffered replies → ONE consolidated reply intent. **Policy (ADR-0056):** on a **pull request
-    // that is also posting a review** (inline findings present), the verdict belongs solely in the
-    // grouped review (step 2) — a separate issue-comment would be the duplicate "2× messages" channel,
-    // and the agent sometimes buffers progress narration ("still reviewing…") via add_comment. So we
-    // DROP the buffered replies there. But a PR run with **no findings** is effectively an *answer* (an
-    // `@mention` question on a PR), where the reply IS the content — keep it, like an issue target.
-    // On a successful enqueue we drop the rows; a re-finalize re-enqueues idempotently (dedup_key).
+    // that is also posting a review**, the verdict belongs solely in the grouped review (step 2) — a
+    // separate issue-comment is the duplicate "2× messages" channel, and the agent often buffers
+    // progress/verification narration ("still reviewing…", "re-reading each file…") via add_comment.
+    // So we DROP the buffered replies whenever a review is posted — gated on `post_pr_review`, NOT on
+    // "has inline findings": a CLEAN review (a verdict summary with zero findings) is still a review, and
+    // under the old finding-count gate its add_comment narration leaked as a "Lightbridge answer" issue
+    // comment on docs PR #224. The reply is kept ONLY when the run posts NO review on the PR — a pure
+    // `@mention` *question* whose answer IS the add_comment (no findings, no summary) — or a non-PR
+    // (issue) target. On a successful enqueue we drop the rows; a re-finalize re-enqueues idempotently.
     let mut queued_reply = false;
     if !pending.comments.is_empty() {
-        if context.target_type == "pull_request" && !pending.inline.is_empty() {
+        if post_pr_review {
             tracing::info!(
                 task_id = %id, dropped = pending.comments.len(),
                 "PR review: dropping buffered add_comment replies — the review is the only channel (ADR-0056)"
@@ -825,10 +855,7 @@ pub async fn finalize_review(
 
     // 2) Inline findings + summary → ONE review intent (PR targets only). Always enqueued when a review
     // is due — including the empty-buffer backstop (a default clean review) and a summary-only verdict —
-    // so an @mention review never goes silent.
-    let has_inline = !pending.inline.is_empty();
-    let post_pr_review = context.target_type == "pull_request"
-        && (has_inline || pending.summary.is_some() || pending.is_empty());
+    // so an @mention review never goes silent. (`has_inline` / `post_pr_review` computed above.)
     let mut queued_review = false;
     if post_pr_review {
         let pr = context.target_id;
@@ -1054,5 +1081,36 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
     }
     if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ADR-0056 reply-drop policy (the docs PR #224 regression). The gate is "a PR review is posted",
+    // NOT "there are findings" — a clean review (verdict summary, zero findings) must still suppress the
+    // agent's buffered add_comment narration.
+    #[test]
+    fn posts_pr_review_gates_on_any_review_not_finding_count() {
+        // The #224 case: a clean PR review — verdict summary, ZERO inline findings → still a review, so
+        // its add_comment narration is dropped.
+        assert!(
+            posts_pr_review("pull_request", false, true, false),
+            "clean PR review (summary, no findings) still posts a review → drop replies"
+        );
+        // A PR review with findings → review posted.
+        assert!(posts_pr_review("pull_request", true, false, false));
+        // The empty-buffer backstop on a PR posts a default clean review.
+        assert!(posts_pr_review("pull_request", false, false, true));
+        // A pure @mention QUESTION on a PR: only an add_comment answer, no findings/summary, buffer not
+        // empty → NOT a review → the reply (the answer) is kept.
+        assert!(
+            !posts_pr_review("pull_request", false, false, false),
+            "PR question with only a reply posts no review → keep the answer"
+        );
+        // A non-PR (issue) target is never a PR review → the reply is the content, kept.
+        assert!(!posts_pr_review("issue", true, true, false));
+        assert!(!posts_pr_review("issue", false, false, false));
     }
 }
