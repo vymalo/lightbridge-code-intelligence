@@ -87,6 +87,13 @@ pub async fn scan(
     // and a missing target makes opengrep error out.
     let mut targets: Vec<String> = Vec::new();
     for f in changed_files {
+        // Defense-in-depth on `Path::join`: `git diff --name-only` only ever emits repo-relative paths,
+        // but an absolute `f` would make `join` silently discard `checkout` (a Rust footgun) and a `..`
+        // could climb out of the tree — so reject both, keeping the scan strictly inside the checkout.
+        if !is_safe_relative(f) {
+            tracing::warn!(path = %f, "sast: skipping non-relative/parent-escaping changed-file path");
+            continue;
+        }
         if checkout.join(f).is_file() {
             targets.push(f.clone());
         }
@@ -161,9 +168,12 @@ pub fn digest(findings: &[SastFinding]) -> Option<String> {
 }
 
 /// Spawn `opengrep scan` over the targets and return the SARIF it writes. Output goes to a private file
-/// **outside the checkout** (so a repo can't plant or clobber it), mirroring Graphify's `GRAPHIFY_OUT`
-/// isolation. A non-zero exit is NOT by itself an error — opengrep exits non-zero when it finds matches;
-/// we treat "the SARIF file exists and parses" as success and only bail when the file never appeared.
+/// in the **system temp dir** (outside the checkout, so a repo can't plant or clobber it). We use
+/// temp_dir rather than the checkout's parent: opengrep takes an *absolute* `--sarif-output`, so — unlike
+/// Graphify, whose `GRAPHIFY_OUT` must sit beside the watch path — there's no reason to depend on the
+/// workdir layout, and `/tmp` is always writable by the non-root runner user.
+/// A non-zero exit is NOT by itself an error — opengrep exits non-zero when it finds matches; we treat
+/// "the SARIF file exists and parses" as success and only bail when the file never appeared.
 async fn run_opengrep(
     config: &SastConfig,
     checkout: &Path,
@@ -172,10 +182,7 @@ async fn run_opengrep(
     let checkout_abs = tokio::fs::canonicalize(checkout)
         .await
         .with_context(|| format!("canonicalizing {}", checkout.display()))?;
-    let out_dir = checkout_abs
-        .parent()
-        .unwrap_or(&checkout_abs)
-        .join("sast-run");
+    let out_dir = std::env::temp_dir().join("sast-run");
     tokio::fs::create_dir_all(&out_dir)
         .await
         .with_context(|| format!("creating {}", out_dir.display()))?;
@@ -220,9 +227,20 @@ async fn run_opengrep(
             truncate(stderr.trim(), 500)
         );
     }
-    tokio::fs::read_to_string(&sarif_path)
+    // Bounded read: the scan is scoped to the PR's changed files, so the SARIF is small in practice, but
+    // cap it defensively so a pathological diff can't OOM the runner pod reading untrusted output into
+    // memory. A truncated read just fails to parse → zero findings (logged, non-fatal), never a crash.
+    use tokio::io::AsyncReadExt;
+    const MAX_SARIF_BYTES: u64 = 16 * 1024 * 1024;
+    let file = tokio::fs::File::open(&sarif_path)
         .await
-        .with_context(|| format!("reading {}", sarif_path.display()))
+        .with_context(|| format!("opening {}", sarif_path.display()))?;
+    let mut buf = Vec::new();
+    file.take(MAX_SARIF_BYTES)
+        .read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("reading {}", sarif_path.display()))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 // ── SARIF parsing (pure, unit-tested) ────────────────────────────────────────────────────────────
@@ -436,6 +454,17 @@ fn normalize_path(uri: &str) -> String {
         .to_string()
 }
 
+/// Whether a changed-file path is safe to hand to `checkout.join()` for scanning: relative and not
+/// climbing out of the tree with `..`. Guards the `Path::join` footgun where an absolute path silently
+/// discards the base, which could redirect the scan to an arbitrary file on the runner.
+fn is_safe_relative(path: &str) -> bool {
+    let p = Path::new(path);
+    !p.is_absolute()
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Truncate to at most `max` chars (char-boundary safe), appending an ellipsis when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -554,6 +583,21 @@ mod tests {
         assert!(d.contains("will be posted"));
         assert!(d.contains("src/a.rs:9"));
         assert!(d.contains("Do NOT re-report"));
+    }
+
+    #[test]
+    fn is_safe_relative_rejects_absolute_and_parent_escapes() {
+        assert!(is_safe_relative("src/exec.rs"));
+        assert!(is_safe_relative("a/b/c.ts"));
+        assert!(!is_safe_relative("/etc/passwd"), "absolute path rejected");
+        assert!(
+            !is_safe_relative("../../etc/passwd"),
+            "parent escape rejected"
+        );
+        assert!(
+            !is_safe_relative("src/../../etc/passwd"),
+            "mid-path .. rejected"
+        );
     }
 
     #[test]
