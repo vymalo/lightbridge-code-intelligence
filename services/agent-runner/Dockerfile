@@ -59,7 +59,9 @@ RUN apt-get update \
   && chmod +x /usr/local/bin/opengrep \
   && opengrep --version \
   # Vendor the ruleset (upstream is archived/frozen, so a shallow clone of the default branch is a
-  # stable pin); drop .git so the copied layer is just the rule files.
+  # stable pin); drop .git so the copied layer is just the rule files. (opengrep emits a harmless
+  # "invalid configuration file found" warning for the repo's non-rule top-level YAML and still writes
+  # SARIF from the valid rules; pruning that cruft is a deferred cleanup, not load-bearing.)
   && git clone --depth 1 https://github.com/opengrep/opengrep-rules /opt/opengrep-rules \
   && rm -rf /opt/opengrep-rules/.git
 
