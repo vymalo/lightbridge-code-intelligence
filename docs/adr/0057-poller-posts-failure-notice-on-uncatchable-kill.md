@@ -1,6 +1,8 @@
 # ADR-0057: The poller posts the failure notice for an uncatchable kill
 
-- **Status:** Accepted
+- **Status:** Accepted — egress mechanism superseded by [ADR-0059](0059-reconciler-owns-all-github-egress.md)
+  (the failure notice becomes one `kind` in the single-egress outbox; the dual-poster + settle buffer below
+  are retired)
 - **Date:** 2026-06-27
 - **Deciders:** @stephane-segning
 

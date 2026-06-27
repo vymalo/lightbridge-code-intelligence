@@ -76,4 +76,6 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0054](0054-review-model-and-provider-selection.md) | Stay on MiniMax-M2.7 (FP8) on DeepInfra for the review agent | Accepted |
 | [0055](0055-review-waits-for-index-readiness.md) | A review waits for index readiness (the `WaitingForIndex` gate; RFC-0002 Phase 1.4) | Accepted |
 | [0056](0056-control-plane-owns-the-posted-output.md) | The control plane owns what gets posted (PR review-only channel + failure notice) | Accepted |
-| [0057](0057-poller-posts-failure-notice-on-uncatchable-kill.md) | The poller posts the failure notice for an uncatchable kill (closes the ADR-0056 gap) | Accepted |
+| [0057](0057-poller-posts-failure-notice-on-uncatchable-kill.md) | The poller posts the failure notice for an uncatchable kill (closes the ADR-0056 gap) | Accepted (egress superseded by 0059) |
+| [0058](0058-rename-poller-role-to-reconciler.md) | Rename the `poller` role to `reconciler` (bidirectional GitHub reconciliation) | Accepted |
+| [0059](0059-reconciler-owns-all-github-egress.md) | The reconciler owns all GitHub egress via a transactional outbox (one writer) | Accepted |
