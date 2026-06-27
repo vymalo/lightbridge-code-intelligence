@@ -12,10 +12,10 @@
 //! review are best-effort and non-fatal.
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
-use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig};
+use agent_runner::bootstrap::config::{EmbeddingsConfig, ReviewConfig, RunnerConfig, SastConfig};
 use agent_runner::clone;
 use agent_runner::indexer::embeddings::EmbeddingsClient;
-use agent_runner::{indexer, review};
+use agent_runner::{indexer, review, sast};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -75,6 +75,11 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // Deterministic SAST pass (ADR-0061): opt-in, best-effort. Resolve is infallible — a misconfigured
+    // block falls back to defaults, and `None` simply means SAST is off — because SAST is an additive
+    // signal whose absence must never fail a review.
+    let sast_config = SastConfig::resolve(file_config.as_ref());
+
     // Race the work against two stop signals; on either we exit promptly WITHOUT reporting a status
     // (the control plane already owns a cancelled row and we must not clobber it with `failed`):
     //  1. SIGTERM — Kubernetes sends it when the reaper deletes the Job. Without this the process
@@ -83,7 +88,7 @@ async fn main() -> std::process::ExitCode {
     //     (e.g. mid-deploy) a cancelled task's pod would otherwise run to completion. Polling our own
     //     status lets us self-cancel within ~10s regardless of the reaper.
     let outcome = tokio::select! {
-        result = run(&config, &client, &embeddings_config, review_config.as_ref()) => result,
+        result = run(&config, &client, &embeddings_config, review_config.as_ref(), sast_config.as_ref()) => result,
         _ = terminated() => {
             tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
             return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
@@ -179,6 +184,7 @@ async fn run(
     client: &ControlPlaneClient,
     embeddings_config: &EmbeddingsConfig,
     review_config: Option<&ReviewConfig>,
+    sast_config: Option<&SastConfig>,
 ) -> anyhow::Result<RunResult> {
     // Mark that the runner actually started (the dispatcher already set `running` on claim; this
     // re-affirms it from the pod and is a no-op if already set).
@@ -246,6 +252,27 @@ async fn run(
             // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
             // commit just yields an unscoped run).
             let diff = clone::pr_diff(&checkout, &context).await;
+            // ── SAST (ADR-0061): a deterministic opengrep pass over the PR's changed files. Its findings
+            // are buffered into the SAME review buffer (the control plane scopes + posts them in the one
+            // grouped review — no second poster), and a digest is fed to the agent so it doesn't
+            // re-report those lines. Opt-in (sast_config is None when disabled) and best-effort: a scan
+            // failure is logged, never fatal. Needs the diff to scope to — without it, SAST is skipped.
+            let sast_findings = match (sast_config, diff.as_ref()) {
+                (Some(cfg), Some(d)) => match sast::scan(cfg, &checkout, &d.files).await {
+                    Ok(findings) => findings,
+                    Err(error) => {
+                        tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
+                        Vec::new()
+                    }
+                },
+                _ => Vec::new(),
+            };
+            // Buffer before the agent runs so a true (file, line) collision lets the agent's richer
+            // finding win the upsert; the digest is what keeps such collisions rare (ADR-0061).
+            if !sast_findings.is_empty() {
+                sast::buffer(client, config.task_id, &sast_findings).await;
+            }
+            let sast_digest = sast::digest(&sast_findings);
             // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and
             // fold them into the prompt as untrusted context so the review respects house rules.
             let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
@@ -257,6 +284,7 @@ async fn run(
                 repo_instructions.as_deref(),
                 context.prior_reviews.as_deref(),
                 context.repo_memory.as_deref(),
+                sast_digest.as_deref(),
                 &attribution,
                 client,
                 &embedder,

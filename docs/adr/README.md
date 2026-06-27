@@ -80,3 +80,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0058](0058-rename-poller-role-to-reconciler.md) | Rename the `poller` role to `reconciler` (bidirectional GitHub reconciliation) | Accepted |
 | [0059](0059-reconciler-owns-all-github-egress.md) | The reconciler owns all GitHub egress via a transactional outbox (one writer) | Accepted |
 | [0060](0060-capture-model-reasoning-and-glm-5-2-latency-finding.md) | Capture the model's reasoning (`reasoning_content`) to logs + the GLM-5.2 latency finding (reopens 0054) | Proposed |
+| [0061](0061-sast-deterministic-finding-source.md) | SAST (opengrep) as a deterministic finding source — runs in the runner, rides the existing channel (not reviewdog), LLM-aware not LLM-gated | Accepted |

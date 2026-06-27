@@ -56,6 +56,21 @@ pub const DEFAULT_MAX_FILES_READ: usize = 30;
 pub const DEFAULT_MAX_SEARCHES: usize = 15;
 pub const DEFAULT_MAX_BATCHES: usize = 6;
 
+/// SAST (opengrep) defaults (ADR-0061). The whole feature is **opt-in** (default disabled) so the
+/// rollout is image-then-config: an existing deploy without the opengrep-bearing image is unaffected.
+pub const DEFAULT_SAST_BIN: &str = "opengrep";
+/// Vendored, pinned ruleset baked into the runner image (see the Dockerfile). A local dir, so scans are
+/// hermetic — no registry fetch at runtime. Operator-overridable to narrow the rule set to their stack.
+pub const DEFAULT_SAST_RULES: &str = "/opt/opengrep-rules";
+/// Minimum SARIF level to surface. `error` (high-signal, mostly real security/correctness) by default so
+/// the first rollout doesn't flood PRs; lower to `warning`/`note` to widen.
+pub const DEFAULT_SAST_MIN_SEVERITY: &str = "error";
+/// Cap on findings posted per review, so a pathological file can't bury the PR. Excess is logged, not
+/// silently dropped (ADR-0033).
+pub const DEFAULT_SAST_MAX_FINDINGS: usize = 25;
+/// Wall-clock ceiling on one opengrep scan; on timeout the pass is abandoned (non-fatal).
+pub const DEFAULT_SAST_TIMEOUT_SECS: u64 = 300;
+
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
 /// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
@@ -65,6 +80,28 @@ pub const DEFAULT_MAX_BATCHES: usize = 6;
 pub struct FileConfig {
     pub embeddings: Option<EmbeddingsFile>,
     pub review: Option<ReviewFile>,
+    /// Deterministic SAST pass (ADR-0061). Absent or `enabled: false` ⇒ no SAST.
+    pub sast: Option<SastFile>,
+}
+
+/// File config for the deterministic SAST pass (ADR-0061). Every field is optional; an absent block (or
+/// `enabled: false`) disables SAST entirely. Bool/numeric-string tolerant so `{env:…}`-substituted
+/// values still deserialize.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SastFile {
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_bool")]
+    pub enabled: Option<bool>,
+    /// opengrep binary name/path; defaults to `opengrep` on PATH.
+    pub bin: Option<String>,
+    /// `--config` value: a local rules dir (default: the vendored set) or a registry ruleset.
+    pub rules: Option<String>,
+    /// Minimum SARIF level to surface (`error`|`warning`|`note`).
+    pub min_severity: Option<String>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_findings: Option<usize>,
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -523,6 +560,86 @@ fn require_system_prompt(system_prompt_file: Option<&str>) -> anyhow::Result<Str
     )
 }
 
+/// Parse a boolean env var (`1`/`true`/`yes`/`on` = true; `0`/`false`/`no`/`off` = false), returning
+/// `None` when unset/empty/unrecognized so the caller applies its own default.
+fn parse_env_bool(name: &str) -> Option<bool> {
+    match std::env::var(name)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolved configuration for the deterministic SAST pass (ADR-0061). Absent ⇒ SAST disabled, so this is
+/// produced as an `Option` like [`ReviewConfig`]. Unlike the LLM config there is no fail-closed path: a
+/// half-set SAST block falls back to the defaults, because SAST is a best-effort *additive* signal whose
+/// absence must never fail a review.
+#[derive(Debug, Clone)]
+pub struct SastConfig {
+    /// opengrep binary name/path.
+    pub bin: String,
+    /// `--config` value (a vendored local rules dir by default).
+    pub rules: String,
+    /// Minimum SARIF level to surface (`error`|`warning`|`note`).
+    pub min_severity: String,
+    /// Cap on findings posted per review (excess logged, not silently dropped).
+    pub max_findings: usize,
+    /// Wall-clock ceiling on one scan, seconds.
+    pub timeout_secs: u64,
+}
+
+impl SastConfig {
+    /// Resolve from the file config's `sast` block when present, else env (`SAST_*`). Returns `None`
+    /// (SAST disabled) unless `enabled` is explicitly true — opt-in so the feature lights up only once
+    /// the opengrep-bearing image is deployed and an operator turns it on.
+    pub fn resolve(file: Option<&FileConfig>) -> Option<Self> {
+        let f = file.and_then(|f| f.sast.as_ref());
+        let enabled = f
+            .and_then(|s| s.enabled)
+            .or_else(|| parse_env_bool("SAST_ENABLED"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let pick = |file_val: Option<&String>, env: &str, default: &str| -> String {
+            file_val
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var(env).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default.to_string())
+        };
+        Some(Self {
+            bin: pick(f.and_then(|s| s.bin.as_ref()), "SAST_BIN", DEFAULT_SAST_BIN),
+            rules: pick(
+                f.and_then(|s| s.rules.as_ref()),
+                "SAST_RULES",
+                DEFAULT_SAST_RULES,
+            ),
+            min_severity: pick(
+                f.and_then(|s| s.min_severity.as_ref()),
+                "SAST_MIN_SEVERITY",
+                DEFAULT_SAST_MIN_SEVERITY,
+            ),
+            max_findings: f
+                .and_then(|s| s.max_findings)
+                .or_else(|| parse_env_u64("SAST_MAX_FINDINGS").map(|n| n as usize))
+                .unwrap_or(DEFAULT_SAST_MAX_FINDINGS)
+                .max(1),
+            timeout_secs: f
+                .and_then(|s| s.timeout_secs)
+                .or_else(|| parse_env_u64("SAST_TIMEOUT_SECS"))
+                .unwrap_or(DEFAULT_SAST_TIMEOUT_SECS)
+                .max(1),
+        })
+    }
+}
+
 fn require(name: &str) -> anyhow::Result<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),
@@ -546,6 +663,7 @@ mod tests {
         std::env::remove_var("REVIEW_SYSTEM_PROMPT");
         let file = FileConfig {
             embeddings: None,
+            sast: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".to_string(),
                 api_key: "k".to_string(),
@@ -585,6 +703,7 @@ mod tests {
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let file = FileConfig {
             embeddings: None,
+            sast: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".to_string(),
                 api_key: "k".to_string(),
@@ -635,6 +754,7 @@ mod tests {
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let file = FileConfig {
             embeddings: None,
+            sast: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".into(),
                 api_key: "k".into(),
