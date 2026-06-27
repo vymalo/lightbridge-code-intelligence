@@ -327,19 +327,33 @@ async fn run(
                     "review posted".to_string()
                 }
                 Ok(review::ReviewOutcome::Exhausted) => {
-                    // Be honest about truncation: set a summary note BEFORE finalize so the posted review
-                    // says some areas may be unreviewed, then flush whatever was buffered.
-                    let note = format!(
-                        "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
-                         far; some areas may be unreviewed.",
-                        review.max_turns
-                    );
+                    // The FAST tier (ADR-0062) is a single diff-only pass BY DESIGN — not a truncated deep
+                    // review — so a fast run that ends without `finish` is normal, not "out of budget."
+                    // Don't post the alarming "hit step budget (N turns)" notice (and `review.max_turns`
+                    // is the config field, 40 by default for the fast block — misleading vs the 1-turn
+                    // cap). Frame it as the quick pass and point to @mention for depth. The DEEP tier keeps
+                    // the honest truncation note with its real budget.
+                    let note = if review.fast {
+                        "🅵 Fast automated pass (SAST + a quick diff-scoped review). For a deeper, \
+                         repo-aware review, mention @lightbridge on this PR."
+                            .to_string()
+                    } else {
+                        format!(
+                            "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
+                             far; some areas may be unreviewed.",
+                            review.max_turns
+                        )
+                    };
                     if let Err(error) = client.set_review_summary(config.task_id, &note).await {
                         tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
                     }
                     client.finalize_review(config.task_id).await?;
                     review_detail = Some(note);
-                    "review posted (truncated at step budget)".to_string()
+                    if review.fast {
+                        "review posted (fast pass)".to_string()
+                    } else {
+                        "review posted (truncated at step budget)".to_string()
+                    }
                 }
                 Ok(review::ReviewOutcome::Aborted(reason)) => {
                     // The model couldn't complete the review. An aborted run is incomplete and
