@@ -286,6 +286,25 @@ pub fn tool_defs() -> Vec<ToolDef> {
     defs
 }
 
+/// Every tool name the agent can offer (ADR-0062), the source of truth for validating a per-tier tool
+/// allowlist (`review.<tier>.tools`): an operator can declare exactly which of these a tier exposes, and
+/// an unknown name must fail closed rather than silently offering fewer tools. Derived from
+/// [`tool_defs`] so the list can never drift from the actual surface.
+pub fn known_tool_names() -> Vec<&'static str> {
+    vec![
+        VECTOR_SEMANTIC_SEARCH,
+        GRAPH_FIND_SYMBOL,
+        GRAPH_GET_CALLERS,
+        READ_FILE,
+        ADD_REVIEW_COMMENT,
+        RETRACT_FINDING,
+        ADD_COMMENT,
+        FINISH,
+        REPORT_PROGRESS,
+        ABORT,
+    ]
+}
+
 /// Runs tool calls against the control-plane API. Holds only borrowed clients + the task id + the
 /// checkout root (`read_file` reads the working tree from here, path-sanitized to within it).
 pub struct Tools<'a> {

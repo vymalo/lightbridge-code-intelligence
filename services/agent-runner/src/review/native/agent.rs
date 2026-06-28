@@ -120,9 +120,8 @@ fn winddown_turn(max_turns: usize) -> usize {
 /// tools, `read_file`, and `report_progress` — with no way to keep investigating, the model must wrap
 /// up. `add_review_comment` is only kept when a diff is present (mirrors the full-set gating, so a
 /// no-diff run never offers an inline tool that can't anchor).
-fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
-    tool_defs()
-        .into_iter()
+fn winddown_tool_defs(base: &[ToolDef], diff_present: bool) -> Vec<ToolDef> {
+    base.iter()
         .filter(|t| {
             let name = t.function.name.as_str();
             match name {
@@ -134,6 +133,7 @@ fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
                 _ => false,
             }
         })
+        .cloned()
         .collect()
 }
 
@@ -301,9 +301,19 @@ pub async fn run_native_agent(
     if !diff_present {
         defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
     }
+    // Per-tier tool allowlist (ADR-0062): when the tier declares `review.tools`, that list is the
+    // authoritative offered set — restrict the base set to it. Still subject to the `diff_present` gate
+    // above and the wind-down narrowing below. Unset = the built-in default surface (full set for DEEP).
+    if let Some(allow) = review.tools.as_ref() {
+        let set: HashSet<&str> = allow.iter().map(|t| t.as_str()).collect();
+        defs.retain(|t| set.contains(t.function.name.as_str()));
+    }
     // Reduced tool set for the wind-down tail (#137): write/finish/abort only, retrieval/read_file
-    // dropped so the model can no longer keep investigating once the budget is nearly spent.
-    let winddown_defs = winddown_tool_defs(diff_present);
+    // dropped so the model can no longer keep investigating once the budget is nearly spent. Derived
+    // from the (possibly allowlist-restricted) `defs`, NOT the global surface, so a per-tier
+    // `review.tools` allowlist is honoured in the wind-down too — a tool the allowlist dropped can't
+    // reappear in the tail (gemini review on #237).
+    let winddown_defs = winddown_tool_defs(&defs, diff_present);
     let params = ChatParams {
         temperature: review.temperature,
         top_p: review.top_p,
@@ -442,9 +452,15 @@ pub async fn run_native_agent(
         let searches_spent = searches >= max_searches;
         let turn_defs_owned: Vec<ToolDef>;
         let turn_defs: &[ToolDef] = if review.fast {
-            // FAST tier (ADR-0062): never offer retrieval/read_file — the single turn records findings
-            // (from the diff + SAST digest in the prompt) and finishes. Same reduced set as wind-down.
-            &winddown_defs
+            // FAST tier (ADR-0062): never offer retrieval/read_file — the turns record findings (from the
+            // diff + SAST digest in the prompt) and finish. With an explicit `review.tools` allowlist,
+            // `defs` already IS that reduced set; without one, fall back to the built-in wind-down
+            // write/finish/abort set so the legacy (no-allowlist) values shape keeps working.
+            if review.tools.is_some() {
+                &defs
+            } else {
+                &winddown_defs
+            }
         } else if in_winddown {
             &winddown_defs
         } else if files_spent || searches_spent || suppress_record {
@@ -1222,6 +1238,8 @@ mod tests {
                 circuit_breaker_threshold: 3,
             },
             fast: false,
+            // Tests that exercise the allowlist set this explicitly; default to the built-in surface.
+            tools: None,
         }
     }
 
@@ -1966,7 +1984,7 @@ mod tests {
 
     #[test]
     fn winddown_tool_defs_drops_investigation_tools() {
-        let names: Vec<String> = winddown_tool_defs(true)
+        let names: Vec<String> = winddown_tool_defs(&tool_defs(), true)
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
@@ -1988,12 +2006,37 @@ mod tests {
             );
         }
         // No diff → `add_review_comment` is not even offered in the reduced set.
-        let no_diff: Vec<String> = winddown_tool_defs(false)
+        let no_diff: Vec<String> = winddown_tool_defs(&tool_defs(), false)
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
         assert!(!no_diff.iter().any(|n| n == ADD_REVIEW_COMMENT));
         assert!(no_diff.iter().any(|n| n == ADD_COMMENT));
+    }
+
+    // Wind-down is derived from the (possibly allowlist-restricted) base, NOT the global surface — so a
+    // tool a per-tier `review.tools` allowlist dropped can't reappear in the wind-down tail (gemini #237).
+    #[test]
+    fn winddown_respects_a_restricted_base_set() {
+        // A base that excludes add_comment (e.g. a deep allowlist of record/finish/abort only).
+        let base: Vec<ToolDef> = tool_defs()
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.function.name.as_str(),
+                    ADD_REVIEW_COMMENT | FINISH | ABORT
+                )
+            })
+            .collect();
+        let names: Vec<String> = winddown_tool_defs(&base, true)
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == ADD_COMMENT),
+            "a tool absent from the restricted base must not reappear in wind-down: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == FINISH), "finish stays");
     }
 
     /// A scripted chat endpoint that also records, per call, the tool names offered in the request body
@@ -2250,6 +2293,87 @@ mod tests {
         assert!(
             set.iter().any(|n| n == ADD_REVIEW_COMMENT),
             "fast tier keeps add_review_comment (diff present): {set:?}"
+        );
+    }
+
+    // Two-tier review (ADR-0062): when the tier declares an explicit `review.tools` allowlist, THAT is
+    // the offered set — exactly those tools, nothing else (here: no `add_comment`, no retrieval). The
+    // allowlist is config-driven so an operator tunes each tier's surface without a code change.
+    #[tokio::test]
+    async fn fast_tier_offers_exactly_the_configured_tool_allowlist() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let user_text = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: user_text.clone(),
+                response: tool_call_reply("finish", r#"{"summary":"Fast pass."}"#),
+            })
+            .mount(&chat)
+            .await;
+        let emb = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "index": 0, "embedding": [0.1_f32, 0.2_f32] }]
+            })))
+            .mount(&emb)
+            .await;
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.fast = true;
+        // An explicit allowlist: record findings, finish, abort — and nothing else.
+        review.tools = Some(vec![
+            crate::bootstrap::config::ReviewTool::AddReviewComment,
+            crate::bootstrap::config::ReviewTool::Finish,
+            crate::bootstrap::config::ReviewTool::Abort,
+        ]);
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("fast tier finishes cleanly");
+
+        let offered = offered.lock().unwrap();
+        let set = &offered[0];
+        let mut got: Vec<&str> = set.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want = vec![ADD_REVIEW_COMMENT, FINISH, super::super::tools::ABORT];
+        want.sort_unstable();
+        assert_eq!(got, want, "offered set is exactly the allowlist: {set:?}");
+        assert!(
+            !set.iter().any(|n| n == super::super::tools::ADD_COMMENT),
+            "a tool left off the allowlist is not offered: {set:?}"
         );
     }
 

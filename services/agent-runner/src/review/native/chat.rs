@@ -240,7 +240,10 @@ struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
     /// The non-stream chain-of-thought (DeepSeek/GLM lineage), surfaced into [`Completion::reasoning`].
-    #[serde(default)]
+    /// Accept `reasoning` too: some OpenAI-compatible gateways emit the field under that name instead of
+    /// `reasoning_content`, which otherwise reads back as empty (`reasoning_chars: 0`) despite the model
+    /// thinking (#220 / ADR-0060).
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
@@ -285,8 +288,9 @@ struct StreamDelta {
     content: Option<String>,
     /// Reasoning-model thinking deltas (DeepSeek/GLM lineage), reassembled across chunks into
     /// [`Completion::reasoning`] for the transcript/logs (epic #137 proof-of-work). Not echoed back to
-    /// the model on the next turn.
-    #[serde(default)]
+    /// the model on the next turn. `reasoning` alias: some gateways stream the deltas under that key, so
+    /// without it a streamed reasoning model logs `reasoning_chars: 0` (the deep-tier GLM-5.2 symptom).
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<StreamToolCall>,

@@ -431,7 +431,21 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
         "## Lightbridge review\n\n{}",
         strip_model_artifacts(summary)
     );
+    append_finding_sections(&mut body, deferred, out_of_scope);
+    body.push_str(REVIEW_DISCLOSURE);
+    body
+}
 
+/// The untrusted-output disclosure appended to every review body (the AI-governance working agreement:
+/// AI output is untrusted; a human owns the decision). Shared by [`render_body`] and
+/// [`render_fast_body`] so the two paths can't drift.
+const REVIEW_DISCLOSURE: &str =
+    "\n\n---\n_🤖 AI-generated review — treat it as untrusted, verify before acting; a human \
+     owns the final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._";
+
+/// Append the "Notes on changed files" (deferred findings) and the collapsed out-of-scope section to a
+/// review body. Factored out of [`render_body`] so the fast-pass body renders findings identically.
+fn append_finding_sections(body: &mut String, deferred: &[Finding], out_of_scope: &[Finding]) {
     // A finding as a bullet whose first line is the badge row, with the bold title + `file:line` on the
     // next (indented) line and the body under that — so the badges never share a line with the title,
     // matching the inline rendering. The 2-space indent keeps the continuation lines inside the list
@@ -455,7 +469,7 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
         body.push_str("\n\n### Notes on changed files\n");
         body.push_str("_Findings on this PR's changes that couldn't be pinned to a diff line._\n");
         for f in deferred {
-            render_finding(&mut body, f);
+            render_finding(body, f);
         }
     }
 
@@ -475,11 +489,37 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
         }
         body.push_str("\n</details>");
     }
+}
 
-    body.push_str(
-        "\n\n---\n_🤖 AI-generated review — treat it as untrusted, verify before acting; a human \
-         owns the final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._",
+/// Render the FAST-tier (ADR-0062) review body. Unlike [`render_body`] it is deliberately marked as a
+/// **quick pass, not the authoritative review**: it leads with a blockquote banner that says what the
+/// pass is (SAST + a diff-scoped look, no repo-wide retrieval) and how to get the deep review (mention
+/// the GitHub App by its real handle). The handle lives only control-plane-side (`GITHUB_APP_HANDLE`),
+/// which is why the fast body is composed here and not by the runner (which hardcoded the wrong handle).
+/// `summary` is the model's `finish` verdict when it converged, or `None` for an exhausted/clean pass —
+/// in which case the banner stands alone (inline findings still post as review comments). Findings that
+/// couldn't anchor are appended exactly as in the full body.
+pub fn render_fast_body(
+    handle: &str,
+    summary: Option<&str>,
+    deferred: &[Finding],
+    out_of_scope: &[Finding],
+) -> String {
+    let handle = handle.trim();
+    let mention = if handle.is_empty() {
+        "mention me on this PR".to_string()
+    } else {
+        format!("mention @{handle} on this PR")
+    };
+    let mut body = format!(
+        "> 🅵 **Fast automated pass** — SAST + a quick, diff-scoped look (no repo-wide retrieval). \
+         For a deeper, repo-aware review, {mention}."
     );
+    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        body.push_str(&format!("\n\n{}", strip_model_artifacts(s)));
+    }
+    append_finding_sections(&mut body, deferred, out_of_scope);
+    body.push_str(REVIEW_DISCLOSURE);
     body
 }
 
@@ -789,6 +829,54 @@ mod tests {
             body.contains("AI-generated review"),
             "governance disclosure"
         );
+    }
+
+    // FAST tier (ADR-0062): the body is marked as a quick pass — a blockquote banner naming the pass and
+    // pointing to the deep review via the REAL App handle. A verdict, when present, follows the banner;
+    // when absent the banner stands alone. Findings render exactly as in the full body.
+    #[test]
+    fn render_fast_body_marks_quick_pass_with_handle_and_optional_verdict() {
+        // With a verdict + an out-of-scope finding.
+        let body = render_fast_body(
+            "lightbridge-assistant",
+            Some("Looks fine; one small nit."),
+            &[],
+            &[finding("vendor/lib.rs", 9, "Unrelated nit")],
+        );
+        assert!(
+            body.starts_with("> 🅵 **Fast automated pass**"),
+            "leads with the quick-pass blockquote banner: {body}"
+        );
+        assert!(
+            body.contains("mention @lightbridge-assistant on this PR"),
+            "points to the deep review via the real handle: {body}"
+        );
+        assert!(body.contains("Looks fine; one small nit."), "verdict shown");
+        assert!(
+            body.contains("<details>") && body.contains("Unrelated nit"),
+            "findings render like the full body"
+        );
+        assert!(
+            body.contains("AI-generated review"),
+            "governance disclosure"
+        );
+        assert!(
+            !body.contains("## Lightbridge review"),
+            "the fast pass is visually distinct from the authoritative review heading"
+        );
+
+        // No verdict (exhausted/clean pass) → the banner stands alone, no default 'No issues' verdict.
+        let empty = render_fast_body("lightbridge-assistant", None, &[], &[]);
+        assert!(empty.starts_with("> 🅵 **Fast automated pass**"));
+        assert!(
+            !empty.contains("No issues found"),
+            "an empty fast pass shows the banner, not a fabricated verdict: {empty}"
+        );
+
+        // No handle configured → a graceful generic pointer, never a bare '@'.
+        let no_handle = render_fast_body("", None, &[], &[]);
+        assert!(no_handle.contains("mention me on this PR"), "{no_handle}");
+        assert!(!no_handle.contains("@ "), "no dangling @: {no_handle}");
     }
 
     #[test]
