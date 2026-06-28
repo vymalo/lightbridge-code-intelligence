@@ -7,22 +7,32 @@ Lightbridge is a GitHub App for **intelligent code review and repository Q&A**. 
 GitHub webhook events, records work in a Rust control plane, and runs each task in an isolated,
 short-lived Kubernetes Job. The work is backed by **repository-aware retrieval** over two
 complementary indexes — a Neo4j knowledge graph (structure) and pgvector (semantics) — with reasoning
-performed by a review agent over those retrieval tools (OpenCode today; moving to a native Rust agent
-loop, [ADR-0026](docs/adr/0026-native-review-agent.md)).
+performed by a **native Rust review agent** that acts through mediated write tools
+([ADR-0026](docs/adr/0026-native-review-agent.md),
+[ADR-0037](docs/adr/0037-agent-acts-via-mediated-tools.md)).
+
+Reviews run in **two tiers** ([ADR-0062](docs/adr/0062-two-tier-review-fast-auto-deep-on-demand.md)): a
+**fast** automatic pass on every opened PR — deterministic [SAST](docs/adr/0061-sast-deterministic-finding-source.md)
+plus a lean, diff-only LLM pass with no retrieval — and a **deep**, repo-aware review on `@mention`
+(full graph + vector retrieval, multi-turn). See [docs/review-pipeline.md](docs/review-pipeline.md).
 
 The Rust control plane is the **trust boundary**: it holds the GitHub App private key and mints
 short-lived, per-task installation tokens — the App key itself never reaches a Job. The agent only
-proposes; the control plane validates results before any write-back to GitHub.
+proposes; the control plane validates results and is the **sole writer** to GitHub — every write flows
+through one outbox drained by the `reconciler` role
+([ADR-0059](docs/adr/0059-reconciler-owns-all-github-egress.md)).
 
 ---
 
 ## System architecture
 
-One control-plane binary runs in two roles (`serve` and `dispatcher`); the actual repository work
-runs in disposable per-task Jobs. A Job never receives the GitHub App key — it bootstraps a
-short-lived installation token at runtime — but it **is** injected with the shared runner bearer
-(`AGENT_RUNNER_TOKEN`) and the embeddings API key it needs to do its work (see
-[Secrets a Job holds](#secrets-a-job-holds)).
+One control-plane binary runs in three roles (`serve`, `dispatcher`, and `reconciler` —
+[ADR-0058](docs/adr/0058-rename-poller-role-to-reconciler.md)); the actual repository work runs in
+disposable per-task Jobs. `serve` handles the HTTP API + reads, `dispatcher` consumes the work queue
+and launches Jobs, and `reconciler` drains the GitHub-egress outbox (the single writer to GitHub) and
+polls feedback. A Job never receives the GitHub App key — it bootstraps a short-lived installation
+token at runtime — but it **is** injected with the shared runner bearer (`AGENT_RUNNER_TOKEN`) and the
+embeddings API key it needs to do its work (see [Secrets a Job holds](#secrets-a-job-holds)).
 
 ```mermaid
 flowchart TD
@@ -35,20 +45,21 @@ flowchart TD
     WEB["Next.js web console<br/>(OIDC Auth Code + PKCE)"]
 
     subgraph cp["Rust control plane — trust boundary"]
-        SERVE["role: serve<br/>HTTP API · mints tokens · validates JWT"]
-        DISP["role: dispatcher<br/>queue consumer"]
-        Q[("Postgres<br/>work queue")]
+        SERVE["role: serve<br/>HTTP API · mints tokens · validates JWT · mediated tools"]
+        DISP["role: dispatcher<br/>queue consumer · launches Jobs"]
+        RECON["role: reconciler<br/>GitHub-egress outbox · feedback poll"]
+        Q[("Postgres<br/>work queue + outbox")]
     end
 
     subgraph job["Kubernetes Job (ephemeral, per task)"]
-        RUNNER["agent-runner<br/>clone · index · reason"]
+        RUNNER["agent-runner<br/>clone · index · review"]
         TS["tree-sitter chunker"]
         GFY["Graphify"]
+        AGENT["native review agent<br/>(in-process, ADR-0026/0037)<br/>SAST + LLM over mediated tools"]
     end
 
     VEC[("pgvector<br/>semantic")]
     NEO[("Neo4j<br/>structural")]
-    AGENT["Review agent<br/>(OpenCode → native, ADR-0026)"]
 
     KC -. login .-> WEB
     WEB -->|"Bearer JWT (read)"| SERVE
@@ -56,22 +67,26 @@ flowchart TD
     SERVE -->|enqueue| Q
     Q -->|"claim (SKIP LOCKED)"| DISP
     DISP -->|"one Job per task"| RUNNER
-    SERVE <-->|"context · token · status · chunks"| RUNNER
+    SERVE <-->|"context · token · status · chunks · tool calls"| RUNNER
     RUNNER --> TS
     RUNNER --> GFY
+    RUNNER --> AGENT
     TS -->|embeddings| EAIG
     EAIG --> VEC
     GFY --> NEO
-    VEC -. MCP .-> AGENT
-    NEO -. MCP .-> AGENT
-    AGENT -. result .-> SERVE
-    SERVE -. writeback .-> GH
+    SERVE -. "retrieval (mediated)" .-> VEC
+    SERVE -. "retrieval (mediated)" .-> NEO
+    AGENT -. "findings (buffered)" .-> SERVE
+    SERVE -->|"enqueue write"| Q
+    Q -->|"claim outbox"| RECON
+    RECON -. writeback .-> GH
 ```
 
 > The full flow — clone → dual index → review → validated write-back — is **implemented and deployed**.
-> The review agent runs via OpenCode today and is moving to a native Rust loop
-> ([ADR-0026](docs/adr/0026-native-review-agent.md)). The per-task Job is also being restructured into a
-> control sidecar + main container ([ADR-0028](docs/adr/0028-agent-job-control-sidecar.md)).
+> The review agent is the **native in-process Rust loop** ([ADR-0026](docs/adr/0026-native-review-agent.md),
+> [ADR-0037](docs/adr/0037-agent-acts-via-mediated-tools.md)); OpenCode has been retired. Reviews are
+> two-tier ([ADR-0062](docs/adr/0062-two-tier-review-fast-auto-deep-on-demand.md)) and a deterministic
+> SAST pass rides the same channel ([ADR-0061](docs/adr/0061-sast-deterministic-finding-source.md)).
 
 See [docs/architecture.md](docs/architecture.md), [docs/jobs-and-lifecycle.md](docs/jobs-and-lifecycle.md),
 and [docs/INDEX.md](docs/INDEX.md) for the full picture.
@@ -148,10 +163,11 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-> There are **two job kinds**: an `index` task (on repo approval) and a `review` task (on a PR or
-> `@mention`). A warm review **reuses the base index** ([ADR-0025](docs/adr/0025-review-reuses-base-index.md)).
-> The authoritative state machine, cancellation, and data-purge flows live in
-> [docs/jobs-and-lifecycle.md](docs/jobs-and-lifecycle.md).
+> There are **two job kinds**: an `index` task (on repo approval / default-branch push) and a `review`
+> task. A review carries a **tier** ([ADR-0062](docs/adr/0062-two-tier-review-fast-auto-deep-on-demand.md)):
+> `fast` on PR-opened, `deep` on `@mention`. A warm review **reuses the base index**
+> ([ADR-0025](docs/adr/0025-review-reuses-base-index.md)). The authoritative state machine, cancellation,
+> and data-purge flows live in [docs/jobs-and-lifecycle.md](docs/jobs-and-lifecycle.md).
 
 ---
 
@@ -194,7 +210,7 @@ sequenceDiagram
 The trust boundary is specifically about the **GitHub App private key**, which never leaves the
 control plane — a Job mints a short-lived (~1h), installation-scoped token at runtime instead. A Job
 is **not** credential-free, though. Today the dispatcher injects into every runner pod
-([`k8s.rs`](services/control-plane/src/k8s.rs)):
+([`k8s.rs`](services/control-plane/src/integrations/k8s.rs)):
 
 | Secret | Source | Lifetime | Notes |
 |---|---|---|---|
@@ -220,8 +236,8 @@ A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust autom
 | `apps/web` | TS | Next.js (App Router) web console; OIDC Auth Code + PKCE login against Keycloak ([ADR-0014](docs/adr/0014-keycloak-oidc-resource-server.md)). [README](apps/web/README.md) |
 | `packages/auth` | TS | Shared OIDC/JWT helpers (token verification, claims, session cookie) |
 | `packages/tsconfig` | TS | Shared TypeScript configs |
-| `services/control-plane` | Rust | Axum control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve` or `dispatcher`. [README](services/control-plane/README.md) |
-| `services/agent-runner` | Rust | Per-task Job: bootstraps from the control plane, clones, indexes (pgvector + Neo4j), and runs the review agent. [README](services/agent-runner/README.md) |
+| `services/control-plane` | Rust | Axum control plane; Postgres via hand-written SQLx (cratestack deferred — [ADR-0005](docs/adr/0005-cratestack-schema-first-control-plane.md)). Runs as `serve`, `dispatcher`, or `reconciler` ([ADR-0058](docs/adr/0058-rename-poller-role-to-reconciler.md)). [README](services/control-plane/README.md) |
+| `services/agent-runner` | Rust | Per-task Job: bootstraps from the control plane, clones, indexes (pgvector + Neo4j), and runs the native review agent + SAST. [README](services/agent-runner/README.md) |
 | `services/config` | Rust | Shared config loader: one JSON file + `{env:VAR:-default}` substitution, used by both Rust services. [README](services/config/README.md) |
 | `xtask` | Rust | Cargo `xtask` workspace automation — the Rust side of `just` (`cargo xtask ci\|fmt\|lint\|test\|build`) |
 | `tools/dashboard-gen` | Python | Generates the Grafana dashboards-as-code into the Helm chart. [README](tools/dashboard-gen/README.md) |
@@ -230,9 +246,10 @@ A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust autom
 
 ### Kubernetes layout
 
-The control plane (`serve` + `dispatcher`) and the web console run in the platform namespace; each task
-runs as a Job in a dedicated **agents** namespace (`AGENT_NAMESPACE`, default `lightbridge-agents`); the
-data stores (Postgres/pgvector, Neo4j) are managed services. See
+The control plane (`serve` + `dispatcher` + `reconciler`) and the web console run in the platform
+namespace; each task runs as a Job in a dedicated **agents** namespace (`AGENT_NAMESPACE`, default
+`lightbridge-agents`); the data stores (Postgres/pgvector, Neo4j) are managed services. Delivery is
+GitOps (the `ai-helm` chart + per-env `ai-helm-values`, promoted by argocd-image-updater). See
 [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md).
 
 ---
@@ -299,15 +316,18 @@ framework (Definition of Ready/Done, AI usage declarations). See
 ## Development status
 
 **Core shipped and running in production.** The end-to-end path is live: webhooks → Postgres work
-queue + dispatcher → per-task Job → dual index (pgvector + Neo4j) → review agent → validated
-write-back, plus the admin/governance web console (repo approval gate, permission-based authz, runs +
-insights). Deployment is GitOps (per-env Helm values → the `ai-helm` chart → ArgoCD).
+queue + dispatcher → per-task Job → dual index (pgvector + Neo4j) → **native review agent** → validated
+write-back through the `reconciler` outbox, plus the admin/governance web console (repo approval gate,
+permission-based authz, runs + insights). Deployment is GitOps (per-env Helm values → the `ai-helm`
+chart → ArgoCD).
 
-In flight: the **native Rust review agent** (replacing OpenCode,
-[ADR-0026](docs/adr/0026-native-review-agent.md)) and the **agent-Job restructure** — a control sidecar
-+ main container with repo-level review config
-([ADR-0028](docs/adr/0028-agent-job-control-sidecar.md)–[0031](docs/adr/0031-review-skills-commands.md)).
-See the [Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for the roadmap.
+Shipped since the initial cut: the **native Rust review agent** (OpenCode retired,
+[ADR-0026](docs/adr/0026-native-review-agent.md)/[ADR-0037](docs/adr/0037-agent-acts-via-mediated-tools.md)),
+**two-tier review** ([ADR-0062](docs/adr/0062-two-tier-review-fast-auto-deep-on-demand.md)), a
+deterministic **SAST** pass ([ADR-0061](docs/adr/0061-sast-deterministic-finding-source.md)), the
+single-egress **reconciler** ([ADR-0058](docs/adr/0058-rename-poller-role-to-reconciler.md)/[ADR-0059](docs/adr/0059-reconciler-owns-all-github-egress.md)),
+and finding verification/refute + feedback memory. See the
+[Issues](https://github.com/vymalo/lightbridge-code-intelligence/issues) for the roadmap.
 
 ## License
 
@@ -317,7 +337,7 @@ MIT — see [LICENSE](LICENSE).
 
 - [Graphify](https://github.com/safishamsi/graphify) — multi-modal graph extraction
 - [tree-sitter](https://tree-sitter.github.io/) — syntax-aware parsing / chunking
-- [OpenCode](https://opencode.ai) — agent reasoning framework
+- [OpenCode](https://opencode.ai) — agent reasoning framework (used in the original review agent; since retired for the native loop, [ADR-0026](docs/adr/0026-native-review-agent.md))
 - [Neo4j](https://neo4j.com/) — graph database
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL vector extension
 - [Keycloak](https://www.keycloak.org/) — OIDC identity provider
