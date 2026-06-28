@@ -331,8 +331,8 @@ transcript capture are best-effort by design, so their failure modes are exercis
 
 ## 5. Rollout and deploy-ordering discipline
 
-Delivery is **GitOps continuous delivery** ([ADR-0055]): merging to `ai-helm` `main` goes live. The
-chart is genericized ([ADR-0057]) with all deployment specifics in the sibling **ai-helm-values**
+Delivery is **GitOps continuous delivery** ([ai-helm]): merging to `ai-helm` `main` goes live. The
+chart is genericized ([ai-helm]) with all deployment specifics in the sibling **ai-helm-values**
 repo; `argocd-image-updater` writes `sha-<gitsha>` image tags.
 
 **Two physical clusters:** ArgoCD runs on a Talos cluster (kube context `admin@homeos`); the LCI
@@ -384,5 +384,4 @@ non-review task (e.g. an `index` task, which ignores tier), gets the full/safe b
   [ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)
 - SAST: [ADR-0061](adr/0061-sast-deterministic-finding-source.md)
 
-[ADR-0055]: https://github.com/ADORSYS-GIS/ai-helm
-[ADR-0057]: https://github.com/ADORSYS-GIS/ai-helm
+[ai-helm]: https://github.com/ADORSYS-GIS/ai-helm
