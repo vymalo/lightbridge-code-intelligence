@@ -39,7 +39,9 @@ Chosen option: **A — Grafana fronted by Caddy + oauth2 forward-auth to Keycloa
 edge-auth pattern** for Grafana (and future internal tools), keeps Grafana itself unconfigured for auth, and
 lets the bespoke web dashboards be **deleted**. Data sources stay as today: **Postgres** (transcript #143 +
 feedback #144 + run state — reuse the [ADR-0046](0046-observability-dashboard-deployment.md) panels),
-**Loki** (the agent's structured per-turn logs — tools, tokens, `reasoning_chars`, latency), **Prometheus/Mimir**
+**Loki** (the agent's structured per-turn logs — tools, tokens, `reasoning_chars` (the length of the
+captured `reasoning_content`, [ADR-0060](0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)),
+latency), **Prometheus/Mimir**
 (metrics), and **optionally Tempo** (request-level traces — the one genuinely new build, the OTel door
 [ADR-0034](0034-agent-run-transcript-and-observability.md) left open).
 
