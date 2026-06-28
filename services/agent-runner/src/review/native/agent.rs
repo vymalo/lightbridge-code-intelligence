@@ -475,7 +475,10 @@ pub async fn run_native_agent(
         let fast_refuse = |tool: &str| review.fast && !offered.contains(tool);
         // One-turn suppression: the guard's effect on `turn_defs` is now baked in for this turn.
         suppress_record = false;
-        if in_winddown && !winddown_announced {
+        // The FAST tier (ADR-0062) never offers retrieval/read_file, so the convergence nudges below
+        // ("stop investigating", "stop opening files", "you're past halfway") are noise — even
+        // contradictory — for it; skip them all. (gemini review on #235.)
+        if !review.fast && in_winddown && !winddown_announced {
             winddown_announced = true;
             let why = if tokens_spent && turn < winddown && !batches_spent {
                 "Context budget nearly full".to_string()
@@ -489,7 +492,7 @@ pub async fn run_native_agent(
                  add_review_comment/add_comment, then call `finish` with your overall verdict. (The \
                  investigation tools are no longer available.)"
             )));
-        } else if !in_winddown {
+        } else if !review.fast && !in_winddown {
             // One-time notice when a single read budget is exhausted (the tool is already dropped above).
             if files_spent && !files_budget_announced {
                 files_budget_announced = true;
@@ -902,13 +905,19 @@ pub async fn run_native_agent(
 
         // Light nudge (#137): once useful work is buffered, remind the model to wrap up with `finish`
         // so it doesn't wander and exhaust the budget after the findings are already recorded. Once.
+        // Keep it for the fast tier too (the finish-push is exactly what we want), but without the
+        // "investigation" wording — fast has no investigation tools (gemini review on #235).
         if findings_recorded > 0 && !nudged_to_finish {
             nudged_to_finish = true;
-            messages.push(ChatMessage::user(
+            let nudge = if review.fast {
+                "You've recorded a finding. Record any others on changed lines with add_review_comment, \
+                 then call `finish` with your overall verdict to post the review."
+            } else {
                 "You have recorded at least one finding. When your investigation is complete, call \
                  `finish` with your overall verdict to post everything you've buffered — don't keep \
-                 investigating past the point of useful work.",
-            ));
+                 investigating past the point of useful work."
+            };
+            messages.push(ChatMessage::user(nudge.to_string()));
         }
     }
 
