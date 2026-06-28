@@ -7,21 +7,29 @@ Kubernetes Job per task.
 
 ## Roles
 
-One binary, selected by the first arg (default `serve`):
+One binary, three roles, selected by the first arg or `CONTROL_PLANE_ROLE` (default `serve`):
 
-- **`serve`** — the HTTP API: GitHub webhooks (HMAC-verified, delivery-id deduped), the internal
-  task/runner API (`/internal/tasks/{id}` — context + minted token + status/chunks/review/graph/search,
-  [ADR-0017](../../docs/adr/0017-agent-runner-control-plane-bootstrap.md)), the dashboard API
-  (`/tasks`, `/repositories`, `/admin/*`, `/me`, `/tasks/{id}/review|cancel`), and `/metrics`.
-  Verifies OIDC JWTs and enforces **permission-based authz**
-  ([ADR-0023](../../docs/adr/0023-db-backed-rbac.md)).
+- **`serve`** — the HTTP API: GitHub webhooks (HMAC-verified, delivery-id deduped; sets the review
+  **tier** — `fast` on PR-opened, `deep` on `@mention`, [ADR-0062](../../docs/adr/0062-two-tier-review-fast-auto-deep-on-demand.md)),
+  the internal task/runner API (`/internal/tasks/{id}` — context + minted token + status/chunks/review/
+  graph/search, [ADR-0017](../../docs/adr/0017-agent-runner-control-plane-bootstrap.md)), the dashboard
+  API (`/tasks`, `/repositories`, `/admin/*`, `/me`, `/tasks/{id}/review|cancel`), and `/metrics`.
+  Verifies OIDC JWTs and enforces **permission-based authz** ([ADR-0023](../../docs/adr/0023-db-backed-rbac.md)).
+  At finalize it *shapes* the review (validates findings against the PR diff) and **enqueues** egress —
+  it never posts to GitHub directly.
 - **`dispatcher`** — the queue consumer: claims `queued` tasks (`SELECT … FOR UPDATE SKIP LOCKED`),
-  launches the agent Job (`k8s.rs`), and runs the **reaper** (deletes cancelled/finished Jobs) and the
-  **purge reconciler** (removes data for denied/removed repos). See RFC-0001.
+  launches the agent Job (`integrations/k8s.rs`), and runs the **reaper** (deletes cancelled/finished
+  Jobs) + the **purge reconciler** (removes data for denied/removed repos). See RFC-0001.
+- **`reconciler`** — a **single replica that owns ALL GitHub egress** ([ADR-0058](../../docs/adr/0058-rename-poller-role-to-reconciler.md)/[ADR-0059](../../docs/adr/0059-reconciler-owns-all-github-egress.md)):
+  it drains the transactional `github_outbox` and delivers reviews / replies / reactions / failure
+  notices, and runs the **feedback poll** (👍/👎 reactions → `review_feedback`,
+  [ADR-0035](../../docs/adr/0035-review-feedback-signal.md)). One writer ⇒ no double-post; it holds the
+  GitHub App key (to mint tokens). (`poller` is the legacy alias the binary still accepts.)
 
 ```bash
 cargo run -p control-plane              # serve (default)
 cargo run -p control-plane dispatcher   # dispatcher
+cargo run -p control-plane reconciler   # reconciler (GitHub egress + feedback poll)
 ```
 
 ## What it talks to
@@ -31,9 +39,11 @@ cargo run -p control-plane dispatcher   # dispatcher
   [ADR-0005](../../docs/adr/0005-cratestack-schema-first-control-plane.md)).
 - **Neo4j** — the structural graph (the control plane writes;
   [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
-- **GitHub** — webhooks in; minted installation tokens used by runners to clone; validated review
-  write-back ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md)).
-- **Kubernetes** — builds + launches the per-task Job (`k8s.rs::job_manifest`); one Job per task
+- **GitHub** — webhooks in; minted installation tokens used by runners to clone; all write-back
+  (validated reviews, replies, reactions, notices) flows **out through the `reconciler`'s
+  `github_outbox`** — one writer ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md) →
+  [ADR-0059](../../docs/adr/0059-reconciler-owns-all-github-egress.md)).
+- **Kubernetes** — builds + launches the per-task Job (`integrations/k8s.rs::job_manifest`); one Job per task
   ([ADR-0004](../../docs/adr/0004-one-k8s-job-per-task.md)).
 
 ## Trust boundary
