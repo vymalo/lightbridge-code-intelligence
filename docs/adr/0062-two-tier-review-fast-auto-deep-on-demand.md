@@ -131,6 +131,13 @@ Three changes, keeping the ADR's decision intact:
    the diff directly, record findings, and **always `finish` with a verdict** (even if clean), and — the
    calibration fix — to **raise only what the diff proves**, phrasing the unverifiable as a P2 question, not
    a P0/P1. The deep tier keeps the full `reviewSystemPrompt`.
+   - **Anti-noise rule (added 2026-06-28, dogfood vymalo-shop#316).** Early fast passes produced calibrated
+     *verdicts* but still recorded content-free "findings" (a P2 *"comment-only change, no functional
+     impact"*) because the lean prompt said "record findings" without forbidding non-findings — a rule the
+     deep prompt already had. The fast prompt now states: **a finding is a provable defect/risk on a changed
+     line; a clean diff means zero findings + a clean verdict; never record "looks fine" / "no functional
+     change" / "comment-only change" / a summary as a finding** (`add_review_comment` is not a notepad).
+     Prompt-only change in ai-helm-values — no runner/chart change.
 2. **Config-driven per-tier tool allowlist** (`review.<tier>.tools`). The exact tool names a tier offers are
    now declared in `ai-helm-values` (fast = `[add_review_comment, finish, abort]`) instead of relying on the
    runner's hardcoded wind-down set. It is a **closed enum** (`ReviewTool`), so an unknown name **fails at
