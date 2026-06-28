@@ -84,3 +84,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0062](0062-two-tier-review-fast-auto-deep-on-demand.md) | Two-tier review: fast auto pass (SAST + a lean diff-only LLM pass) on every PR; deep on-demand (`@mention`, full retrieval, 2h) — one model, two loop shapes | Accepted |
 | [0063](0063-cli-only-repository-approval.md) | CLI-only repository approval (device-code over the existing OIDC-gated endpoints) — retire the web approval gate | Proposed |
 | [0064](0064-observability-via-grafana-behind-caddy-oauth2.md) | Observability via Grafana behind a Caddy + oauth2 proxy — retire the bespoke web dashboards (transcript/feedback → Grafana panels) | Proposed |
+| [0065](0065-re-review-dedup-and-reconciliation.md) | Re-review must not duplicate: short-circuit unchanged commits + dedup findings at finalize + re-derive-then-reconcile (refines ADR-0040) | Proposed |
