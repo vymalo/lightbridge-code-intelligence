@@ -87,7 +87,7 @@ ever *gating* them.**
   owner of PR output (why reviewdog is rejected for the product pipeline).
 - [ADR-0059](0059-reconciler-owns-all-github-egress.md) — the egress outbox (downstream of where SAST
   hooks in; untouched).
-- [ADR-0019](0019-structural-graph-via-graphify.md) — the Graphify subprocess pattern opengrep mirrors.
+- [ADR-0019](0019-graphify-cli-structural-graph.md) — the Graphify subprocess pattern opengrep mirrors.
 - [opengrep](https://github.com/opengrep/opengrep) · [reviewdog](https://github.com/reviewdog/reviewdog).
 </content>
 </invoke>

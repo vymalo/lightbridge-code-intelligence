@@ -1,11 +1,13 @@
 # OpenCode ACP and MCP Integration
 
-> **⚠️ Largely historical.** This document describes an early ACP-subprocess design. In practice the
-> runner drives OpenCode **headless** (`opencode run`), and that is being **replaced by a native Rust
-> agent loop** with structured tool calls ([ADR-0026](adr/0026-native-review-agent.md)). The retrieval
-> tools are thin clients of the control-plane API rather than standalone MCP servers in the review path
-> ([ADR-0020](adr/0020-mcp-servers-via-control-plane.md)). Read this for background; treat ADR-0026 and
-> ADR-0020 as the current truth.
+> **Historical / superseded.** OpenCode (and the ACP-subprocess / standalone-MCP-server shape this
+> document describes) has been **replaced by a native, in-process Rust review-agent loop** that calls
+> the LLM with structured tool calls and acts only through control-plane-mediated tools
+> ([ADR-0026](adr/0026-native-review-agent.md), [ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)).
+> The retrieval tools are thin clients of the control-plane API, not standalone MCP servers
+> ([ADR-0020](adr/0020-mcp-servers-via-control-plane.md)). The current review subsystem is documented in
+> **[review-pipeline.md](review-pipeline.md)**; this file is retained for historical background only —
+> nothing below reflects the running system.
 
 ## Why OpenCode here
 

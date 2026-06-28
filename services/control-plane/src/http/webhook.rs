@@ -190,8 +190,8 @@ async fn handle_pull_request(
                 base_sha: pr["base"]["sha"].as_str().map(str::to_string),
                 head_sha: pr["head"]["sha"].as_str().map(str::to_string),
                 run_epoch: 0, // the automatic first review
-                // ADR-0062: the automatic on-open review is the FAST tier (SAST + one diff-only LLM
-                // turn, no retrieval). The deep, repo-aware review is `@mention`-only.
+                // ADR-0062: the automatic on-open review is the FAST tier (SAST + a lean diff-only LLM
+                // pass, no retrieval, turn-capped). The deep, repo-aware review is `@mention`-only.
                 tier: "fast".to_string(),
             };
             create_review_task(state, pool, task, owner, name, delivery_id).await;

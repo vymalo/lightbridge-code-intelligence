@@ -11,11 +11,12 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 - [GitHub App and Rust control plane](github-app-and-control-plane.md)
 - [Control-plane roles & GitHub egress](control-plane-roles-and-github-egress.md) — the three roles (serve / dispatcher / reconciler) and the single-egress outbox (ADR-0058/0059)
 - [Jobs and task lifecycle](jobs-and-lifecycle.md) — the two job kinds, state machine, cancellation + purge (with diagrams)
+- [Review pipeline](review-pipeline.md) — the whole review subsystem end to end: tier selection (fast auto / deep on @mention, [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)), the deterministic opengrep SAST pass, the native mediated-tools agent loop, control-plane finalize/shaping, and egress
 - [Indexing and storage](indexing-and-storage.md)
-- [OpenCode ACP and MCP integration](opencode-acp-mcp.md)
 - [Kubernetes and deployment](kubernetes-deployment.md)
 - [Security, observability, testing, rollout](security-observability-testing-rollout.md)
 - [FAQ](faq.md)
+- [OpenCode ACP and MCP integration](opencode-acp-mcp.md) — **historical / superseded** by the native agent ([ADR-0026](adr/0026-native-review-agent.md)/[ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)); see [review-pipeline.md](review-pipeline.md) for the running system
 
 ### Run it
 - [Local setup guide](local-setup.md) — compose deps, GitHub App + webhook proxy, manual trigger, multipass + k3s
@@ -43,7 +44,8 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 4. [Control-plane roles & GitHub egress](control-plane-roles-and-github-egress.md) — the serve/dispatcher/reconciler split and how every GitHub write flows through one outbox ([ADR-0058](adr/0058-rename-poller-role-to-reconciler.md)/[ADR-0059](adr/0059-reconciler-owns-all-github-egress.md)).
 5. [Indexing and storage](indexing-and-storage.md) — reviews reuse the base index ([ADR-0025](adr/0025-review-reuses-base-index.md)) by pinning retrieval + the skip-check to the latest indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)), so a PR review doesn't re-index from scratch.
 6. [Jobs and task lifecycle](jobs-and-lifecycle.md)
-7. The review agent — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker/failover + structured logging). Prompt engineering (epic #177): [ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md) (grounding & uncertainty — empty retrieval ≠ absence), [ADR-0048](adr/0048-review-prompt-structure-and-technique.md) (prompt structure & technique for the GLM model) + the [revised-prompt draft](drafts/review-system-prompt.md), [ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md) (eval-driven prompt iteration). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
+7. [Review pipeline](review-pipeline.md) — the canonical end-to-end review-subsystem reference: two-tier selection ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)), the per-tier tool allowlist, deterministic SAST ([ADR-0061](adr/0061-sast-deterministic-finding-source.md)), the native agent loop, finalize/shaping, and egress.
+8. The review agent ADRs — [ADR-0026](adr/0026-native-review-agent.md) (native loop) + [ADR-0037](adr/0037-agent-acts-via-mediated-tools.md) (mediated tools) + [ADR-0020](adr/0020-mcp-servers-via-control-plane.md) (retrieval tools) + [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md) (LLM resilience: timeout/retry/circuit-breaker + structured logging; the fallback model was removed in [ADR-0053](adr/0053-remove-review-fallback-model.md)). Prompt engineering (epic #177): [ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md) (grounding & uncertainty — empty retrieval ≠ absence), [ADR-0048](adr/0048-review-prompt-structure-and-technique.md) (prompt structure & technique) + the [revised-prompt draft](drafts/review-system-prompt.md), [ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md) (eval-driven prompt iteration). Historical: [OpenCode ACP/MCP](opencode-acp-mcp.md).
 
 ### Platform engineer path
 1. [Architecture overview](architecture.md)
