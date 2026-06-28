@@ -85,3 +85,4 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0063](0063-cli-only-repository-approval.md) | CLI-only repository approval (device-code over the existing OIDC-gated endpoints) — retire the web approval gate | Proposed |
 | [0064](0064-observability-via-grafana-behind-caddy-oauth2.md) | Observability via Grafana behind a Caddy + oauth2 proxy — retire the bespoke web dashboards (transcript/feedback → Grafana panels) | Proposed |
 | [0065](0065-re-review-dedup-and-reconciliation.md) | Re-review must not duplicate: short-circuit unchanged commits + dedup findings at finalize + re-derive-then-reconcile (refines ADR-0040) | Proposed |
+| [0066](0066-deep-tier-external-knowledge-tools.md) | External knowledge for the deep tier: control-plane-mediated `web_search` + Context7 (query/lib not URL — keeps the Job sandboxed); deep-only via the allowlist | Proposed |
