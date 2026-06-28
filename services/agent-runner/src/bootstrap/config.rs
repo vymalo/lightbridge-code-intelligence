@@ -195,14 +195,75 @@ pub struct ReviewFile {
     /// the cheap model + short timeout.
     #[serde(default)]
     pub deep: Option<Box<ReviewFile>>,
-    /// Per-tier tool allowlist (ADR-0062): the exact set of tool names this tier offers the model, e.g.
-    /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. When set,
-    /// it is the authoritative offered set (validated against the known tools — an unknown name fails
-    /// closed). When unset, the tier uses the built-in default (the full surface for DEEP; the wind-down
-    /// write/finish/abort set for FAST). Externalizing it lets an operator tune each tier's surface from
-    /// the ConfigMap instead of relying on the hardcoded fallback.
+    /// Per-tier tool allowlist (ADR-0062): the exact set of tools this tier offers the model, e.g.
+    /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. A closed
+    /// [`ReviewTool`] enum, so an unknown name **fails at deserialize** (serde names the valid variants)
+    /// rather than being a free-form string we'd have to hand-check. When unset, the tier uses the
+    /// built-in default (the full surface for DEEP; the wind-down write/finish/abort set for FAST).
+    /// Externalizing it lets an operator tune each tier's surface from the ConfigMap.
     #[serde(default)]
-    pub tools: Option<Vec<String>>,
+    pub tools: Option<Vec<ReviewTool>>,
+}
+
+/// A tool the review agent can be configured to offer (ADR-0062). A **closed enum** so a per-tier
+/// `review.<tier>.tools` allowlist is validated when the config is parsed — an unknown name fails the
+/// config with serde listing the valid variants — instead of a free-form string the runner has to
+/// re-validate by hand. Each serde name is the EXACT tool name the agent dispatches (see
+/// [`crate::review::native::tools`]); a sync test asserts the enum can't drift from that surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ReviewTool {
+    #[serde(rename = "lightbridge_vector_semantic_search")]
+    VectorSemanticSearch,
+    #[serde(rename = "lightbridge_graph_find_symbol")]
+    GraphFindSymbol,
+    #[serde(rename = "lightbridge_graph_get_callers")]
+    GraphGetCallers,
+    #[serde(rename = "read_file")]
+    ReadFile,
+    #[serde(rename = "add_review_comment")]
+    AddReviewComment,
+    #[serde(rename = "retract_finding")]
+    RetractFinding,
+    #[serde(rename = "add_comment")]
+    AddComment,
+    #[serde(rename = "finish")]
+    Finish,
+    #[serde(rename = "report_progress")]
+    ReportProgress,
+    #[serde(rename = "abort")]
+    Abort,
+}
+
+impl ReviewTool {
+    /// Every variant, in the canonical tool order — the operator-facing list of valid `tools` values.
+    pub const ALL: [ReviewTool; 10] = [
+        ReviewTool::VectorSemanticSearch,
+        ReviewTool::GraphFindSymbol,
+        ReviewTool::GraphGetCallers,
+        ReviewTool::ReadFile,
+        ReviewTool::AddReviewComment,
+        ReviewTool::RetractFinding,
+        ReviewTool::AddComment,
+        ReviewTool::Finish,
+        ReviewTool::ReportProgress,
+        ReviewTool::Abort,
+    ];
+
+    /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewTool::VectorSemanticSearch => "lightbridge_vector_semantic_search",
+            ReviewTool::GraphFindSymbol => "lightbridge_graph_find_symbol",
+            ReviewTool::GraphGetCallers => "lightbridge_graph_get_callers",
+            ReviewTool::ReadFile => "read_file",
+            ReviewTool::AddReviewComment => "add_review_comment",
+            ReviewTool::RetractFinding => "retract_finding",
+            ReviewTool::AddComment => "add_comment",
+            ReviewTool::Finish => "finish",
+            ReviewTool::ReportProgress => "report_progress",
+            ReviewTool::Abort => "abort",
+        }
+    }
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -353,10 +414,10 @@ pub struct ReviewConfig {
     /// NOT from file config — set by `main.rs` from the task context's `tier` (`fast` → `true`); a Job
     /// runs one task, so mutating it per-run on the resolved config is sound. Defaults to `false` (deep).
     pub fast: bool,
-    /// Per-tier tool allowlist (ADR-0062): when `Some`, the authoritative set of tool names this tier
-    /// offers the model (validated at resolve — an unknown name fails closed). `None` = the built-in
-    /// default for the tier. From `review.<tier>.tools`.
-    pub tools: Option<Vec<String>>,
+    /// Per-tier tool allowlist (ADR-0062): when `Some`, the authoritative set of tools this tier offers
+    /// the model (a non-empty list of [`ReviewTool`]). `None` = the built-in default for the tier. From
+    /// `review.<tier>.tools`.
+    pub tools: Option<Vec<ReviewTool>>,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -518,10 +579,21 @@ impl ReviewConfig {
             .request_timeout_secs
             .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
-        // Per-tier tool allowlist (ADR-0062): validate every name against the known surface so a typo
-        // fails the config loudly instead of silently offering fewer tools. An empty list is a
-        // misconfiguration (a tier with no tools can't act) — reject it too.
-        let tools = validate_tools(r.tools.as_deref())?;
+        // Per-tier tool allowlist (ADR-0062): names are already validated at deserialize (the closed
+        // `ReviewTool` enum). Only an EMPTY list needs rejecting here — a tier with no tools can't act.
+        let tools = match &r.tools {
+            Some(t) if t.is_empty() => anyhow::bail!(
+                "review.tools is set but empty — a tier with no tools can't act. Remove the key (use \
+                 the built-in default) or list at least one of: {}",
+                ReviewTool::ALL
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(t) => Some(t.clone()),
+            None => None,
+        };
         let max_retries = r
             .max_retries
             .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
@@ -655,34 +727,6 @@ fn require_system_prompt(system_prompt_file: Option<&str>) -> anyhow::Result<Str
          ai-helm `config.reviewSystemPrompt` ConfigMap) or REVIEW_SYSTEM_PROMPT. There is no \
          built-in default (ADR-0037) — review fails closed without one.",
     )
-}
-
-/// Validate a per-tier tool allowlist (ADR-0062) against the known tool surface. `None` ⇒ the tier uses
-/// its built-in default (returns `Ok(None)`). `Some(list)` ⇒ every name must be a known tool and the
-/// list must be non-empty, else we fail closed (a typo'd or empty allowlist is a misconfiguration we
-/// want surfaced, not a tier that silently can't act). Names are trimmed; duplicates are harmless.
-fn validate_tools(tools: Option<&[String]>) -> anyhow::Result<Option<Vec<String>>> {
-    let Some(list) = tools else {
-        return Ok(None);
-    };
-    let known = crate::review::native::tools::known_tool_names();
-    let cleaned: Vec<String> = list.iter().map(|t| t.trim().to_string()).collect();
-    if cleaned.iter().all(|t| t.is_empty()) {
-        anyhow::bail!(
-            "review.tools is set but empty — a tier with no tools can't act. Either remove the key \
-             (use the built-in default) or list at least one of: {}",
-            known.join(", ")
-        );
-    }
-    for name in &cleaned {
-        if !known.contains(&name.as_str()) {
-            anyhow::bail!(
-                "review.tools contains an unknown tool {name:?}. Valid tools are: {}",
-                known.join(", ")
-            );
-        }
-    }
-    Ok(Some(cleaned))
 }
 
 /// Parse a boolean env var (`1`/`true`/`yes`/`on` = true; `0`/`false`/`no`/`off` = false), returning
@@ -958,10 +1002,11 @@ mod tests {
         std::fs::remove_file(&prompt).ok();
     }
 
-    // Per-tier tool allowlist (ADR-0062): a valid list resolves through to the tier config; an unknown
-    // name or an empty list fails closed (a typo'd or actionless tier is a misconfiguration).
+    // Per-tier tool allowlist (ADR-0062): a valid list resolves through to the tier config; an EMPTY
+    // list fails closed (a tier with no tools can't act). Unknown names are rejected earlier, at
+    // deserialize, by the closed `ReviewTool` enum (see `unknown_tool_name_fails_at_deserialize`).
     #[test]
-    fn resolve_tools_allowlist_validates_names() {
+    fn resolve_tools_allowlist_carries_through_and_rejects_empty() {
         let prompt = std::env::temp_dir().join(format!("lci-tools-{}.md", std::process::id()));
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let p = prompt.to_string_lossy().into_owned();
@@ -969,9 +1014,9 @@ mod tests {
         // A good allowlist resolves and is carried onto the config.
         let mut good = review_block("m", &p);
         good.tools = Some(vec![
-            "add_review_comment".to_string(),
-            "finish".to_string(),
-            "abort".to_string(),
+            ReviewTool::AddReviewComment,
+            ReviewTool::Finish,
+            ReviewTool::Abort,
         ]);
         let cfg = ReviewConfig::from_review_file(&good)
             .expect("resolves")
@@ -980,21 +1025,12 @@ mod tests {
             cfg.tools.as_deref(),
             Some(
                 [
-                    "add_review_comment".to_string(),
-                    "finish".to_string(),
-                    "abort".to_string()
+                    ReviewTool::AddReviewComment,
+                    ReviewTool::Finish,
+                    ReviewTool::Abort
                 ]
                 .as_slice()
             )
-        );
-
-        // An unknown tool name fails closed, naming the offender.
-        let mut bad = review_block("m", &p);
-        bad.tools = Some(vec!["finish".to_string(), "nope_tool".to_string()]);
-        let err = ReviewConfig::from_review_file(&bad).expect_err("unknown tool must fail");
-        assert!(
-            format!("{err:#}").contains("nope_tool"),
-            "error names the bad tool: {err:#}"
         );
 
         // An empty list is rejected — a tier with no tools can't act.
@@ -1003,6 +1039,36 @@ mod tests {
         ReviewConfig::from_review_file(&empty).expect_err("empty allowlist must fail");
 
         std::fs::remove_file(&prompt).ok();
+    }
+
+    // The closed enum rejects an unknown tool name at parse time — serde names the offending value, so a
+    // typo in `review.<tier>.tools` fails the config loudly instead of silently offering fewer tools.
+    #[test]
+    fn unknown_tool_name_fails_at_deserialize() {
+        let json = r#"{"review":{"base_url":"u","api_key":"k","model":"m",
+                        "tools":["add_review_comment","nope_tool"]}}"#;
+        let err =
+            serde_json::from_str::<FileConfig>(json).expect_err("unknown tool must fail parsing");
+        assert!(
+            err.to_string().contains("nope_tool") || err.to_string().contains("unknown variant"),
+            "serde names the bad tool: {err}"
+        );
+    }
+
+    // Drift guard: the operator-facing `ReviewTool` enum must stay in lockstep with the tool surface the
+    // agent actually dispatches (`tools::known_tool_names`). Add/remove a tool without updating the enum
+    // and an allowlist would filter against a stale set — this fails the build instead.
+    #[test]
+    fn review_tool_enum_matches_the_dispatch_surface() {
+        use std::collections::BTreeSet;
+        let enum_names: BTreeSet<&str> = ReviewTool::ALL.iter().map(|t| t.as_str()).collect();
+        let known: BTreeSet<&str> = crate::review::native::tools::known_tool_names()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            enum_names, known,
+            "ReviewTool variants must match tools::known_tool_names() exactly"
+        );
     }
 
     // `review.stream` (file config) takes precedence; when unset it falls back to the `LLM_STREAM`

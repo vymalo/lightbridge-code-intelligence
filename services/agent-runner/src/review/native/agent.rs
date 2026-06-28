@@ -120,9 +120,8 @@ fn winddown_turn(max_turns: usize) -> usize {
 /// tools, `read_file`, and `report_progress` — with no way to keep investigating, the model must wrap
 /// up. `add_review_comment` is only kept when a diff is present (mirrors the full-set gating, so a
 /// no-diff run never offers an inline tool that can't anchor).
-fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
-    tool_defs()
-        .into_iter()
+fn winddown_tool_defs(base: &[ToolDef], diff_present: bool) -> Vec<ToolDef> {
+    base.iter()
         .filter(|t| {
             let name = t.function.name.as_str();
             match name {
@@ -134,6 +133,7 @@ fn winddown_tool_defs(diff_present: bool) -> Vec<ToolDef> {
                 _ => false,
             }
         })
+        .cloned()
         .collect()
 }
 
@@ -302,16 +302,18 @@ pub async fn run_native_agent(
         defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
     }
     // Per-tier tool allowlist (ADR-0062): when the tier declares `review.tools`, that list is the
-    // authoritative offered set — restrict the base set to it (names are pre-validated at config
-    // resolve, so a non-matching name can't reach here). Still subject to the `diff_present` gate above
-    // and the wind-down narrowing below. Unset = the built-in default surface (full set for DEEP).
+    // authoritative offered set — restrict the base set to it. Still subject to the `diff_present` gate
+    // above and the wind-down narrowing below. Unset = the built-in default surface (full set for DEEP).
     if let Some(allow) = review.tools.as_ref() {
-        let set: HashSet<&str> = allow.iter().map(String::as_str).collect();
+        let set: HashSet<&str> = allow.iter().map(|t| t.as_str()).collect();
         defs.retain(|t| set.contains(t.function.name.as_str()));
     }
     // Reduced tool set for the wind-down tail (#137): write/finish/abort only, retrieval/read_file
-    // dropped so the model can no longer keep investigating once the budget is nearly spent.
-    let winddown_defs = winddown_tool_defs(diff_present);
+    // dropped so the model can no longer keep investigating once the budget is nearly spent. Derived
+    // from the (possibly allowlist-restricted) `defs`, NOT the global surface, so a per-tier
+    // `review.tools` allowlist is honoured in the wind-down too — a tool the allowlist dropped can't
+    // reappear in the tail (gemini review on #237).
+    let winddown_defs = winddown_tool_defs(&defs, diff_present);
     let params = ChatParams {
         temperature: review.temperature,
         top_p: review.top_p,
@@ -1982,7 +1984,7 @@ mod tests {
 
     #[test]
     fn winddown_tool_defs_drops_investigation_tools() {
-        let names: Vec<String> = winddown_tool_defs(true)
+        let names: Vec<String> = winddown_tool_defs(&tool_defs(), true)
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
@@ -2004,12 +2006,37 @@ mod tests {
             );
         }
         // No diff → `add_review_comment` is not even offered in the reduced set.
-        let no_diff: Vec<String> = winddown_tool_defs(false)
+        let no_diff: Vec<String> = winddown_tool_defs(&tool_defs(), false)
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
         assert!(!no_diff.iter().any(|n| n == ADD_REVIEW_COMMENT));
         assert!(no_diff.iter().any(|n| n == ADD_COMMENT));
+    }
+
+    // Wind-down is derived from the (possibly allowlist-restricted) base, NOT the global surface — so a
+    // tool a per-tier `review.tools` allowlist dropped can't reappear in the wind-down tail (gemini #237).
+    #[test]
+    fn winddown_respects_a_restricted_base_set() {
+        // A base that excludes add_comment (e.g. a deep allowlist of record/finish/abort only).
+        let base: Vec<ToolDef> = tool_defs()
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.function.name.as_str(),
+                    ADD_REVIEW_COMMENT | FINISH | ABORT
+                )
+            })
+            .collect();
+        let names: Vec<String> = winddown_tool_defs(&base, true)
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == ADD_COMMENT),
+            "a tool absent from the restricted base must not reappear in wind-down: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == FINISH), "finish stays");
     }
 
     /// A scripted chat endpoint that also records, per call, the tool names offered in the request body
@@ -2309,9 +2336,9 @@ mod tests {
         review.fast = true;
         // An explicit allowlist: record findings, finish, abort — and nothing else.
         review.tools = Some(vec![
-            ADD_REVIEW_COMMENT.to_string(),
-            FINISH.to_string(),
-            super::super::tools::ABORT.to_string(),
+            crate::bootstrap::config::ReviewTool::AddReviewComment,
+            crate::bootstrap::config::ReviewTool::Finish,
+            crate::bootstrap::config::ReviewTool::Abort,
         ]);
         let cpc = ControlPlaneClient::new(cp.uri(), "tok");
         let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");

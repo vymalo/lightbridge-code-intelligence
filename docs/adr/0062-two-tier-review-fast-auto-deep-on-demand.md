@@ -133,10 +133,30 @@ Three changes, keeping the ADR's decision intact:
    a P0/P1. The deep tier keeps the full `reviewSystemPrompt`.
 2. **Config-driven per-tier tool allowlist** (`review.<tier>.tools`). The exact tool names a tier offers are
    now declared in `ai-helm-values` (fast = `[add_review_comment, finish, abort]`) instead of relying on the
-   runner's hardcoded wind-down set. The runner validates every name against the known surface and **fails
-   the review closed** on an unknown one; the fast-tier non-offered-tool refusal guard still backstops a
-   hallucinated call. (Tools were already hidden from fast mode — this externalizes the set so an operator
-   tunes each tier from the ConfigMap.)
+   runner's hardcoded wind-down set. It is a **closed enum** (`ReviewTool`), so an unknown name **fails at
+   config parse** with serde naming the valid variants — no free-form string to hand-validate; the
+   fast-tier non-offered-tool refusal guard still backstops a hallucinated call, and the allowlist is now
+   honoured in the wind-down tail too (it derives from the restricted set). (Tools were already hidden from
+   fast mode — this externalizes the set so an operator tunes each tier from the ConfigMap.)
+
+   **The configurable tools** (the values for `review.<tier>.tools` — the operator-facing surface):
+
+   | Tool | What it does | Kind |
+   |---|---|---|
+   | `lightbridge_vector_semantic_search` | Semantic (embedding) search over the indexed repo | retrieval |
+   | `lightbridge_graph_find_symbol` | Locate a symbol in the code graph | retrieval |
+   | `lightbridge_graph_get_callers` | Find callers of a symbol in the code graph | retrieval |
+   | `read_file` | Read a file slice from the checkout | retrieval |
+   | `add_review_comment` | Record one inline finding on a diff line | write |
+   | `retract_finding` | Drop a previously recorded finding (refute pass) | write |
+   | `add_comment` | Post a non-inline reply/remark | write |
+   | `report_progress` | Log an internal progress note (not posted) | control |
+   | `finish` | End the run with a verdict + post the buffer | control |
+   | `abort` | End the run without posting (can't produce a result) | control |
+
+   A tier with no allowlist uses the built-in default: the **full** surface for DEEP; the
+   write/`finish`/`abort` wind-down set for FAST. An allowlist must be non-empty and should include
+   `finish` (and usually `abort`) so the run can converge.
 3. **Control-plane-owned fast framing.** The "🅵 quick pass — mention @handle for a deeper review" body is
    now rendered at `finalize_review` (`render_fast_body`), where the **real** App handle lives
    (`GITHUB_APP_HANDLE`), instead of by the runner (which couldn't know it). Keyed on the task `tier`, it
