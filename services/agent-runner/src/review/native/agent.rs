@@ -74,6 +74,14 @@ commands.";
 /// findings and finish.
 const WINDDOWN_MIN_TURNS: usize = 2;
 
+/// Turn ceiling for the FAST tier (ADR-0062). The fast tier's cheapness comes from **no retrieval** + a
+/// cheap model + short timeout — NOT from a single turn. One turn is too few: the model's first action is
+/// also its last, so it can't both act and then `finish` (whose summary becomes the review body) — a
+/// 1-turn fast pass posted an empty review on a PR with changes (vymalo-shop#301). A few no-retrieval
+/// turns let it record findings via `add_review_comment` and `finish`. The fast block's own `max_turns`
+/// (if set) lowers this; this caps it so an unset fast block can't inherit the generous default (40).
+const FAST_TIER_MAX_TURNS: usize = 5;
+
 /// Default cap on how many chars of a turn's `reasoning_content` we echo to the live log. Generous on
 /// purpose: a heavy reasoner (GLM-5.2) emits thousands of chars per turn and the old 600-char cap hid
 /// "how far it thinks". Override with the `REASONING_LOG_CHARS` env (`0` = unbounded).
@@ -319,9 +327,15 @@ pub async fn run_native_agent(
 
     // Operator-tunable turn budget (#137): a tight ceiling used to exhaust mid-PR with findings still
     // buffered. Generous default lives in config; a turn is ~6s on the deepseek model.
-    // Two-tier review (ADR-0062): the FAST tier (automatic PR-opened) is a SINGLE diff-only turn — no
-    // investigation loop — so a cheap signal posts on every PR; the deep `@mention` run uses the budget.
-    let max_turns = if review.fast { 1 } else { review.max_turns };
+    // Two-tier review (ADR-0062): the FAST tier (automatic PR-opened) runs WITHOUT retrieval (that's its
+    // cheapness — see the tool-set + refusal guards), bounded by a small turn ceiling so it can record
+    // findings and `finish` without an investigation loop. Not 1 turn: the model needs room to act AND
+    // finish (a 1-turn pass posted an empty review, vymalo-shop#301). Deep uses the full configured budget.
+    let max_turns = if review.fast {
+        review.max_turns.min(FAST_TIER_MAX_TURNS)
+    } else {
+        review.max_turns
+    };
     // Risk-first batching (ADR-0042): how many read-only tool calls we run concurrently per turn.
     let max_batch_size = review.max_batch_size.max(1);
     // Once the model has recorded ≥1 finding we nudge it to call `finish` so a wandering run doesn't burn
@@ -2297,6 +2311,74 @@ mod tests {
         assert!(
             !cp_hits.iter().any(|r| r.url.path().ends_with("/search")),
             "fast tier must not dispatch the retrieval call to the control plane"
+        );
+    }
+
+    // Two-tier review (ADR-0062): the fast tier is NOT a single turn — it needs room to act AND finish.
+    // The #301 regression: a 1-turn cap meant the model's first action was its last, so it never recorded
+    // an inline finding or called finish → an empty review on a PR with changes. With the small (>1) fast
+    // budget the model records a finding then finishes across turns, and the review is non-empty.
+    #[tokio::test]
+    async fn fast_tier_records_a_finding_then_finishes_across_turns() {
+        let chat = MockServer::start().await;
+        mount_chat(
+            &chat,
+            vec![
+                tool_call_reply(
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":2,"title":"Bug","priority":"P1","category":"correctness","body":"off-by-one"}"#,
+                ),
+                tool_call_reply("finish", r#"{"summary":"One P1."}"#),
+            ],
+        )
+        .await;
+        let cp = MockServer::start().await;
+        for ep in ["review/inline", "review/summary"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{ep}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&cp)
+                .await;
+        }
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        review.fast = true;
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new("http://unused", "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n a\n+let x = 1;\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        let outcome = run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("fast tier finishes");
+        assert!(
+            matches!(outcome, ReviewOutcome::Finished),
+            "fast tier records + finishes across turns; got {outcome:?}"
+        );
+        let inline = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/review/inline"))
+            .count();
+        assert_eq!(
+            inline, 1,
+            "the fast finding was recorded, not lost to a 1-turn cap"
         );
     }
 
