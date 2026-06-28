@@ -47,31 +47,31 @@ using the [MADR](https://adr.github.io/madr/) format.
 | [0025](0025-review-reuses-base-index.md) | Review reuses the base index instead of re-indexing every run (perf) | Accepted |
 | [0026](0026-native-review-agent.md) | Native Rust review agent with structured tool calls; drop OpenCode (robust output + control tools) | Accepted |
 | [0027](0027-daisyui-design-system.md) | Adopt daisyUI (dracula theme) as the component layer; supersede ADR-0015's bespoke component/token mechanism | Accepted |
-| [0028](0028-agent-job-control-sidecar.md) | Agent Job = control sidecar + single configurable main container (closed built-in pipeline) | Proposed |
-| [0029](0029-focused-review-not-generic-runner.md) | Scope boundary: a focused code-review system, not a generic step/CI runner (reject arbitrary steps, CRD/operator, workflow engines) | Proposed |
+| [0028](0028-agent-job-control-sidecar.md) | Agent Job = control sidecar + single configurable main container (closed built-in pipeline) | Superseded by ADR-0026 |
+| [0029](0029-focused-review-not-generic-runner.md) | Scope boundary: a focused code-review system, not a generic step/CI runner (reject arbitrary steps, CRD/operator, workflow engines) | Accepted |
 | [0030](0030-repo-review-config.md) | Repo-level review configuration (`.lightbridge-code-review.jsonc`) — extend understanding, not execution | Proposed |
 | [0031](0031-review-skills-commands.md) | Custom review skills/commands via the repo config (named prompts, `@mention`-invokable) | Proposed |
-| [0032](0032-review-finding-priority-and-category.md) | Review findings carry a priority (P0–P2) + category (security always red), reviewed across all dimensions | Proposed |
-| [0033](0033-inbound-command-parsing-and-run-kinds.md) | Parse the `@mention` comment body; run kinds (review / conversational `ask` / skill) + non-PR targets | Proposed (run-kind mechanism revised by ADR-0037) |
-| [0034](0034-agent-run-transcript-and-observability.md) | Persist the agent run transcript (tool calls, reasoning, tokens) and surface it in the dashboard | Proposed |
-| [0035](0035-review-feedback-signal.md) | Capture 👍/👎 on posted reviews as a quality feedback signal (persist comment IDs, store + display) | Proposed |
-| [0036](0036-auto-read-agent-instruction-files.md) | Auto-read conventional agent instruction files (AGENTS.md → CLAUDE.md → …) as review context, ranked, untrusted | Proposed |
-| [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Proposed |
-| [0038](0038-per-repo-review-model.md) | Per-repository review model selected in the admin UI from an operator allowlist (admin-owned, not the author-owned repo file) | Proposed |
-| [0039](0039-agent-llm-resilience-and-observability.md) | Agent LLM resilience & observability: generous per-request timeout (180s, eaig reality), bounded retry/backoff on transient errors, per-run circuit breaker, optional model failover, captured HTTP error body, structured per-turn logging | Proposed |
-| [0040](0040-re-review-reads-prior-findings.md) | A re-review reads the agent's own prior review as context (reconcile, don't contradict) | Proposed |
-| [0041](0041-full-diff-coverage-gate.md) | Full-diff coverage gate: bounce an early finish while changed files are untouched | Proposed |
-| [0042](0042-risk-first-review-and-parallel-batching.md) | Risk-first review strategy + parallel read-only tool batching + cumulative read budgets (Phase 1) | Proposed |
-| [0043](0043-review-finding-verification.md) | Finding verification: evidence citation on every finding + a refute pass on P0/P1 (Phase 2) | Proposed |
-| [0044](0044-feedback-memory-m1.md) | Feedback memory (M1): inject 👎-rejected findings as repo memory so the agent doesn't re-raise known false positives | Proposed |
-| [0045](0045-context-window-budget.md) | Context-window budget: converge before overflow, trim consumed tool output, never discard buffered findings | Proposed |
-| [0046](0046-observability-dashboard-deployment.md) | Observability dashboard deployment (most dashboards read Postgres, not Prometheus) | Proposed |
+| [0032](0032-review-finding-priority-and-category.md) | Review findings carry a priority (P0–P2) + category (security always red), reviewed across all dimensions | Accepted |
+| [0033](0033-inbound-command-parsing-and-run-kinds.md) | Parse the `@mention` comment body; run kinds (review / conversational `ask` / skill) + non-PR targets | Accepted |
+| [0034](0034-agent-run-transcript-and-observability.md) | Persist the agent run transcript (tool calls, reasoning, tokens) and surface it in the dashboard | Accepted |
+| [0035](0035-review-feedback-signal.md) | Capture 👍/👎 on posted reviews as a quality feedback signal (persist comment IDs, store + display) | Accepted |
+| [0036](0036-auto-read-agent-instruction-files.md) | Auto-read conventional agent instruction files (AGENTS.md → CLAUDE.md → …) as review context, ranked, untrusted | Accepted |
+| [0037](0037-agent-acts-via-mediated-tools.md) | The agent acts via mediated write tools (add_review_comment / add_comment / …); run kind is emergent, not classified up front | Accepted |
+| [0038](0038-per-repo-review-model.md) | Per-repository review model selected in the admin UI from an operator allowlist (admin-owned, not the author-owned repo file) | Proposed (scope expanded → per-identity + ACL, see #241) |
+| [0039](0039-agent-llm-resilience-and-observability.md) | Agent LLM resilience & observability: generous per-request timeout (180s, eaig reality), bounded retry/backoff on transient errors, per-run circuit breaker, optional model failover, captured HTTP error body, structured per-turn logging | Accepted |
+| [0040](0040-re-review-reads-prior-findings.md) | A re-review reads the agent's own prior review as context (reconcile, don't contradict) | Accepted |
+| [0041](0041-full-diff-coverage-gate.md) | Full-diff coverage gate: bounce an early finish while changed files are untouched | Accepted |
+| [0042](0042-risk-first-review-and-parallel-batching.md) | Risk-first review strategy + parallel read-only tool batching + cumulative read budgets (Phase 1) | Accepted |
+| [0043](0043-review-finding-verification.md) | Finding verification: evidence citation on every finding + a refute pass on P0/P1 (Phase 2) | Accepted |
+| [0044](0044-feedback-memory-m1.md) | Feedback memory (M1): inject 👎-rejected findings as repo memory so the agent doesn't re-raise known false positives | Accepted |
+| [0045](0045-context-window-budget.md) | Context-window budget: converge before overflow, trim consumed tool output, never discard buffered findings | Accepted |
+| [0046](0046-observability-dashboard-deployment.md) | Observability dashboard deployment (most dashboards read Postgres, not Prometheus) | Accepted |
 | [0047](0047-review-prompt-grounding-and-uncertainty.md) | Reviewer prompt — grounding & uncertainty calibration (empty retrieval ≠ proof of absence) | Accepted |
 | [0048](0048-review-prompt-structure-and-technique.md) | Reviewer prompt — structure & technique adapted to a GLM / OpenAI-compatible model | Accepted |
 | [0049](0049-eval-driven-reviewer-prompt-iteration.md) | Eval-driven reviewer-prompt iteration — golden cases before deploy | Accepted |
-| [0050](0050-retrieval-pins-to-latest-indexed-snapshot.md) | Reviews reuse the latest indexed snapshot (pin retrieval + skip-check to it; no per-PR re-index) | Proposed |
-| [0051](0051-per-model-config.md) | Per-model configuration blocks (primary / fallback / embeddings) | Proposed |
-| [0052](0052-index-snapshot-pruning.md) | Index snapshot pruning — keep the latest + in-flight, sweep the rest | Proposed |
+| [0050](0050-retrieval-pins-to-latest-indexed-snapshot.md) | Reviews reuse the latest indexed snapshot (pin retrieval + skip-check to it; no per-PR re-index) | Accepted |
+| [0051](0051-per-model-config.md) | Per-model configuration blocks (primary / fallback / embeddings) | Accepted |
+| [0052](0052-index-snapshot-pruning.md) | Index snapshot pruning — keep the latest + in-flight, sweep the rest | Accepted |
 | [0053](0053-remove-review-fallback-model.md) | Remove the review fallback model (single model + retry/breaker; failover dropped) | Accepted |
 | [0054](0054-review-model-and-provider-selection.md) | Stay on MiniMax-M2.7 (FP8) on DeepInfra for the review agent | Accepted |
 | [0055](0055-review-waits-for-index-readiness.md) | A review waits for index readiness (the `WaitingForIndex` gate; RFC-0002 Phase 1.4) | Accepted |

@@ -1,6 +1,6 @@
 # ADR-0033: Inbound command parsing and run kinds (conversational "ask" + non-PR targets)
 
-- **Status:** Proposed (run-kind mechanism revised by [ADR-0037](0037-agent-acts-via-mediated-tools.md) — the kind becomes emergent from the tools the agent calls, not an up-front classification; the rest carries forward)
+- **Status:** Accepted (run-kind mechanism revised by [ADR-0037](0037-agent-acts-via-mediated-tools.md) — the kind becomes emergent from the tools the agent calls, not an up-front classification; the rest carries forward)
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

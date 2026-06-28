@@ -1,6 +1,6 @@
 # ADR-0044: Feedback memory (M1) — don't re-raise findings a human rejected
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-24
 - **Deciders:** @stephane-segning
 

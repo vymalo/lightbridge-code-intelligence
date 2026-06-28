@@ -1,6 +1,6 @@
 # ADR-0042: Risk-first review strategy + parallel tool batching (Phase 1)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 

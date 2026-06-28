@@ -1,6 +1,6 @@
 # ADR-0038: Per-repository review model, selected in the admin UI from an operator allowlist
 
-- **Status:** Proposed
+- **Status:** Proposed — scope expanded to per-identity (org/user/repo) model + ACL; to be superseded by a follow-up ADR (see Amendment + epic #241).
 - **Date:** 2026-06-22
 - **Deciders:** @stephane-segning
 
@@ -93,3 +93,15 @@ stored on the repository (control-plane DB). When the dispatcher builds a review
   [ADR-0031](0031-review-skills-commands.md) (skills), [ADR-0037](0037-agent-acts-via-mediated-tools.md)
   (prompt as operator config).
 - Source of truth: this ADR + the review-agent epic (#137).
+
+## Amendment (2026-06-28) — scope expands to per-identity models + ACL
+
+Per-**repo** model selection (this ADR as written) is too narrow. The real requirement is **per-identity
+model resolution across org / user / repo**: e.g. **Stephane and Mark reviewing on the same repo should get
+different models**, each per their own configuration. That introduces **ACL** — who may set a model at which
+scope (org admin vs repo maintainer vs individual), and how the scopes resolve/override (precedence order).
+
+This ADR does not cover identity-scoped selection or the authz model, so it will be **superseded by a
+follow-up ADR** that designs: (a) the config store keyed on (org, user, repo); (b) the resolution/precedence
+order; (c) the ACL governing who sets what at which scope; (d) how the resolved model reaches the runner's
+per-task config (the control plane already owns that hand-off). Tracked in epic #241.

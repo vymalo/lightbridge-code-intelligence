@@ -1,6 +1,6 @@
 # ADR-0050: Reviews reuse the latest indexed snapshot (no per-PR re-index)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
 

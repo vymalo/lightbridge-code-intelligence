@@ -1,6 +1,6 @@
 # ADR-0051: Per-model configuration blocks (primary / fallback / embeddings)
 
-- **Status:** Accepted — runner shipped ([#195](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/195)); chart + values restructure pending (step 2/3 below)
+- **Status:** Accepted — runner shipped ([#195](https://github.com/adorsys-gis/lightbridge-code-intelligence/pull/195)); the chart + values per-tier restructure shipped via [ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md).
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
 

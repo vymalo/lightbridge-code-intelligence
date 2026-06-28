@@ -1,6 +1,6 @@
 # ADR-0046: Deploying the Grafana dashboards (and why they read Postgres)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-24
 - **Deciders:** @stephane-segning
 

@@ -1,6 +1,6 @@
 # ADR-0040: A re-review reads the agent's own prior review as context
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 
