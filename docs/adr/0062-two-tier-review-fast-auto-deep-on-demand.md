@@ -1,6 +1,6 @@
 # ADR-0062: Two-tier review — a fast auto pass on every PR, a deep review on demand
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @stephane-segning
 
@@ -55,8 +55,8 @@ We also now have a **deterministic, near-instant** finding source — SAST via o
   **fully-independent config block** (`review.fast` / `review.deep` in ai-helm-values — own model,
   gateway, prompt, reasoning budget, timeout). The runner accepts BOTH the flat `review.*` (legacy: both
   tiers share it) and the nested blocks, so it deploys before the values are restructured (transition-
-  safe, `deny_unknown_fields`). The structural fast behavior (single diff-only turn, no retrieval) is
-  still keyed on the tier, independent of which model the fast block names.
+  safe, `deny_unknown_fields`). The structural fast behavior (a short, turn-capped diff-only pass with no
+  retrieval — see the amendment) is keyed on the tier, independent of which model the fast block names.
 - **Same system prompt for both.** The persona/standards are constant; only the toolset and budget
   differ. Caveat: the prompt's "how you investigate" section assumes retrieval — the fast tier simply
   does not register those tools (the model only ever sees the tools it has), and the fast-tier prompt
@@ -164,7 +164,8 @@ Three changes, keeping the ADR's decision intact:
    appends the model's verdict when present, and posts the inline findings either way. The runner no longer
    sets a fast summary.
 
-**Deploy ordering** (the [`deny_unknown_fields`](0021-file-based-config.md) rule): ship the **runner image**
+**Deploy ordering** (the `deny_unknown_fields` rule — the runner rejects an agent.json with a field it
+doesn't know): ship the **runner image**
 carrying `review.<tier>.tools` first, then the **ai-helm** chart (renders the field + the second prompt
 file), then the **ai-helm-values** that set them. The fast prompt alone needs no new runner (it rides the
 existing `system_prompt_file`); only the `tools` field gates on the new image.
