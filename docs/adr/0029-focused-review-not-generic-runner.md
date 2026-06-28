@@ -1,6 +1,6 @@
 # ADR-0029: Scope boundary — a focused code-review system, not a generic step/CI runner
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

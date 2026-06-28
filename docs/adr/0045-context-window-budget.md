@@ -1,6 +1,6 @@
 # ADR-0045: Context-window budget — converge before overflow, never discard findings
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-24
 - **Deciders:** @stephane-segning
 

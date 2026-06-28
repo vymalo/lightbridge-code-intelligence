@@ -1,6 +1,6 @@
 # ADR-0035: Capture 👍/👎 on posted reviews as a feedback signal
 
-- **Status:** Proposed (capture mechanism **corrected** below: GitHub does not webhook reactions — poll the REST API instead)
+- **Status:** Accepted (capture mechanism **corrected** below: GitHub does not webhook reactions — poll the REST API instead)
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

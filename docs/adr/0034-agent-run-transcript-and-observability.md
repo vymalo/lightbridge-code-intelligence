@@ -1,6 +1,6 @@
 # ADR-0034: Persist the agent run transcript (tool calls, reasoning, tokens) and surface it
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

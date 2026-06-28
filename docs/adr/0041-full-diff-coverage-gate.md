@@ -1,6 +1,6 @@
 # ADR-0041: A full-diff coverage gate before wind-down
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 

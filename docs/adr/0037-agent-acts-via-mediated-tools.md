@@ -1,6 +1,6 @@
 # ADR-0037: The agent acts via mediated tools; the run kind is emergent
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 - **Deciders:** @stephane-segning
 

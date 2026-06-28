@@ -1,6 +1,6 @@
 # ADR-0043: Finding verification — evidence citation + a refute pass (Phase 2)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 

@@ -1,6 +1,6 @@
 # ADR-0036: Auto-read conventional agent instruction files (AGENTS.md, CLAUDE.md, …) as review context
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

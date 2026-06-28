@@ -1,6 +1,6 @@
 # ADR-0052: Index snapshot pruning — keep the latest + in-flight, sweep the rest
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** @stephane-segning
 

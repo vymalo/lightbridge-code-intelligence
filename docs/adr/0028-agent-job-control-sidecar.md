@@ -1,6 +1,6 @@
 # ADR-0028: Agent Job = control sidecar + single configurable main container
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0026](0026-native-review-agent.md) — the native in-process agent loop replaced the sidecar restructure (the Job has no sidecar).
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

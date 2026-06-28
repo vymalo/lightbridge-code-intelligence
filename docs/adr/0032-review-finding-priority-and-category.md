@@ -1,6 +1,6 @@
 # ADR-0032: Review findings carry a priority (P0–P2) and a category, not `error|warning|info`
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 
 ## Context and Problem Statement

@@ -1,6 +1,6 @@
 # ADR-0039: Agent LLM resilience & observability — timeout, bounded retry, circuit breaker, failover
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 
