@@ -327,31 +327,31 @@ async fn run(
                     "review posted".to_string()
                 }
                 Ok(review::ReviewOutcome::Exhausted) => {
-                    // The FAST tier (ADR-0062) is a single diff-only pass BY DESIGN — not a truncated deep
-                    // review — so a fast run that ends without `finish` is normal, not "out of budget."
-                    // Don't post the alarming "hit step budget (N turns)" notice (and `review.max_turns`
-                    // is the config field, 40 by default for the fast block — misleading vs the 1-turn
-                    // cap). Frame it as the quick pass and point to @mention for depth. The DEEP tier keeps
-                    // the honest truncation note with its real budget.
-                    let note = if review.fast {
-                        "🅵 Fast automated pass (SAST + a quick diff-scoped review). For a deeper, \
-                         repo-aware review, mention @lightbridge on this PR."
-                            .to_string()
+                    if review.fast {
+                        // FAST tier (ADR-0062): a fast run that ends without `finish` is normal, not "out
+                        // of budget." The quick-pass framing — the 🅵 banner + the "mention @handle for a
+                        // deeper review" pointer — is rendered CONTROL-PLANE-SIDE at finalize, where the
+                        // real GitHub App handle lives (the runner doesn't have it, and hardcoded the wrong
+                        // `@lightbridge` before). So DON'T set a summary here: an exhausted fast pass just
+                        // finalizes, and finalize composes the fast body from the task tier + whatever the
+                        // run buffered (inline findings still post). A finished fast run is the same — its
+                        // `finish` verdict becomes the summary the fast body wraps.
+                        client.finalize_review(config.task_id).await?;
+                        review_detail =
+                            Some("fast pass exhausted; framed control-plane-side".to_string());
+                        "review posted (fast pass)".to_string()
                     } else {
-                        format!(
+                        // DEEP tier: the honest truncation note with its real budget.
+                        let note = format!(
                             "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
                              far; some areas may be unreviewed.",
                             review.max_turns
-                        )
-                    };
-                    if let Err(error) = client.set_review_summary(config.task_id, &note).await {
-                        tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
-                    }
-                    client.finalize_review(config.task_id).await?;
-                    review_detail = Some(note);
-                    if review.fast {
-                        "review posted (fast pass)".to_string()
-                    } else {
+                        );
+                        if let Err(error) = client.set_review_summary(config.task_id, &note).await {
+                            tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
+                        }
+                        client.finalize_review(config.task_id).await?;
+                        review_detail = Some(note);
                         "review posted (truncated at step budget)".to_string()
                     }
                 }

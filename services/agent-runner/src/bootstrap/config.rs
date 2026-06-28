@@ -195,6 +195,14 @@ pub struct ReviewFile {
     /// the cheap model + short timeout.
     #[serde(default)]
     pub deep: Option<Box<ReviewFile>>,
+    /// Per-tier tool allowlist (ADR-0062): the exact set of tool names this tier offers the model, e.g.
+    /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. When set,
+    /// it is the authoritative offered set (validated against the known tools — an unknown name fails
+    /// closed). When unset, the tier uses the built-in default (the full surface for DEEP; the wind-down
+    /// write/finish/abort set for FAST). Externalizing it lets an operator tune each tier's surface from
+    /// the ConfigMap instead of relying on the hardcoded fallback.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 /// Load the agent config file if it exists. `Ok(None)` when the path is absent (use env); `Err` when
@@ -345,6 +353,10 @@ pub struct ReviewConfig {
     /// NOT from file config — set by `main.rs` from the task context's `tier` (`fast` → `true`); a Job
     /// runs one task, so mutating it per-run on the resolved config is sound. Defaults to `false` (deep).
     pub fast: bool,
+    /// Per-tier tool allowlist (ADR-0062): when `Some`, the authoritative set of tool names this tier
+    /// offers the model (validated at resolve — an unknown name fails closed). `None` = the built-in
+    /// default for the tier. From `review.<tier>.tools`.
+    pub tools: Option<Vec<String>>,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -458,6 +470,9 @@ impl ReviewConfig {
             stream: stream_from_env(),
             resilience: ResilienceConfig::from_env(),
             fast: false, // per-task; main.rs sets it from the task tier (ADR-0062)
+            // No env knob for a per-tier tool allowlist — the file path (`review.<tier>.tools`) is where
+            // an operator declares it; env config uses the built-in per-tier defaults.
+            tools: None,
         }))
     }
 
@@ -503,6 +518,10 @@ impl ReviewConfig {
             .request_timeout_secs
             .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+        // Per-tier tool allowlist (ADR-0062): validate every name against the known surface so a typo
+        // fails the config loudly instead of silently offering fewer tools. An empty list is a
+        // misconfiguration (a tier with no tools can't act) — reject it too.
+        let tools = validate_tools(r.tools.as_deref())?;
         let max_retries = r
             .max_retries
             .or_else(|| parse_env_u64("LLM_MAX_RETRIES"))
@@ -558,6 +577,7 @@ impl ReviewConfig {
                     .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
             },
             fast: false, // set by resolve_tiers / main per the task tier (ADR-0062)
+            tools,
         }))
     }
 
@@ -635,6 +655,34 @@ fn require_system_prompt(system_prompt_file: Option<&str>) -> anyhow::Result<Str
          ai-helm `config.reviewSystemPrompt` ConfigMap) or REVIEW_SYSTEM_PROMPT. There is no \
          built-in default (ADR-0037) — review fails closed without one.",
     )
+}
+
+/// Validate a per-tier tool allowlist (ADR-0062) against the known tool surface. `None` ⇒ the tier uses
+/// its built-in default (returns `Ok(None)`). `Some(list)` ⇒ every name must be a known tool and the
+/// list must be non-empty, else we fail closed (a typo'd or empty allowlist is a misconfiguration we
+/// want surfaced, not a tier that silently can't act). Names are trimmed; duplicates are harmless.
+fn validate_tools(tools: Option<&[String]>) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(list) = tools else {
+        return Ok(None);
+    };
+    let known = crate::review::native::tools::known_tool_names();
+    let cleaned: Vec<String> = list.iter().map(|t| t.trim().to_string()).collect();
+    if cleaned.iter().all(|t| t.is_empty()) {
+        anyhow::bail!(
+            "review.tools is set but empty — a tier with no tools can't act. Either remove the key \
+             (use the built-in default) or list at least one of: {}",
+            known.join(", ")
+        );
+    }
+    for name in &cleaned {
+        if !known.contains(&name.as_str()) {
+            anyhow::bail!(
+                "review.tools contains an unknown tool {name:?}. Valid tools are: {}",
+                known.join(", ")
+            );
+        }
+    }
+    Ok(Some(cleaned))
 }
 
 /// Parse a boolean env var (`1`/`true`/`yes`/`on` = true; `0`/`false`/`no`/`off` = false), returning
@@ -763,6 +811,7 @@ mod tests {
                 stream: None,
                 fast: None,
                 deep: None,
+                tools: None,
             }),
         };
         let err =
@@ -809,6 +858,7 @@ mod tests {
                 stream: None,
                 fast: None,
                 deep: None,
+                tools: None,
             }),
         };
         let cfg = ReviewConfig::resolve(Some(&file))
@@ -851,6 +901,7 @@ mod tests {
             stream: None,
             fast: None,
             deep: None,
+            tools: None,
         }
     }
 
@@ -904,6 +955,53 @@ mod tests {
             "deep falls back to the flat block"
         );
         assert!(fast.fast && !deep.fast, "flags still set per tier");
+        std::fs::remove_file(&prompt).ok();
+    }
+
+    // Per-tier tool allowlist (ADR-0062): a valid list resolves through to the tier config; an unknown
+    // name or an empty list fails closed (a typo'd or actionless tier is a misconfiguration).
+    #[test]
+    fn resolve_tools_allowlist_validates_names() {
+        let prompt = std::env::temp_dir().join(format!("lci-tools-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let p = prompt.to_string_lossy().into_owned();
+
+        // A good allowlist resolves and is carried onto the config.
+        let mut good = review_block("m", &p);
+        good.tools = Some(vec![
+            "add_review_comment".to_string(),
+            "finish".to_string(),
+            "abort".to_string(),
+        ]);
+        let cfg = ReviewConfig::from_review_file(&good)
+            .expect("resolves")
+            .expect("enabled");
+        assert_eq!(
+            cfg.tools.as_deref(),
+            Some(
+                [
+                    "add_review_comment".to_string(),
+                    "finish".to_string(),
+                    "abort".to_string()
+                ]
+                .as_slice()
+            )
+        );
+
+        // An unknown tool name fails closed, naming the offender.
+        let mut bad = review_block("m", &p);
+        bad.tools = Some(vec!["finish".to_string(), "nope_tool".to_string()]);
+        let err = ReviewConfig::from_review_file(&bad).expect_err("unknown tool must fail");
+        assert!(
+            format!("{err:#}").contains("nope_tool"),
+            "error names the bad tool: {err:#}"
+        );
+
+        // An empty list is rejected — a tier with no tools can't act.
+        let mut empty = review_block("m", &p);
+        empty.tools = Some(vec![]);
+        ReviewConfig::from_review_file(&empty).expect_err("empty allowlist must fail");
+
         std::fs::remove_file(&prompt).ok();
     }
 

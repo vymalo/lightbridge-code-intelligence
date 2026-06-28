@@ -879,14 +879,15 @@ pub async fn finalize_review(
                 resources: Vec::new(),
             })
             .collect();
-        // A present-but-blank summary falls back to the default, so the verdict is never empty.
-        let summary = pending
+        // The model's `finish` verdict, if it produced one. `None` = an exhausted/clean pass (no
+        // verdict) — the FAST body then shows its banner alone, while the DEEP body / stored copy fall
+        // back to the default so the verdict is never empty.
+        let real_summary = pending
             .summary
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_CLEAN_SUMMARY)
-            .to_string();
+            .filter(|s| !s.is_empty());
+        let summary = real_summary.unwrap_or(DEFAULT_CLEAN_SUMMARY).to_string();
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
@@ -917,8 +918,21 @@ pub async fn finalize_review(
         let findings_json = serde_json::to_value(&findings).unwrap_or_default();
 
         let validated = crate::review::validate(findings, &commentable);
-        let body =
-            crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope);
+        // FAST tier (ADR-0062): mark the body as a quick pass — a blockquote banner that names what the
+        // pass is and points to the deep review via the App's REAL handle (`state.app_handle`, which only
+        // exists control-plane-side; the runner hardcoded the wrong `@lightbridge`). The stored `summary`
+        // (re-injected as prior-review context on a later run) stays the verdict/default; only the posted
+        // body differs. DEEP keeps the full authoritative review body.
+        let body = if context.tier == "fast" {
+            crate::review::render_fast_body(
+                state.app_handle.as_str(),
+                real_summary,
+                &validated.deferred,
+                &validated.out_of_scope,
+            )
+        } else {
+            crate::review::render_body(&summary, &validated.deferred, &validated.out_of_scope)
+        };
         let comments: Vec<crate::outbox::ReviewCommentPayload> = validated
             .inline
             .iter()

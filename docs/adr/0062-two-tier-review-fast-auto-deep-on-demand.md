@@ -110,3 +110,41 @@ We also now have a **deterministic, near-instant** finding source — SAST via o
 - [ADR-0056](0056-control-plane-owns-the-posted-output.md) — single-channel PR output the ack must not break.
 - [ADR-0060](0060-capture-model-reasoning-and-glm-5-2-latency-finding.md) — the cost diagnosis (effort/turns/retrieval, not model/gateway).
 - [ADR-0061](0061-sast-deterministic-finding-source.md) — SAST/opengrep, the fast tier's backbone.
+
+## Amendment (2026-06-28) — fast-tier hardening: dedicated prompt, config-driven tools, real-handle framing
+
+Live dogfood of the first fast-tier rollout (vymalo-shop #303/#304/#305) worked end-to-end — findings
+posted inline, no retrieval leaked — but surfaced three rough edges, all rooted in the fast tier **reusing
+the deep system prompt**. The deep prompt tells the model to *investigate first* (search / graph /
+`read_file`), so on a tier where those tools don't exist, M2.7 opened each run by **calling tools that get
+refused** (turns 0–2 on #304), only then reviewed the diff, and so **ran out of its turn budget before
+`finish`** — landing in the `Exhausted` backstop every time instead of producing a clean verdict. Two
+consequences followed: (a) the exhausted-pass note was a generic banner that **didn't acknowledge the
+findings** the run had actually posted, and it hardcoded the wrong **`@lightbridge`** handle (the real App
+is `lightbridge-assistant`); (b) without repo access the model **over-rated unverifiable concerns as P0/P1**
+(a client-side Flutter route "auth" P1 on #303 that a client route cannot actually gate).
+
+Three changes, keeping the ADR's decision intact:
+
+1. **Dedicated fast system prompt** (`config.reviewSystemPromptFast` → `review-system-fast.md`, pointed at
+   by `review.fast.system_prompt_file`). It never mentions retrieval/`read_file`, tells the model to review
+   the diff directly, record findings, and **always `finish` with a verdict** (even if clean), and — the
+   calibration fix — to **raise only what the diff proves**, phrasing the unverifiable as a P2 question, not
+   a P0/P1. The deep tier keeps the full `reviewSystemPrompt`.
+2. **Config-driven per-tier tool allowlist** (`review.<tier>.tools`). The exact tool names a tier offers are
+   now declared in `ai-helm-values` (fast = `[add_review_comment, finish, abort]`) instead of relying on the
+   runner's hardcoded wind-down set. The runner validates every name against the known surface and **fails
+   the review closed** on an unknown one; the fast-tier non-offered-tool refusal guard still backstops a
+   hallucinated call. (Tools were already hidden from fast mode — this externalizes the set so an operator
+   tunes each tier from the ConfigMap.)
+3. **Control-plane-owned fast framing.** The "🅵 quick pass — mention @handle for a deeper review" body is
+   now rendered at `finalize_review` (`render_fast_body`), where the **real** App handle lives
+   (`GITHUB_APP_HANDLE`), instead of by the runner (which couldn't know it). Keyed on the task `tier`, it
+   marks **every** fast review as a quick pass (a blockquote banner distinct from the deep review's heading),
+   appends the model's verdict when present, and posts the inline findings either way. The runner no longer
+   sets a fast summary.
+
+**Deploy ordering** (the [`deny_unknown_fields`](0021-file-based-config.md) rule): ship the **runner image**
+carrying `review.<tier>.tools` first, then the **ai-helm** chart (renders the field + the second prompt
+file), then the **ai-helm-values** that set them. The fast prompt alone needs no new runner (it rides the
+existing `system_prompt_file`); only the `tools` field gates on the new image.
