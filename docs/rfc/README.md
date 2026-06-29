@@ -50,3 +50,4 @@ Copy [the template](0000-rfc-template.md) to `NNNN-kebab-title.md`, numbered seq
 | [0000](0000-rfc-template.md) | RFC template | — |
 | [0001](0001-horizontally-scalable-control-plane.md) | Horizontally scalable control plane (stateless roles + Postgres-backed queue) | Proposed |
 | [0002](0002-incremental-layered-indexing.md) | Incremental, layered indexing (base branch + per-PR overlays) | Proposed |
+| [0003](0003-skip-auto-review-on-bot-authored-prs.md) | Skip the automatic review on bot-authored PRs | Proposed |
