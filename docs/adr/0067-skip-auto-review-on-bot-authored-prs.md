@@ -49,10 +49,13 @@ info log mirroring the approval-gate skip, and increments a `review_skipped_bot_
 - The `push`/re-index path and the approval gate are unchanged.
 
 ### Config
-A new `review.skipBotAuthoredPrs` knob (`ReviewSection` in `services/control-plane/src/config.rs`),
+A new `review.skip_bot_authored_prs` knob (`ReviewSection` in `services/control-plane/src/config.rs`),
 `Option<bool>` with a `skip_bot_authored_prs(&self) -> bool` accessor **defaulting to `true`** —
 mirroring the existing `reactions` / `reactions_enabled()` idiom. `false` restores today's behaviour
-(auto-review everything) with no other code-path difference.
+(auto-review everything) with no other code-path difference. The JSON key is **snake_case**
+(`skip_bot_authored_prs`, matching `reactions` / `label_reviewed`): `ReviewSection` derives `Deserialize`
+with `deny_unknown_fields` and **no `rename_all`**, so a camelCase key would be rejected at config parse
+rather than silently bind.
 
 ## Consequences
 

@@ -42,7 +42,7 @@ A new review knob controls this:
 // control-plane.json (mounted from the Helm ConfigMap)
 {
   "review": {
-    "skipBotAuthoredPrs": true   // default: true
+    "skip_bot_authored_prs": true   // default: true (snake_case — ReviewSection has no rename_all)
   }
 }
 ```
@@ -66,7 +66,7 @@ log line in the same spirit as the existing approval-gate skip:
 pull_request opened by bot 'dependabot[bot]'; skipping automatic review (skip_bot_authored_prs=true)
 ```
 
-Setting `skipBotAuthoredPrs: false` restores today's behaviour (auto-review everything). The default
+Setting `skip_bot_authored_prs: false` restores today's behaviour (auto-review everything). The default
 is `true` because that is the desired posture for this repo and the common case across installations.
 
 ## Reference-level explanation
@@ -167,13 +167,13 @@ approval-gate skip). The existing `task_created` counter already covers the "rev
 - **Forks / first-time contributors.** Unaffected — those are human `User` accounts; only `Bot`
   accounts are gated.
 - **Re-open / synchronize.** Already no-ops today (re-review is `@mention`-only), so nothing changes.
-- **Disabling the feature.** `skipBotAuthoredPrs: false` reverts to current behaviour with no code
+- **Disabling the feature.** `skip_bot_authored_prs: false` reverts to current behaviour with no code
   path differences beyond the single guard.
 
 ### Migration / rollout
 
 Pure additive config; no DB migration. Ships dark-compatible: an installation with no
-`review.skipBotAuthoredPrs` key gets the new default (`true`). If we want to stage it, land the code
+`review.skip_bot_authored_prs` key gets the new default (`true`). If we want to stage it, land the code
 with the default `false` first, flip to `true` in `ai-helm-values` after one dogfood cycle — but the
 recommendation is to default `true` from the start, since that is the intended posture.
 
@@ -213,7 +213,7 @@ recommendation is to default `true` from the start, since that is the intended p
   This would recover supply-chain coverage on dependency bumps at near-zero cost. Likely a fast
   follow-up rather than v1.
 - **Per-bot allowlist.** If some installations want specific bots auto-reviewed (or specific bots
-  *always* skipped regardless of the global flag), extend the knob to `skipBotAuthoredPrs: ["renovate[bot]", …]`
+  *always* skipped regardless of the global flag), extend the knob to `skip_bot_authored_prs: ["renovate[bot]", …]`
   or a `{ default, allow, deny }` shape. Deferred until there's a concrete need.
 - **Should the default be `true` or `false` on first ship?** Proposed `true` (skip) to match the
   intended posture; open to landing `false` and flipping in `ai-helm-values` after one dogfood cycle.
