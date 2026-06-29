@@ -1,9 +1,9 @@
 # RFC-0003: Skip the automatic review on bot-authored PRs
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Author(s):** Stephane Segning Lambou
 - **Date:** 2026-06-29
-- **Resulting ADRs:** (filled in once accepted)
+- **Resulting ADRs:** [ADR-0067](../adr/0067-skip-auto-review-on-bot-authored-prs.md)
 
 ## Summary
 
