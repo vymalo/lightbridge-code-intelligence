@@ -66,6 +66,17 @@ pub fn review_skipped_bot_author() {
     counter!("lci_review_skipped_bot_author_total").increment(1);
 }
 
+/// A call through an external-knowledge MCP tool (ADR-0066): `tool` is the configured MCP server's
+/// name (e.g. `brave-search`, `context7`) — bounded cardinality (one label value per configured
+/// server), not the individual downstream tool. `outcome` is `ok`, `error` (upstream/network
+/// failure), `unknown_tool` (no configured server matches the requested name), or `invalid_request`
+/// (a malformed `mcp__<server>__<tool>` name). `tool` is dynamic (config-driven, not a compile-time
+/// set of providers) so it's owned here; `outcome` stays `&'static str` (callers pass literals).
+pub fn knowledge_tool_call(tool: &str, outcome: &'static str) {
+    let tool = tool.to_string();
+    counter!("lci_knowledge_tool_calls_total", "tool" => tool, "outcome" => outcome).increment(1);
+}
+
 /// A dispatch attempt outcome: `launched` or `failed`. Callers pass string literals so this is
 /// zero-allocation.
 pub fn dispatch_outcome(outcome: &'static str) {

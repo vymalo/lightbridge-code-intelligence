@@ -597,6 +597,138 @@ pub async fn graph_query(
     }
 }
 
+// ── ADR-0066 external-knowledge MCP tools ───────────────────────────────────────────────────────
+// A single dynamically-backed mediated tool (`mcp_tools`) — one endpoint discovers whatever tools
+// the configured MCP servers (`knowledge_tools.mcp_servers`) currently expose, one endpoint
+// dispatches a call to whichever server owns it. Adding a new server (brave-search, context7, or
+// anything else) is a config change, not a code change: no per-provider Rust handler, no hardcoded
+// tool schema. Available to any tier — gating is purely the normal per-tier `review.tools`
+// allowlist, the same mechanism every other mediated tool uses, not a tier check here. The model
+// supplies a discovered tool name + arguments, never a URL, so there is no SSRF primitive.
+
+/// How long the control plane waits on an upstream MCP server before giving up.
+const KNOWLEDGE_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Every discovered tool's exposed name carries this prefix: `mcp__<server>__<tool>`. Namespaces
+/// names across servers (so two servers can't collide) and lets `call_knowledge_tool` route a call
+/// back to the right server without a separate lookup table.
+const MCP_TOOL_PREFIX: &str = "mcp__";
+
+/// One discovered tool, as returned to the agent-runner to fold into its live tool schema.
+#[derive(Debug, Serialize)]
+pub struct DiscoveredTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// `GET /internal/tasks/{id}/knowledge/tools` — discover every tool every configured MCP server
+/// currently exposes. Best-effort per server: one unreachable/misbehaving server is logged and
+/// skipped rather than failing the whole discovery (a partial tool set beats none). Not tier-gated
+/// (discovery alone performs no provider-billed action); the runner's per-tier allowlist decides
+/// whether to call this at all.
+pub async fn list_knowledge_tools(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Concurrent, not sequential: N configured servers shouldn't cost up to N × the per-server
+    // timeout just to discover tools before the review has even started.
+    let per_server = state
+        .knowledge_tools
+        .mcp_servers
+        .iter()
+        .map(|server| async move {
+            let result = crate::mcp_client::list_tools(&server.url, KNOWLEDGE_TOOL_TIMEOUT).await;
+            (server, result)
+        });
+    let results = futures::future::join_all(per_server).await;
+
+    let mut discovered = Vec::new();
+    for (server, result) in results {
+        match result {
+            Ok(tools) => discovered.extend(tools.into_iter().map(|t| DiscoveredTool {
+                name: format!("{MCP_TOOL_PREFIX}{}__{}", server.name, t.name),
+                description: t.description,
+                input_schema: t.input_schema,
+            })),
+            Err(error) => {
+                tracing::warn!(%error, task_id = %id, server = %server.name, "MCP tool discovery failed; skipping this server");
+            }
+        }
+    }
+    Json(discovered).into_response()
+}
+
+/// Body for `POST /internal/tasks/{id}/knowledge/call`.
+#[derive(Debug, Deserialize)]
+pub struct KnowledgeToolCallRequest {
+    /// The prefixed name from `list_knowledge_tools` (`mcp__<server>__<tool>`).
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// `POST /internal/tasks/{id}/knowledge/call` — dispatch a previously-discovered tool call to its
+/// owning MCP server, keyed by the `mcp__<server>__<tool>` prefix.
+pub async fn call_knowledge_tool(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<KnowledgeToolCallRequest>,
+) -> Response {
+    let Some((server_name, tool_name)) = parse_knowledge_tool_name(&req.tool) else {
+        crate::http::metrics::knowledge_tool_call("unknown", "invalid_request");
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("not a valid mcp__<server>__<tool> name: {:?}", req.tool),
+        )
+            .into_response();
+    };
+    let Some(server) = state
+        .knowledge_tools
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == server_name)
+    else {
+        crate::http::metrics::knowledge_tool_call(server_name, "unknown_tool");
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no configured MCP server named {server_name:?}"),
+        )
+            .into_response();
+    };
+    match crate::mcp_client::call_tool(
+        &server.url,
+        tool_name,
+        req.arguments,
+        KNOWLEDGE_TOOL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(text) => {
+            crate::http::metrics::knowledge_tool_call(&server.name, "ok");
+            Json(serde_json::json!({ "text": text })).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, tool = %req.tool, "MCP tool call failed");
+            crate::http::metrics::knowledge_tool_call(&server.name, "error");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("{server_name} upstream error"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Split `mcp__<server>__<tool>` into `(server, tool)`. `server`/`tool` may not themselves contain
+/// `__` (the config comment on [`crate::config::McpServerConfig::name`] asks for that), so the
+/// first `__` after the prefix is the unambiguous split point.
+fn parse_knowledge_tool_name(name: &str) -> Option<(&str, &str)> {
+    name.strip_prefix(MCP_TOOL_PREFIX)?.split_once("__")
+}
+
 // ── ADR-0037 mediated write actions ─────────────────────────────────────────────────────────────
 // The native agent calls these *during* its run; the control plane accumulates them and posts nothing
 // until `finalize_review` flushes the buffer as one grouped review (+ a single consolidated reply).
@@ -1131,5 +1263,27 @@ mod tests {
         // A non-PR (issue) target is never a PR review → the reply is the content, kept.
         assert!(!posts_pr_review("issue", true, true, false));
         assert!(!posts_pr_review("issue", false, false, false));
+    }
+
+    #[test]
+    fn parse_knowledge_tool_name_splits_server_and_tool() {
+        assert_eq!(
+            parse_knowledge_tool_name("mcp__brave-search__brave_web_search"),
+            Some(("brave-search", "brave_web_search"))
+        );
+        // The tool half itself may contain `__` — split_once takes only the FIRST `__` after the
+        // prefix, so everything past it (including further `__`) belongs to the tool name.
+        assert_eq!(
+            parse_knowledge_tool_name("mcp__context7__resolve-library-id"),
+            Some(("context7", "resolve-library-id"))
+        );
+    }
+
+    #[test]
+    fn parse_knowledge_tool_name_rejects_malformed_names() {
+        assert_eq!(parse_knowledge_tool_name("brave_web_search"), None); // no mcp__ prefix
+        assert_eq!(parse_knowledge_tool_name("mcp__no_double_underscore"), None);
+        assert_eq!(parse_knowledge_tool_name("mcp__"), None);
+        assert_eq!(parse_knowledge_tool_name(""), None);
     }
 }

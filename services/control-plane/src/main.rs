@@ -33,6 +33,7 @@ mod queue;
 mod config;
 mod db;
 mod jwt;
+mod mcp_client;
 mod outbox;
 mod review;
 mod types;
@@ -88,6 +89,10 @@ pub struct AppState {
     /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
     /// (else defaults). Held here so the webhook + internal handlers can react/label.
     pub review: Arc<config::ReviewSection>,
+    /// Configured external-knowledge MCP servers (ADR-0066), dynamically discovered + called as the
+    /// `mcp_tools` mediated tool. Empty by default — no servers means no tools discovered, a safe
+    /// degrade. Available to any tier; gated purely by the runner's per-tier `review.tools` allowlist.
+    pub knowledge_tools: Arc<config::KnowledgeToolsSection>,
     /// The GitHub App's handle (e.g. `lightbridge-assistant`), from `GITHUB_APP_HANDLE`. A PR comment
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
@@ -113,6 +118,10 @@ impl AppState {
         let embeddings = file_config
             .as_ref()
             .map(|f| f.embeddings.clone())
+            .unwrap_or_default();
+        let knowledge_tools = file_config
+            .as_ref()
+            .map(|f| f.knowledge_tools.clone())
             .unwrap_or_default();
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
@@ -163,6 +172,7 @@ impl AppState {
             neo4j,
             metrics,
             review: Arc::new(review),
+            knowledge_tools: Arc::new(knowledge_tools),
             app_handle: Arc::new(
                 std::env::var("GITHUB_APP_HANDLE")
                     .ok()
@@ -255,6 +265,17 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
+        )
+        // External-knowledge MCP tools (ADR-0066): dynamically discover + call whatever's in
+        // `knowledge_tools.mcp_servers` — no per-provider route. Available to any tier; gated purely
+        // by the runner's per-tier `review.tools` allowlist, like every other mediated tool.
+        .route(
+            "/internal/tasks/{id}/knowledge/tools",
+            get(internal::list_knowledge_tools),
+        )
+        .route(
+            "/internal/tasks/{id}/knowledge/call",
+            post(internal::call_knowledge_tool),
         )
         // The agent run transcript (ADR-0034): the runner submits it at run end.
         .route(

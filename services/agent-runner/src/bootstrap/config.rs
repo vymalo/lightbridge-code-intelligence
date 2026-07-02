@@ -232,11 +232,19 @@ pub enum ReviewTool {
     ReportProgress,
     #[serde(rename = "abort")]
     Abort,
+    /// External-knowledge MCP tools (ADR-0066), mediated by the control plane: whatever the
+    /// configured MCP servers (e.g. brave-search, context7) currently expose, discovered
+    /// dynamically at run start — never a hardcoded per-provider tool. A single sentinel rather
+    /// than one variant per downstream tool, since the actual set isn't known at compile time.
+    /// Available to any tier; unlike the rest of this enum, it's not a single dispatchable tool but
+    /// a whole discoverable set gated the same way as everything else — via this allowlist.
+    #[serde(rename = "mcp_tools")]
+    McpTools,
 }
 
 impl ReviewTool {
     /// Every variant, in the canonical tool order — the operator-facing list of valid `tools` values.
-    pub const ALL: [ReviewTool; 10] = [
+    pub const ALL: [ReviewTool; 11] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
@@ -247,6 +255,7 @@ impl ReviewTool {
         ReviewTool::Finish,
         ReviewTool::ReportProgress,
         ReviewTool::Abort,
+        ReviewTool::McpTools,
     ];
 
     /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
@@ -262,6 +271,7 @@ impl ReviewTool {
             ReviewTool::Finish => "finish",
             ReviewTool::ReportProgress => "report_progress",
             ReviewTool::Abort => "abort",
+            ReviewTool::McpTools => "mcp_tools",
         }
     }
 }
