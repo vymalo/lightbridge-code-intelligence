@@ -735,9 +735,15 @@ fn parse_knowledge_tool_name(name: &str) -> Option<(&str, &str)> {
 // Per-call diff validation is done runner-side (it holds the diff); the flush re-validates here
 // authoritatively via `crate::review::validate`.
 
-/// Default summary for a run that produced no findings (and the empty-run backstop), so an
-/// `@mention`-triggered review is never a silent hang (ADR-0037).
+/// Default summary for a run that produced no findings (and the empty-run backstop). Persisted to the
+/// `reviews` row so prior-review context + the console always have a verdict, even when ADR-0068
+/// suppresses the GitHub post (the 👍 reaction is the whole GitHub response).
 const DEFAULT_CLEAN_SUMMARY: &str = "No issues found — the change looks good.";
+
+/// GitHub reaction contents for the ADR-0068 verdict: 👍 (`+1`) on a clean pass, 👎 (`-1`) when findings
+/// were posted. (GitHub's reaction set has no ❌; 👎 is the agreed stand-in for "changes requested".)
+const REACTION_CLEAN: &str = "+1";
+const REACTION_FINDINGS: &str = "-1";
 
 /// Body for `POST /internal/tasks/{id}/review/inline` (`add_review_comment`).
 #[derive(Debug, Deserialize)]
@@ -894,12 +900,22 @@ fn posts_pr_review(
     target_type == "pull_request" && (has_inline || has_summary || buffer_empty)
 }
 
+/// The ADR-0068 verdict reaction content for a completed review: 👎 (`-1`) when findings were posted, 👍
+/// (`+1`) on a clean pass. Pure, so the mapping is unit-tested independently of the DB/outbox.
+fn verdict_reaction_content(has_findings: bool) -> &'static str {
+    if has_findings {
+        REACTION_FINDINGS
+    } else {
+        REACTION_CLEAN
+    }
+}
+
 /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer (ADR-0037). Posts the
 /// inline findings + summary as **one grouped PR review** (re-validated against the diff here, the
 /// authority), consolidates buffered replies into **one** thread comment, records the emergent run
-/// kind, and clears the buffer. An empty run still posts a default "no issues found" review so an
-/// `@mention` is never silent. The buffer is cleared at the end regardless, so a finished run can't
-/// re-post on a stray retry.
+/// kind, and clears the buffer. A **clean pass** (zero findings) posts NO review — the 👍 verdict
+/// reaction is the whole GitHub response (ADR-0068) — but still persists the review row. The buffer is
+/// cleared at the end regardless, so a finished run can't re-post on a stray retry.
 pub async fn finalize_review(
     _auth: RunnerAuth,
     State(state): State<AppState>,
@@ -990,9 +1006,10 @@ pub async fn finalize_review(
         }
     }
 
-    // 2) Inline findings + summary → ONE review intent (PR targets only). Always enqueued when a review
-    // is due — including the empty-buffer backstop (a default clean review) and a summary-only verdict —
-    // so an @mention review never goes silent. (`has_inline` / `post_pr_review` computed above.)
+    // 2) Inline findings + summary → ONE review intent (PR targets only), PLUS the verdict reaction.
+    // ADR-0068: only a run with findings enqueues a review; a clean pass suppresses the post (👍 only) but
+    // still persists the review row and reacts. `post_pr_review` (computed above) still gates the whole
+    // block — a pure @mention question posts neither. (`has_inline` computed above.)
     let mut queued_review = false;
     if post_pr_review {
         let pr = context.target_id;
@@ -1079,32 +1096,80 @@ pub async fn finalize_review(
             validated.deferred.len() as i32,
             validated.out_of_scope.len() as i32,
         );
-        let payload = crate::outbox::ReviewPayload {
-            pr,
-            body,
-            summary,
-            comments,
-            inline_n,
-            deferred_n,
-            out_of_scope_n,
-            findings_json,
-            label_findings,
-            label_error,
-        };
+        // ADR-0068: a clean pass (no inline, deferred, OR out-of-scope findings) posts NO review — the 👍
+        // reaction is the whole GitHub response. The review row is still persisted (below) so prior-review
+        // context + the console keep the verdict; only the GitHub post is suppressed. This supersedes
+        // ADR-0056's "never silent" for the clean case, both tiers (fast auto + deep @mention).
+        let has_findings = inline_n + deferred_n + out_of_scope_n > 0;
 
-        match crate::outbox::enqueue_review(pool, &t, &payload).await {
-            Ok(_) => {
-                queued_review = true;
-                tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review queued for egress");
-                // Drop the inline + summary rows now the intent is durably queued, so a re-finalize
-                // doesn't re-shape (the dedup_key would no-op the re-enqueue anyway).
-                let _ = crate::db::clear_pending_action(pool, id, "inline").await;
-                let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+        if has_findings {
+            let payload = crate::outbox::ReviewPayload {
+                pr,
+                body,
+                summary,
+                comments,
+                inline_n,
+                deferred_n,
+                out_of_scope_n,
+                findings_json,
+                label_findings,
+                label_error,
+            };
+            match crate::outbox::enqueue_review(pool, &t, &payload).await {
+                Ok(_) => {
+                    queued_review = true;
+                    tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review queued for egress");
+                    // Drop the inline + summary rows now the intent is durably queued, so a re-finalize
+                    // doesn't re-shape (the dedup_key would no-op the re-enqueue anyway).
+                    let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+                    let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "enqueueing review failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue review")
+                        .into_response();
+                }
             }
-            Err(error) => {
-                tracing::error!(%error, task_id = %id, "enqueueing review failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue review")
-                    .into_response();
+        } else {
+            // Silent clean pass (ADR-0068): no review post, but the review row MUST still be persisted (it
+            // feeds prior-review context + observability). The reconciler normally does this off the
+            // `review` intent; with no intent, persist it here directly (no `review_url`/`github_review_id`
+            // — nothing was posted).
+            if let Err(error) = crate::db::upsert_review(
+                pool,
+                id,
+                &summary,
+                &body,
+                0,
+                0,
+                0,
+                &findings_json,
+                None,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id = %id, "persisting silent clean review copy failed (non-fatal)");
+            }
+            tracing::info!(task_id = %id, "clean pass: no findings → suppressing review post, 👍 only (ADR-0068)");
+            let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+            let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+        }
+
+        // ADR-0068 verdict reaction on the trigger: 👎 when findings were posted, 👍 on a clean pass.
+        // Targets the @mention comment when the task was mention-triggered, else the PR body.
+        if state.review.reactions_enabled() {
+            let content = verdict_reaction_content(has_findings);
+            if let Err(error) = crate::outbox::enqueue_reaction(
+                pool,
+                &t,
+                context.target_id,
+                content,
+                context.trigger_comment_id,
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
             }
         }
     }
@@ -1162,7 +1227,8 @@ pub async fn set_status(
             }
             // A terminal failure gets 😕 + a fallback "review failed, retry" comment on the PR when the
             // review never finalized (ADR-0056), so the author isn't left in silence. Success is
-            // acknowledged by the review post (🎉) in `finalize_review`, so we don't double-react here.
+            // acknowledged by the verdict reaction (👍/👎, ADR-0068) in `finalize_review`, so we don't
+            // double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {
                 let state = state.clone();
                 let pool = pool.clone();
@@ -1224,8 +1290,15 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
         repo: &context.name,
     };
     if state.review.reactions_enabled() {
-        if let Err(error) =
-            crate::outbox::enqueue_reaction(pool, &t, context.target_id, "confused").await
+        // ADR-0068: retarget 😕 to the @mention comment when the task was mention-triggered.
+        if let Err(error) = crate::outbox::enqueue_reaction(
+            pool,
+            &t,
+            context.target_id,
+            "confused",
+            context.trigger_comment_id,
+        )
+        .await
         {
             tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
         }
@@ -1263,6 +1336,14 @@ mod tests {
         // A non-PR (issue) target is never a PR review → the reply is the content, kept.
         assert!(!posts_pr_review("issue", true, true, false));
         assert!(!posts_pr_review("issue", false, false, false));
+    }
+
+    // ADR-0068 verdict reaction: 👍 (+1) on a clean pass, 👎 (-1) when findings were posted. (❌ has no
+    // GitHub reaction; 👎 is the agreed stand-in.)
+    #[test]
+    fn verdict_reaction_is_thumbs_up_when_clean_thumbs_down_on_findings() {
+        assert_eq!(verdict_reaction_content(false), "+1");
+        assert_eq!(verdict_reaction_content(true), "-1");
     }
 
     #[test]

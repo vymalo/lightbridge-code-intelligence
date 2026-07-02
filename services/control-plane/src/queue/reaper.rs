@@ -316,6 +316,7 @@ mod tests {
                 head_sha: Some("head1".to_string()),
                 run_epoch: 0,
                 tier: "deep".to_string(),
+                trigger_comment_id: None,
             },
         )
         .await
