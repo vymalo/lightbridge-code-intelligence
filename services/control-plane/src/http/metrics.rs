@@ -66,6 +66,14 @@ pub fn review_skipped_bot_author() {
     counter!("lci_review_skipped_bot_author_total").increment(1);
 }
 
+/// A deep-tier external-knowledge tool call (ADR-0066): `tool` is `web_search` or
+/// `context7_lookup`; `outcome` is `ok`, `error` (upstream/network failure), `rejected` (fast-tier
+/// task, server-side gate), or `not_configured` (the tool's MCP URL is unset). Both are `&'static
+/// str` (callers pass literals), so this is zero-allocation.
+pub fn knowledge_tool_call(tool: &'static str, outcome: &'static str) {
+    counter!("lci_knowledge_tool_calls_total", "tool" => tool, "outcome" => outcome).increment(1);
+}
+
 /// A dispatch attempt outcome: `launched` or `failed`. Callers pass string literals so this is
 /// zero-allocation.
 pub fn dispatch_outcome(outcome: &'static str) {

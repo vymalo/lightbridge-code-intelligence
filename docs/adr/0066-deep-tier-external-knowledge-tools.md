@@ -1,7 +1,7 @@
 # ADR-0066: External knowledge tools for the deep tier — web search + Context7, mediated by the control plane
 
-- **Status:** Proposed
-- **Date:** 2026-06-28
+- **Status:** Accepted
+- **Date:** 2026-06-28 (mechanism finalized 2026-07-02)
 - **Deciders:** @stephane-segning
 
 ## Context and Problem Statement
@@ -43,6 +43,22 @@ outbound is to the internal gateway for embeddings). Letting the Job fetch model
   *query*, `context7_lookup` takes a *library/topic* — never a raw URL) dispatch to a control-plane
   internal endpoint; the **control plane** performs the egress (provider allowlist, size caps, no
   internal-network access) and returns results the agent treats as untrusted. Keys live control-plane-side.
+  - **Concrete mechanism (finalized 2026-07-02, ticket #255):** the "provider allowlist" is not a
+    bespoke per-provider REST client with control-plane-held API keys — it's the control plane acting
+    as an **MCP client** ([`rmcp`](https://crates.io/crates/rmcp), streamable-HTTP) against
+    **already-deployed, in-cluster** MCP servers: `brave-search` and `context7`
+    (`converse-mcp` namespace, `ai-helm` `charts/mcps`). Those servers already hold their own upstream
+    provider credentials (Brave/Context7 API keys, via their own `ExternalSecret`s) — the control
+    plane needs **no new secrets**, only their in-cluster Service URL
+    (`http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`,
+    `http://context7.converse-mcp.svc.cluster.local:8080/mcp`). LCI's control plane (`converse`
+    namespace) and the MCP servers (`converse-mcp`) share the `home-remote`/`hetzner-prod` cluster, and
+    no `NetworkPolicy` currently restricts that path — so the call goes over **plain in-cluster HTTP**,
+    **bypassing the public OAuth-gated gateway** (`api.ai.camer.digital/mcp/*`) those same servers are
+    also reachable through for external callers. No OAuth2 client-credentials flow, no Keycloak client
+    registration, no new secret to provision. If the in-cluster network topology ever changes such that
+    this path stops being viable, the fallback is the public gateway path (Option C as originally
+    written, with a control-plane OAuth2 client).
 - **Option D — status quo.** Repo-only deep reviews.
 
 ## Decision Outcome
@@ -62,8 +78,13 @@ is the low-risk default**, open `web_search` is the higher-injection-risk one an
 gated / rate-limited. The agent's writes are already mediated and limited (it can only comment/finish — it
 cannot merge or approve), which bounds the blast radius of a successful injection.
 
-**Proposed** — open for discussion (provider choice, allowlist/caps, whether to ship Context7 first and
-web_search behind a flag).
+**Accepted** — both tools ship together (not Context7-first-behind-a-flag): once the reach path is
+"already-deployed in-cluster MCP servers with their own creds," there is no per-provider account to
+provision before `web_search` can go live, so the original reason to stage it behind a flag no longer
+applies. Deep-tier-only is still enforced twice: the per-tier `review.tools` allowlist keeps the fast
+tier from being *offered* either tool, and the control plane independently re-checks the task's tier
+server-side before performing the call (defense in depth, ADR-0002 — the shared runner bearer token is
+not itself task/tier-scoped).
 
 ### Consequences
 
@@ -95,4 +116,10 @@ web_search behind a flag).
 
 - Builds on: [ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md) (per-tier tool allowlist — the delivery mechanism), [ADR-0037](0037-agent-acts-via-mediated-tools.md) (mediated tools), [ADR-0002](0002-rust-control-plane-trust-boundary.md) (trust boundary), [ADR-0026](0026-native-review-agent.md) (why not MCP).
 - Origin: the "FETCH capability" maintainer direction (web-search + web-fetch wanted), now scoped to the deep tier + Context7.
-- Context7: curated, version-aware library documentation for LLMs (Upstash) — consumed here via its HTTP API control-plane-side, not as an MCP subprocess.
+- Context7: curated, version-aware library documentation for LLMs (Upstash) — the control plane calls
+  its `resolve-library-id` + `query-docs` MCP tools (not its plain REST API, and not as an MCP
+  subprocess in the Job — see the concrete mechanism above).
+- Implementation: #255. Not a contradiction of "why not MCP" (ADR-0026): that ADR is about the
+  **Job** not running an MCP subprocess/client (the untrusted, sandboxed side); here the **control
+  plane** (the trust boundary) is the MCP client, calling servers it already operates, which is the
+  same shape as any other outbound integration the control plane owns.

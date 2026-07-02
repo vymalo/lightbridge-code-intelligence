@@ -189,6 +189,14 @@ pub struct SymbolHit {
     pub start_line: i64,
 }
 
+/// Result of a deep-tier external-knowledge tool call (ADR-0066): `web_search` / `context7_lookup`.
+/// Plain text, already size-capped control-plane-side — untrusted content, framed as such before
+/// it reaches the model (see `review::native::tools`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KnowledgeToolResult {
+    pub text: String,
+}
+
 /// One entry in the agent run transcript (ADR-0034): an assistant turn (its reasoning text +
 /// `tool_calls`, with the turn's token usage) or a tool result. Submitted in order; the control plane
 /// assigns the sequence. Tool-result content is truncated by the runner to keep the row bounded.
@@ -536,6 +544,55 @@ impl ControlPlaneClient {
             .await
             .context("parsing graph hits")?;
         Ok(hits)
+    }
+
+    /// `POST /internal/tasks/{id}/knowledge/web-search` — deep-tier external knowledge (ADR-0066),
+    /// mediated web search. The control plane proxies this to the in-cluster brave-search MCP server
+    /// and returns plain text; a fast-tier task id is rejected server-side (403).
+    pub async fn web_search(&self, task_id: Uuid, query: &str) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/knowledge/web-search", self.base_url);
+        let body: KnowledgeToolResult = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .context("web_search request")?
+            .error_for_status()
+            .context("control plane rejected the web_search call")?
+            .json()
+            .await
+            .context("parsing web_search result")?;
+        Ok(body.text)
+    }
+
+    /// `POST /internal/tasks/{id}/knowledge/context7` — deep-tier external knowledge (ADR-0066),
+    /// mediated Context7 library-docs lookup. `topic` narrows the docs to a specific question; the
+    /// control plane defaults it when absent.
+    pub async fn context7_lookup(
+        &self,
+        task_id: Uuid,
+        library: &str,
+        topic: Option<&str>,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/knowledge/context7", self.base_url);
+        let body: KnowledgeToolResult = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "library": library, "topic": topic }))
+            .send()
+            .await
+            .context("context7_lookup request")?
+            .error_for_status()
+            .context("control plane rejected the context7_lookup call")?
+            .json()
+            .await
+            .context("parsing context7_lookup result")?;
+        Ok(body.text)
     }
 
     /// `POST /internal/tasks/{id}/status` — report a status transition (best-effort `detail`).

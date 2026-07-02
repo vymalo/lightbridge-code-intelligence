@@ -23,6 +23,25 @@ pub struct FileConfig {
     pub dispatcher: DispatcherSection,
     pub review: ReviewSection,
     pub embeddings: EmbeddingsSection,
+    pub knowledge_tools: KnowledgeToolsSection,
+}
+
+/// Deep-tier external-knowledge tools (ADR-0066): `web_search` (brave-search MCP) and
+/// `context7_lookup` (context7 MCP). Both already-deployed, in-cluster MCP servers
+/// (`converse-mcp` namespace) hold their own upstream provider credentials — the control plane
+/// only needs their in-cluster Service URL, reached over plain in-cluster HTTP (no OAuth, no
+/// secrets held here). Each URL is independently `Option`al: unset disables that one tool's
+/// internal endpoint (503), so a partial rollout (e.g. context7 wired, web_search not yet) degrades
+/// per-tool rather than all-or-nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnowledgeToolsSection {
+    /// Streamable-HTTP MCP endpoint for the brave-search server, e.g.
+    /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`. `None` disables `web_search`.
+    pub web_search_mcp_url: Option<String>,
+    /// Streamable-HTTP MCP endpoint for the context7 server, e.g.
+    /// `http://context7.converse-mcp.svc.cluster.local:8080/mcp`. `None` disables `context7_lookup`.
+    pub context7_mcp_url: Option<String>,
 }
 
 /// Embedding-store safety. The `code_chunks.embedding` column is a fixed-width `vector(N)`; changing

@@ -33,6 +33,7 @@ mod queue;
 mod config;
 mod db;
 mod jwt;
+mod mcp_client;
 mod outbox;
 mod review;
 mod types;
@@ -88,6 +89,9 @@ pub struct AppState {
     /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
     /// (else defaults). Held here so the webhook + internal handlers can react/label.
     pub review: Arc<config::ReviewSection>,
+    /// Deep-tier external-knowledge MCP endpoints (ADR-0066): `web_search` / `context7_lookup`.
+    /// Each URL is independently optional — unset disables that tool's internal route (503).
+    pub knowledge_tools: Arc<config::KnowledgeToolsSection>,
     /// The GitHub App's handle (e.g. `lightbridge-assistant`), from `GITHUB_APP_HANDLE`. A PR comment
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
@@ -113,6 +117,10 @@ impl AppState {
         let embeddings = file_config
             .as_ref()
             .map(|f| f.embeddings.clone())
+            .unwrap_or_default();
+        let knowledge_tools = file_config
+            .as_ref()
+            .map(|f| f.knowledge_tools.clone())
             .unwrap_or_default();
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
@@ -163,6 +171,7 @@ impl AppState {
             neo4j,
             metrics,
             review: Arc::new(review),
+            knowledge_tools: Arc::new(knowledge_tools),
             app_handle: Arc::new(
                 std::env::var("GITHUB_APP_HANDLE")
                     .ok()
@@ -255,6 +264,17 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
+        )
+        // Deep-tier external-knowledge tools (ADR-0066): mediated `web_search` + `context7_lookup`,
+        // proxying to the already-deployed in-cluster brave-search/context7 MCP servers. Gated
+        // server-side to `deep`-tier tasks inside each handler (not just the runner's allowlist).
+        .route(
+            "/internal/tasks/{id}/knowledge/web-search",
+            post(internal::web_search),
+        )
+        .route(
+            "/internal/tasks/{id}/knowledge/context7",
+            post(internal::context7_lookup),
         )
         // The agent run transcript (ADR-0034): the runner submits it at run end.
         .route(

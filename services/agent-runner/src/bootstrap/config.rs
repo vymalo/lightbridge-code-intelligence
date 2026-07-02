@@ -232,11 +232,19 @@ pub enum ReviewTool {
     ReportProgress,
     #[serde(rename = "abort")]
     Abort,
+    /// Deep-tier external knowledge (ADR-0066): a web search, mediated by the control plane
+    /// (in-cluster brave-search MCP). Query in, never a URL.
+    #[serde(rename = "web_search")]
+    WebSearch,
+    /// Deep-tier external knowledge (ADR-0066): curated library docs, mediated by the control plane
+    /// (in-cluster context7 MCP). Library name in, never a raw library id or URL.
+    #[serde(rename = "context7_lookup")]
+    Context7Lookup,
 }
 
 impl ReviewTool {
     /// Every variant, in the canonical tool order — the operator-facing list of valid `tools` values.
-    pub const ALL: [ReviewTool; 10] = [
+    pub const ALL: [ReviewTool; 12] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
@@ -247,6 +255,8 @@ impl ReviewTool {
         ReviewTool::Finish,
         ReviewTool::ReportProgress,
         ReviewTool::Abort,
+        ReviewTool::WebSearch,
+        ReviewTool::Context7Lookup,
     ];
 
     /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
@@ -262,6 +272,8 @@ impl ReviewTool {
             ReviewTool::Finish => "finish",
             ReviewTool::ReportProgress => "report_progress",
             ReviewTool::Abort => "abort",
+            ReviewTool::WebSearch => "web_search",
+            ReviewTool::Context7Lookup => "context7_lookup",
         }
     }
 }

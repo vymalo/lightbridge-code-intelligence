@@ -292,6 +292,7 @@ pub async fn run_native_agent(
         embedder,
         task_id,
         checkout_root,
+        fast_tier: review.fast,
     };
     // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
     // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model

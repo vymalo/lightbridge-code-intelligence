@@ -597,6 +597,205 @@ pub async fn graph_query(
     }
 }
 
+// ── ADR-0066 deep-tier external-knowledge tools ─────────────────────────────────────────────────
+// `web_search` (brave-search MCP) and `context7_lookup` (context7 MCP). Both target servers already
+// run in-cluster (`converse-mcp` namespace) and hold their own upstream provider credentials — this
+// control plane only proxies the call over plain in-cluster HTTP (no OAuth, no secrets held here;
+// see ADR-0066's in-cluster-DNS reach-path decision). The model supplies a query/library, never a
+// URL or a raw Context7 library id, so there is no SSRF primitive.
+
+/// How long the control plane waits on the upstream MCP server before giving up.
+const KNOWLEDGE_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Pull the first Context7-compatible library id (`/org/project` or `/org/project/version`) out of
+/// `resolve-library-id`'s free-text response. See the call site for why this is a deterministic
+/// heuristic rather than LLM-assisted selection.
+fn extract_library_id(text: &str) -> Option<&str> {
+    for (i, ch) in text.char_indices() {
+        if ch != '/' {
+            continue;
+        }
+        let rest = &text[i..];
+        // NOT `.`: real ids contain dots (e.g. `/vercel/next.js`, `/vinta/awesome-python.com`).
+        let end = rest
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| c.is_whitespace() || matches!(c, ')' | ']' | ',' | '"' | '\'' | ';'))
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        let candidate = &rest[..end];
+        // At least `/org/project` — two slashes, non-trivial length.
+        if candidate.matches('/').count() >= 2 && candidate.len() > 2 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Reject anything that isn't a `deep`-tier task. The shared runner-bearer token (`RunnerAuth`) is
+/// not task-scoped, so a `fast`-tier Job technically presents the same credential as a `deep` one —
+/// the tool-allowlist keeps the fast tier from *offering* these tools, but the trust boundary lives
+/// in the control plane (ADR-0002), so the tier is re-checked here too (ADR-0066 acceptance
+/// criterion: fast tier refuses these, not just "doesn't see them").
+async fn require_deep_tier(pool: &sqlx::PgPool, id: Uuid) -> Result<(), Response> {
+    match crate::db::get_task_context(pool, id).await {
+        Ok(Some(ctx)) if ctx.tier == "deep" => Ok(()),
+        Ok(Some(_)) => Err((
+            StatusCode::FORBIDDEN,
+            "external-knowledge tools are deep-tier only",
+        )
+            .into_response()),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "task not found").into_response()),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "task context lookup failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response())
+        }
+    }
+}
+
+/// Body for `POST /internal/tasks/{id}/knowledge/web-search`.
+#[derive(Debug, Deserialize)]
+pub struct WebSearchRequest {
+    pub query: String,
+}
+
+/// `POST /internal/tasks/{id}/knowledge/web-search` — deep-tier only (ADR-0066). Proxies to the
+/// in-cluster brave-search MCP server's `brave_web_search` tool.
+pub async fn web_search(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<WebSearchRequest>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    if let Err(response) = require_deep_tier(pool, id).await {
+        crate::http::metrics::knowledge_tool_call("web_search", "rejected");
+        return response;
+    }
+    let Some(url) = state.knowledge_tools.web_search_mcp_url.as_deref() else {
+        crate::http::metrics::knowledge_tool_call("web_search", "not_configured");
+        return (StatusCode::SERVICE_UNAVAILABLE, "web_search is not configured").into_response();
+    };
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    match crate::mcp_client::call_tool(
+        url,
+        "brave_web_search",
+        serde_json::json!({ "query": req.query, "count": 5 }),
+        KNOWLEDGE_TOOL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(text) => {
+            crate::http::metrics::knowledge_tool_call("web_search", "ok");
+            Json(serde_json::json!({ "text": text })).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "web_search MCP call failed");
+            crate::http::metrics::knowledge_tool_call("web_search", "error");
+            (StatusCode::BAD_GATEWAY, "web_search upstream error").into_response()
+        }
+    }
+}
+
+/// Body for `POST /internal/tasks/{id}/knowledge/context7`.
+#[derive(Debug, Deserialize)]
+pub struct Context7LookupRequest {
+    pub library: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+/// `POST /internal/tasks/{id}/knowledge/context7` — deep-tier only (ADR-0066). Two MCP calls to the
+/// in-cluster context7 server: `resolve-library-id` (name → Context7 library id), then `query-docs`
+/// (id + a question → curated docs). The model supplies a library name (+ optional topic), never a
+/// raw library id.
+pub async fn context7_lookup(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<Context7LookupRequest>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    if let Err(response) = require_deep_tier(pool, id).await {
+        crate::http::metrics::knowledge_tool_call("context7_lookup", "rejected");
+        return response;
+    }
+    let Some(url) = state.knowledge_tools.context7_mcp_url.as_deref() else {
+        crate::http::metrics::knowledge_tool_call("context7_lookup", "not_configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context7_lookup is not configured",
+        )
+            .into_response();
+    };
+    if req.library.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty library").into_response();
+    }
+    // query-docs needs a question, not just a library name — the topic doubles as one; absent a
+    // topic, ask for the library's general docs so the call still returns something useful.
+    let question = req
+        .topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} overview and current usage", req.library));
+
+    let resolved = crate::mcp_client::call_tool(
+        url,
+        "resolve-library-id",
+        serde_json::json!({ "libraryName": req.library, "query": question }),
+        KNOWLEDGE_TOOL_TIMEOUT,
+    )
+    .await;
+    let resolved_text = match resolved {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, library = %req.library, "context7 resolve-library-id failed");
+            crate::http::metrics::knowledge_tool_call("context7_lookup", "error");
+            return (StatusCode::BAD_GATEWAY, "context7 upstream error").into_response();
+        }
+    };
+    // `resolve-library-id` returns a free-text candidate list for a human/LLM to read and pick from
+    // (Context7's own tool description walks through a selection process) — this handler has no LLM
+    // to do that reasoning, so it deterministically takes the first `/org/project[/version]`-shaped
+    // token, which Context7 puts first for the best match. A wrong pick is low-severity: `query-docs`
+    // either returns that library's docs (still useful) or a clean "not found" the agent can react to.
+    let Some(library_id) = extract_library_id(&resolved_text) else {
+        tracing::warn!(task_id = %id, library = %req.library, "context7 resolve-library-id returned no parseable library id");
+        crate::http::metrics::knowledge_tool_call("context7_lookup", "error");
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("context7 could not resolve a library id for {:?}", req.library),
+        )
+            .into_response();
+    };
+    match crate::mcp_client::call_tool(
+        url,
+        "query-docs",
+        serde_json::json!({ "libraryId": library_id, "query": question }),
+        KNOWLEDGE_TOOL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(text) => {
+            crate::http::metrics::knowledge_tool_call("context7_lookup", "ok");
+            Json(serde_json::json!({ "text": text })).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, library = %req.library, "context7 query-docs failed");
+            crate::http::metrics::knowledge_tool_call("context7_lookup", "error");
+            (StatusCode::BAD_GATEWAY, "context7 upstream error").into_response()
+        }
+    }
+}
+
 // ── ADR-0037 mediated write actions ─────────────────────────────────────────────────────────────
 // The native agent calls these *during* its run; the control plane accumulates them and posts nothing
 // until `finalize_review` flushes the buffer as one grouped review (+ a single consolidated reply).
@@ -1131,5 +1330,25 @@ mod tests {
         // A non-PR (issue) target is never a PR review → the reply is the content, kept.
         assert!(!posts_pr_review("issue", true, true, false));
         assert!(!posts_pr_review("issue", false, false, false));
+    }
+
+    #[test]
+    fn extract_library_id_finds_the_first_org_project_token() {
+        assert_eq!(
+            extract_library_id("Best match: /vercel/next.js (High reputation, 1200 snippets)"),
+            Some("/vercel/next.js")
+        );
+        assert_eq!(
+            extract_library_id("Try /vercel/next.js/v15.1.8 for the pinned version."),
+            Some("/vercel/next.js/v15.1.8")
+        );
+    }
+
+    #[test]
+    fn extract_library_id_rejects_a_bare_path_or_prose() {
+        // No `/org/project` shape anywhere (just prose, or a single-segment path).
+        assert_eq!(extract_library_id("no good match found"), None);
+        assert_eq!(extract_library_id("/just-one-segment stops here"), None);
+        assert_eq!(extract_library_id(""), None);
     }
 }
