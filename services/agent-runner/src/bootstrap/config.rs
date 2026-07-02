@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use regex::Regex;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -195,14 +196,18 @@ pub struct ReviewFile {
     /// the cheap model + short timeout.
     #[serde(default)]
     pub deep: Option<Box<ReviewFile>>,
-    /// Per-tier tool allowlist (ADR-0062): the exact set of tools this tier offers the model, e.g.
-    /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. A closed
-    /// [`ReviewTool`] enum, so an unknown name **fails at deserialize** (serde names the valid variants)
-    /// rather than being a free-form string we'd have to hand-check. When unset, the tier uses the
-    /// built-in default (the full surface for DEEP; the wind-down write/finish/abort set for FAST).
-    /// Externalizing it lets an operator tune each tier's surface from the ConfigMap.
+    /// Per-tier tool allowlist (ADR-0062 + ADR-0066): the exact set of tools this tier offers, e.g.
+    /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. Each
+    /// entry is a [`ReviewToolSelector`] — either an exact built-in name (validated at deserialize
+    /// against the closed [`ReviewTool`] enum) OR an `mcp__`-prefixed **regex** matched against the
+    /// dynamically-discovered `mcp__<server>__<tool>` names, so an operator can pick a SUBSET of a
+    /// server's tools (a busy server like brave-search exposes many) instead of all-or-nothing — e.g.
+    /// `"mcp__brave-search__brave_web_search"` (exact) or `"mcp__context7__.*"` (all of context7's).
+    /// An unknown built-in / malformed regex **fails at deserialize** rather than silently offering
+    /// fewer tools. When unset, the tier uses the built-in default (the full surface — every built-in
+    /// plus all discovered MCP tools — for DEEP; the wind-down write/finish/abort set for FAST).
     #[serde(default)]
-    pub tools: Option<Vec<ReviewTool>>,
+    pub tools: Option<Vec<ReviewToolSelector>>,
 }
 
 /// A tool the review agent can be configured to offer (ADR-0062). A **closed enum** so a per-tier
@@ -232,19 +237,11 @@ pub enum ReviewTool {
     ReportProgress,
     #[serde(rename = "abort")]
     Abort,
-    /// External-knowledge MCP tools (ADR-0066), mediated by the control plane: whatever the
-    /// configured MCP servers (e.g. brave-search, context7) currently expose, discovered
-    /// dynamically at run start — never a hardcoded per-provider tool. A single sentinel rather
-    /// than one variant per downstream tool, since the actual set isn't known at compile time.
-    /// Available to any tier; unlike the rest of this enum, it's not a single dispatchable tool but
-    /// a whole discoverable set gated the same way as everything else — via this allowlist.
-    #[serde(rename = "mcp_tools")]
-    McpTools,
 }
 
 impl ReviewTool {
-    /// Every variant, in the canonical tool order — the operator-facing list of valid `tools` values.
-    pub const ALL: [ReviewTool; 11] = [
+    /// Every variant, in the canonical tool order — the operator-facing list of valid built-in names.
+    pub const ALL: [ReviewTool; 10] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
@@ -255,7 +252,6 @@ impl ReviewTool {
         ReviewTool::Finish,
         ReviewTool::ReportProgress,
         ReviewTool::Abort,
-        ReviewTool::McpTools,
     ];
 
     /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
@@ -271,8 +267,79 @@ impl ReviewTool {
             ReviewTool::Finish => "finish",
             ReviewTool::ReportProgress => "report_progress",
             ReviewTool::Abort => "abort",
-            ReviewTool::McpTools => "mcp_tools",
         }
+    }
+
+    /// The built-in matching `name`, if any (the inverse of [`as_str`](Self::as_str)).
+    fn from_name(name: &str) -> Option<ReviewTool> {
+        ReviewTool::ALL.into_iter().find(|t| t.as_str() == name)
+    }
+}
+
+/// One entry in a per-tier `review.<tier>.tools` allowlist (ADR-0062 + ADR-0066): either an exact
+/// built-in tool, or a regex selector for the dynamically-discovered external-knowledge MCP tools.
+/// Deserialized from a single string — a built-in name binds [`Self::Builtin`]; a string starting
+/// with the `mcp__` prefix is compiled as an anchored regex into [`Self::Mcp`]; anything else fails
+/// the config (a typo'd built-in can't silently become a never-matching pattern).
+#[derive(Debug, Clone)]
+pub enum ReviewToolSelector {
+    Builtin(ReviewTool),
+    Mcp(McpToolPattern),
+}
+
+/// A compiled, fully-anchored regex over discovered `mcp__<server>__<tool>` names (ADR-0066). Carries
+/// the raw pattern for logging/diagnostics alongside the compiled matcher.
+#[derive(Debug, Clone)]
+pub struct McpToolPattern {
+    raw: String,
+    regex: Regex,
+}
+
+impl McpToolPattern {
+    /// Whether this selector matches a discovered tool's (prefixed) name.
+    pub fn is_match(&self, discovered_tool_name: &str) -> bool {
+        self.regex.is_match(discovered_tool_name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewToolSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let s = String::deserialize(deserializer)?;
+        if let Some(builtin) = ReviewTool::from_name(&s) {
+            return Ok(ReviewToolSelector::Builtin(builtin));
+        }
+        // Not a built-in. It MUST be an `mcp__` selector, else it's a typo we fail loud on rather
+        // than treating a mistyped built-in as a regex that silently matches nothing.
+        if let Some(pattern) = s.strip_prefix(crate::review::native::tools::MCP_TOOL_PREFIX) {
+            // Anchor to a FULL match and keep the `mcp__` prefix in the compiled regex, so
+            // `mcp__brave-search__brave_web_search` matches exactly that discovered name and
+            // `mcp__context7__.*` matches all of context7's — never a partial/substring hit.
+            let anchored = format!(
+                "^{}{}$",
+                regex::escape(crate::review::native::tools::MCP_TOOL_PREFIX),
+                pattern
+            );
+            let regex = Regex::new(&anchored)
+                .map_err(|e| D::Error::custom(format!("invalid mcp tool regex {s:?}: {e}")))?;
+            return Ok(ReviewToolSelector::Mcp(McpToolPattern { raw: s, regex }));
+        }
+        Err(D::Error::custom(format!(
+            "unknown review tool {s:?}: expected a built-in ({}) or an \"mcp__<server>__<tool>\" \
+             regex selector",
+            ReviewTool::ALL
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 }
 
@@ -424,10 +491,10 @@ pub struct ReviewConfig {
     /// NOT from file config — set by `main.rs` from the task context's `tier` (`fast` → `true`); a Job
     /// runs one task, so mutating it per-run on the resolved config is sound. Defaults to `false` (deep).
     pub fast: bool,
-    /// Per-tier tool allowlist (ADR-0062): when `Some`, the authoritative set of tools this tier offers
-    /// the model (a non-empty list of [`ReviewTool`]). `None` = the built-in default for the tier. From
-    /// `review.<tier>.tools`.
-    pub tools: Option<Vec<ReviewTool>>,
+    /// Per-tier tool allowlist (ADR-0062 + ADR-0066): when `Some`, the authoritative set of tools this
+    /// tier offers the model (a non-empty list of [`ReviewToolSelector`] — built-in names + `mcp__`
+    /// regex selectors). `None` = the built-in default for the tier. From `review.<tier>.tools`.
+    pub tools: Option<Vec<ReviewToolSelector>>,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -589,12 +656,14 @@ impl ReviewConfig {
             .request_timeout_secs
             .or_else(|| parse_env_u64("LLM_REQUEST_TIMEOUT_SECS"))
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
-        // Per-tier tool allowlist (ADR-0062): names are already validated at deserialize (the closed
-        // `ReviewTool` enum). Only an EMPTY list needs rejecting here — a tier with no tools can't act.
+        // Per-tier tool allowlist (ADR-0062 + ADR-0066): entries are already validated at deserialize
+        // (built-in name or a compiled `mcp__` regex). Only an EMPTY list needs rejecting here — a
+        // tier with no tools can't act.
         let tools = match &r.tools {
             Some(t) if t.is_empty() => anyhow::bail!(
                 "review.tools is set but empty — a tier with no tools can't act. Remove the key (use \
-                 the built-in default) or list at least one of: {}",
+                 the built-in default) or list at least one built-in ({}) or `mcp__<server>__<tool>` \
+                 regex selector.",
                 ReviewTool::ALL
                     .iter()
                     .map(|t| t.as_str())
@@ -1021,27 +1090,32 @@ mod tests {
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let p = prompt.to_string_lossy().into_owned();
 
-        // A good allowlist resolves and is carried onto the config.
+        // A good allowlist (built-ins + an mcp selector) resolves and is carried onto the config.
         let mut good = review_block("m", &p);
-        good.tools = Some(vec![
-            ReviewTool::AddReviewComment,
-            ReviewTool::Finish,
-            ReviewTool::Abort,
-        ]);
+        good.tools = Some(
+            serde_json::from_value(serde_json::json!([
+                "add_review_comment",
+                "finish",
+                "abort",
+                "mcp__brave-search__brave_web_search",
+            ]))
+            .unwrap(),
+        );
         let cfg = ReviewConfig::from_review_file(&good)
             .expect("resolves")
             .expect("enabled");
-        assert_eq!(
-            cfg.tools.as_deref(),
-            Some(
-                [
-                    ReviewTool::AddReviewComment,
-                    ReviewTool::Finish,
-                    ReviewTool::Abort
-                ]
-                .as_slice()
-            )
-        );
+        let selectors = cfg.tools.as_deref().expect("carried through");
+        assert_eq!(selectors.len(), 4);
+        assert!(matches!(
+            &selectors[0],
+            ReviewToolSelector::Builtin(ReviewTool::AddReviewComment)
+        ));
+        // The mcp selector matches the exact discovered name and nothing else.
+        let ReviewToolSelector::Mcp(pat) = &selectors[3] else {
+            panic!("expected an mcp selector: {:?}", selectors[3]);
+        };
+        assert!(pat.is_match("mcp__brave-search__brave_web_search"));
+        assert!(!pat.is_match("mcp__brave-search__brave_local_search"));
 
         // An empty list is rejected — a tier with no tools can't act.
         let mut empty = review_block("m", &p);
@@ -1051,8 +1125,48 @@ mod tests {
         std::fs::remove_file(&prompt).ok();
     }
 
-    // The closed enum rejects an unknown tool name at parse time — serde names the offending value, so a
-    // typo in `review.<tier>.tools` fails the config loudly instead of silently offering fewer tools.
+    // ADR-0066: the mcp selector is a FULL-match regex, so `mcp__context7__.*` picks every context7
+    // tool but no other server's, and a bare exact name matches only itself.
+    #[test]
+    fn mcp_tool_selector_regex_matches_are_anchored_per_server() {
+        let sel: Vec<ReviewToolSelector> = serde_json::from_value(serde_json::json!([
+            "mcp__context7__.*",
+            "mcp__brave-search__brave_web_search",
+        ]))
+        .unwrap();
+        let ReviewToolSelector::Mcp(all_context7) = &sel[0] else {
+            panic!("expected mcp selector");
+        };
+        assert!(all_context7.is_match("mcp__context7__resolve-library-id"));
+        assert!(all_context7.is_match("mcp__context7__query-docs"));
+        assert!(!all_context7.is_match("mcp__brave-search__brave_web_search"));
+        // A partial/substring must NOT match (anchoring): the pattern is the whole name.
+        assert!(!all_context7.is_match("x-mcp__context7__query-docs"));
+
+        let ReviewToolSelector::Mcp(exact) = &sel[1] else {
+            panic!("expected mcp selector");
+        };
+        assert!(exact.is_match("mcp__brave-search__brave_web_search"));
+        assert!(!exact.is_match("mcp__brave-search__brave_web_search_extra"));
+    }
+
+    // A malformed regex in an `mcp__` selector fails the config at parse time (fail-closed).
+    #[test]
+    fn invalid_mcp_regex_fails_at_deserialize() {
+        let err = serde_json::from_str::<FileConfig>(
+            r#"{"review":{"base_url":"u","api_key":"k","model":"m","tools":["mcp__brave__(oops"]}}"#,
+        )
+        .expect_err("an invalid regex must fail parsing");
+        assert!(
+            err.to_string().contains("invalid mcp tool regex"),
+            "error names the problem: {err}"
+        );
+    }
+
+    // An unknown tool name that is neither a built-in nor an `mcp__` selector fails at parse time —
+    // the custom `ReviewToolSelector` deserializer names the offending value, so a typo in
+    // `review.<tier>.tools` fails the config loudly instead of silently offering fewer tools (and a
+    // mistyped built-in is NOT quietly reinterpreted as a never-matching regex).
     #[test]
     fn unknown_tool_name_fails_at_deserialize() {
         let json = r#"{"review":{"base_url":"u","api_key":"k","model":"m",
@@ -1060,8 +1174,8 @@ mod tests {
         let err =
             serde_json::from_str::<FileConfig>(json).expect_err("unknown tool must fail parsing");
         assert!(
-            err.to_string().contains("nope_tool") || err.to_string().contains("unknown variant"),
-            "serde names the bad tool: {err}"
+            err.to_string().contains("nope_tool"),
+            "the error names the bad tool: {err}"
         );
     }
 
