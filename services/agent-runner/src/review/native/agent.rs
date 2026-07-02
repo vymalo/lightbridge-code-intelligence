@@ -32,7 +32,7 @@ use super::tools::{
     VECTOR_SEMANTIC_SEARCH,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
-use crate::bootstrap::config::{ReviewConfig, ReviewTool};
+use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewToolSelector};
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
 
@@ -301,33 +301,60 @@ pub async fn run_native_agent(
     if !diff_present {
         defs.retain(|t| t.function.name != ADD_REVIEW_COMMENT);
     }
-    // Per-tier tool allowlist (ADR-0062): when the tier declares `review.tools`, that list is the
-    // authoritative offered set — restrict the base set to it. Still subject to the `diff_present` gate
-    // above and the wind-down narrowing below. Unset = the built-in default surface (full set for DEEP).
+    // Per-tier tool allowlist (ADR-0062): when the tier declares `review.tools`, its BUILT-IN entries
+    // are the authoritative offered set — restrict the static base to them. Still subject to the
+    // `diff_present` gate above and the wind-down narrowing below. Unset = the built-in default
+    // surface (full set for DEEP). The `mcp__` selectors are handled separately just below.
     if let Some(allow) = review.tools.as_ref() {
-        let set: HashSet<&str> = allow.iter().map(|t| t.as_str()).collect();
-        defs.retain(|t| set.contains(t.function.name.as_str()));
+        let builtins: HashSet<&str> = allow
+            .iter()
+            .filter_map(|s| match s {
+                ReviewToolSelector::Builtin(b) => Some(b.as_str()),
+                ReviewToolSelector::Mcp(_) => None,
+            })
+            .collect();
+        defs.retain(|t| builtins.contains(t.function.name.as_str()));
     }
     // External-knowledge MCP tools (ADR-0066): discovered dynamically from the control plane, never
-    // hardcoded here — offered on ANY tier whose allowlist includes the `mcp_tools` sentinel, or
-    // whose allowlist is unset (the built-in default = the full surface, same as every other tool).
-    // A discovery failure (no servers configured, one unreachable, network hiccup) degrades to "no
-    // external-knowledge tools this run" — never fails the review.
-    let mcp_tools_allowed = review
-        .tools
-        .as_ref()
-        .is_none_or(|allow| allow.contains(&ReviewTool::McpTools));
-    if mcp_tools_allowed {
+    // hardcoded here. The allowlist picks WHICH discovered tools to offer via `mcp__`-anchored regex
+    // selectors — so an operator can take one tool from a busy server (brave-search exposes many)
+    // rather than all-or-nothing. Rules: an UNSET allowlist offers ALL discovered (the full default
+    // surface, same as every built-in); a SET allowlist offers a discovered tool iff some `mcp__`
+    // selector matches its name, and skips discovery entirely when it has no `mcp__` selectors (no
+    // wasted round-trip). A discovery failure (no servers, one unreachable, a network hiccup) degrades
+    // to "no external-knowledge tools this run" — never fails the review.
+    let mcp_selectors: Option<Vec<&McpToolPattern>> = review.tools.as_ref().map(|allow| {
+        allow
+            .iter()
+            .filter_map(|s| match s {
+                ReviewToolSelector::Mcp(p) => Some(p),
+                ReviewToolSelector::Builtin(_) => None,
+            })
+            .collect()
+    });
+    let discover = match &mcp_selectors {
+        None => true,                 // allowlist unset → full surface
+        Some(sel) => !sel.is_empty(), // set → only if it names ≥1 mcp selector
+    };
+    if discover {
         match tools.client.list_knowledge_tools(task_id).await {
-            Ok(discovered) if !discovered.is_empty() => {
-                tracing::info!(task_id = %task_id, count = discovered.len(), "discovered external-knowledge tools");
-                defs.extend(
-                    discovered
-                        .into_iter()
-                        .map(|t| ToolDef::function(t.name, t.description, t.input_schema)),
-                );
+            Ok(discovered) => {
+                let matched: Vec<_> = discovered
+                    .into_iter()
+                    .filter(|t| match &mcp_selectors {
+                        None => true, // unset → offer everything discovered
+                        Some(sel) => sel.iter().any(|p| p.is_match(&t.name)),
+                    })
+                    .collect();
+                if !matched.is_empty() {
+                    tracing::info!(task_id = %task_id, count = matched.len(), "offering discovered external-knowledge tools");
+                    defs.extend(
+                        matched
+                            .into_iter()
+                            .map(|t| ToolDef::function(t.name, t.description, t.input_schema)),
+                    );
+                }
             }
-            Ok(_) => {} // no servers configured — nothing to add, not an error
             Err(error) => {
                 tracing::warn!(%error, task_id = %task_id, "knowledge-tool discovery failed; continuing without external-knowledge tools");
             }
@@ -2364,11 +2391,10 @@ mod tests {
         let mut review = review_config(format!("{}/v1", chat.uri()));
         review.fast = true;
         // An explicit allowlist: record findings, finish, abort — and nothing else.
-        review.tools = Some(vec![
-            crate::bootstrap::config::ReviewTool::AddReviewComment,
-            crate::bootstrap::config::ReviewTool::Finish,
-            crate::bootstrap::config::ReviewTool::Abort,
-        ]);
+        review.tools = Some(
+            serde_json::from_value(serde_json::json!(["add_review_comment", "finish", "abort"]))
+                .unwrap(),
+        );
         let cpc = ControlPlaneClient::new(cp.uri(), "tok");
         let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
         let diff = PrDiff {
@@ -2481,6 +2507,96 @@ mod tests {
         );
         // The built-in surface is still there alongside it.
         assert!(offered[0].iter().any(|n| n == VECTOR_SEMANTIC_SEARCH));
+    }
+
+    // ADR-0066 (the regex-selector point): a tier whose allowlist names a SPECIFIC `mcp__` selector
+    // gets ONLY the discovered tools that selector matches — not all of a busy server's tools. Here
+    // brave-search exposes two tools; the allowlist picks exactly one.
+    #[tokio::test]
+    async fn mcp_selector_offers_only_matching_discovered_tools() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let user_text = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: user_text.clone(),
+                response: tool_call_reply("finish", r#"{"summary":"ok"}"#),
+            })
+            .mount(&chat)
+            .await;
+        let emb = MockServer::start().await;
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/tasks/{}/knowledge/tools", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "name": "mcp__brave-search__brave_web_search", "description": "web", "input_schema": {"type":"object"} },
+                { "name": "mcp__brave-search__brave_local_search", "description": "local", "input_schema": {"type":"object"} }
+            ])))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let mut review = review_config(format!("{}/v1", chat.uri()));
+        // Allowlist: finish/abort + ONE specific brave tool by exact selector — not the local one.
+        review.tools = Some(
+            serde_json::from_value(json!([
+                "finish",
+                "abort",
+                "mcp__brave-search__brave_web_search"
+            ]))
+            .unwrap(),
+        );
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("run finishes cleanly");
+
+        let offered = offered.lock().unwrap();
+        assert!(
+            offered[0]
+                .iter()
+                .any(|n| n == "mcp__brave-search__brave_web_search"),
+            "the selected tool is offered: {:?}",
+            offered[0]
+        );
+        assert!(
+            !offered[0]
+                .iter()
+                .any(|n| n == "mcp__brave-search__brave_local_search"),
+            "the UNselected sibling tool is NOT offered: {:?}",
+            offered[0]
+        );
+        // A built-in the allowlist didn't name is also absent (retrieval).
+        assert!(!offered[0].iter().any(|n| n == VECTOR_SEMANTIC_SEARCH));
     }
 
     // Two-tier review (ADR-0062): the fast tier removes retrieval from the OFFERED set, but a model

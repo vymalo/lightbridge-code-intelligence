@@ -36,12 +36,11 @@ pub const ADD_COMMENT: &str = "add_comment";
 pub const FINISH: &str = "finish";
 pub const REPORT_PROGRESS: &str = "report_progress";
 pub const ABORT: &str = "abort";
-/// The config-allowlist sentinel (ADR-0066): NOT itself a dispatchable tool name — see
-/// [`crate::bootstrap::config::ReviewTool::McpTools`]. The actual dispatched names are whatever the
-/// control plane discovers at run start, each prefixed [`MCP_TOOL_PREFIX`].
-pub const MCP_TOOLS: &str = "mcp_tools";
-/// Every discovered external-knowledge tool's dispatched name carries this prefix
-/// (`mcp__<server>__<tool>`) — mirrors `crate::http::internal::MCP_TOOL_PREFIX` control-plane-side.
+/// Every discovered external-knowledge tool's dispatched name carries this prefix (ADR-0066:
+/// `mcp__<server>__<tool>`) — mirrors `crate::http::internal::MCP_TOOL_PREFIX` control-plane-side.
+/// The runner dispatches any call with this prefix generically; a per-tier `review.tools` allowlist
+/// picks WHICH discovered tools are offered via `mcp__`-anchored regex selectors
+/// ([`crate::bootstrap::config::ReviewToolSelector`]).
 pub const MCP_TOOL_PREFIX: &str = "mcp__";
 
 const DEFAULT_LIMIT: i64 = 10;
@@ -293,13 +292,14 @@ pub fn tool_defs() -> Vec<ToolDef> {
     defs
 }
 
-/// Every tool name the agent can offer (ADR-0062), the source of truth for validating a per-tier tool
-/// allowlist (`review.<tier>.tools`): an operator can declare exactly which of these a tier exposes, and
-/// an unknown name must fail closed rather than silently offering fewer tools. Mostly derived from
-/// [`tool_defs`] so the list can't drift from the actual static surface — plus [`MCP_TOOLS`]
-/// (ADR-0066), which is deliberately NOT in `tool_defs()`: it's an allowlist-only sentinel meaning
-/// "discover and offer whatever the configured MCP servers currently expose," not a single
-/// dispatchable tool with a fixed schema.
+/// Every BUILT-IN tool name the agent can offer (ADR-0062), the source of truth for validating the
+/// built-in entries of a per-tier `review.<tier>.tools` allowlist against the closed [`ReviewTool`]
+/// enum. Derived from [`tool_defs`] so the list can't drift from the actual static surface. The
+/// dynamically-discovered external-knowledge tools (ADR-0066) are deliberately NOT here — they have
+/// no compile-time names or fixed schema; the allowlist selects them by `mcp__`-anchored regex
+/// instead ([`crate::bootstrap::config::ReviewToolSelector`]).
+///
+/// [`ReviewTool`]: crate::bootstrap::config::ReviewTool
 pub fn known_tool_names() -> Vec<&'static str> {
     vec![
         VECTOR_SEMANTIC_SEARCH,
@@ -312,7 +312,6 @@ pub fn known_tool_names() -> Vec<&'static str> {
         FINISH,
         REPORT_PROGRESS,
         ABORT,
-        MCP_TOOLS,
     ]
 }
 
