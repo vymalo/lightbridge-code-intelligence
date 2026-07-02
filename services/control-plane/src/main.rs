@@ -425,6 +425,22 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
+    // Pin the process-default rustls crypto provider before anything builds a TLS client. This
+    // workspace links *two* providers — `ring` (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs`
+    // (pulled transitively by `rmcp` → reqwest 0.13 → rustls-platform-verifier) — and with both
+    // present rustls 0.23 can't auto-select a default and panics on the first handshake ("Could not
+    // automatically determine the process-level CryptoProvider"). That bit the `dispatcher` role at
+    // startup when it builds its kube client. Installing one explicitly makes selection deterministic
+    // regardless of which provider features the dependency graph enables. `ring` matches sqlx's
+    // pinned choice and is always present (Postgres core). Idempotent: a benign `Err` means a
+    // provider is already installed (e.g. a re-entrant test), which we leave in place.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::warn!("a rustls CryptoProvider was already installed; keeping the existing one");
+    }
+
     // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
     // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
     // the same image so they scale independently. `scheduler` arrives in Phase 2.
@@ -562,6 +578,21 @@ fn spawn_metrics_server(handle: PrometheusHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The workspace links two rustls crypto providers (`ring` via sqlx, `aws-lc-rs` via rmcp's
+    // reqwest 0.13), so rustls can't auto-pick a process default and panics on the first TLS
+    // handshake — which crashed the dispatcher role at startup. `main` installs `ring` explicitly;
+    // this guards that the provider is actually linked and installable, and that a process default
+    // ends up set. `install_default` is process-global and once-only, so tolerate a benign `Err`
+    // (another test in this binary may have installed it first) and assert the end state instead.
+    #[test]
+    fn a_default_crypto_provider_is_installed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no process-default rustls CryptoProvider — the dispatcher would panic on first TLS use"
+        );
+    }
 
     #[test]
     fn with_pool_readiness_follows_the_ping() {
