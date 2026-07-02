@@ -42,9 +42,15 @@ pub struct KnowledgeToolsSection {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-/// One configured MCP server. Its tools are exposed to the agent prefixed `mcp__<name>__<tool>` so
-/// names can't collide across servers and the control plane can route a call back without a
-/// separate lookup table.
+/// One configured MCP server (ADR-0066). Its tools are exposed to the agent prefixed
+/// `mcp__<name>__<tool>` so names can't collide across servers and the control plane can route a call
+/// back without a separate lookup table.
+///
+/// **Remote-transport-only invariant (by design):** an MCP server is always an already-running
+/// **remote HTTP** endpoint reached over streamable-HTTP by URL — the control plane never spawns a
+/// **local stdio** MCP subprocess (that path was removed in ADR-0026 and stays gone). `url` is
+/// validated to be an `http(s)://` endpoint at deserialize, so a non-HTTP (e.g. `stdio:`) transport
+/// can't even be declared.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -54,7 +60,9 @@ pub struct McpServerConfig {
     #[serde(deserialize_with = "deserialize_mcp_server_name")]
     pub name: String,
     /// Streamable-HTTP MCP endpoint, e.g.
-    /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`.
+    /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`. Must be `http(s)://` — the
+    /// remote-transport-only invariant above is enforced here at deserialize.
+    #[serde(deserialize_with = "deserialize_mcp_server_url")]
     pub url: String,
 }
 
@@ -73,6 +81,24 @@ where
         )));
     }
     Ok(name)
+}
+
+/// Enforce the remote-transport-only invariant (ADR-0066): an MCP server must be an `http(s)://`
+/// endpoint. Rejecting any other scheme at config load makes "never a local stdio subprocess, by
+/// design" a fail-closed guarantee rather than a convention — a `stdio:` / bare-command / file-path
+/// declaration can't even parse.
+fn deserialize_mcp_server_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let url = String::deserialize(deserializer)?;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(serde::de::Error::custom(format!(
+            "mcp server url {url:?} must be an http:// or https:// endpoint — LCI speaks only to \
+             remote HTTP MCP servers, never a local stdio subprocess (ADR-0066)"
+        )));
+    }
+    Ok(url)
 }
 
 /// Embedding-store safety. The `code_chunks.embedding` column is a fixed-width `vector(N)`; changing
@@ -217,5 +243,30 @@ mod tests {
         let json = r#"{"knowledge_tools":{"mcp_servers":[{"name":"context7","url":"http://x"}]}}"#;
         let config: FileConfig = serde_json::from_str(json).expect("valid name parses");
         assert_eq!(config.knowledge_tools.mcp_servers[0].name, "context7");
+    }
+
+    // ADR-0066 remote-transport-only invariant: a non-HTTP url (e.g. a stdio/local transport) can't
+    // even be declared — it fails config load.
+    #[test]
+    fn mcp_server_url_must_be_http() {
+        let err = serde_json::from_str::<FileConfig>(
+            r#"{"knowledge_tools":{"mcp_servers":[{"name":"ctx","url":"stdio:///usr/bin/ctx"}]}}"#,
+        )
+        .expect_err("a non-http(s) mcp url must fail parsing");
+        assert!(
+            err.to_string().contains("http://") && err.to_string().contains("stdio"),
+            "error explains the remote-only rule: {err}"
+        );
+        // Both http and https are accepted.
+        for url in [
+            "http://svc.local:8080/mcp",
+            "https://api.example.com/mcp/brave",
+        ] {
+            let json = format!(
+                r#"{{"knowledge_tools":{{"mcp_servers":[{{"name":"s","url":"{url}"}}]}}}}"#
+            );
+            serde_json::from_str::<FileConfig>(&json)
+                .unwrap_or_else(|e| panic!("{url} should parse: {e}"));
+        }
     }
 }

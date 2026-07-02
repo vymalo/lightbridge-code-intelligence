@@ -97,6 +97,26 @@ invented — no SSRF primitive. Egress + any provider credentials stay in the tr
 ([ADR-0002](0002-rust-control-plane-trust-boundary.md)); the control plane itself holds **no provider
 secrets** — the concrete mechanism (below) routes to MCP servers that already hold their own.
 
+### Provisioning model: declare servers, then select tools
+
+Two config layers, in order — this is the operator's mental model, and the "where do we provision"
+answer:
+
+1. **Declare the servers** in `knowledge_tools.mcp_servers` (control-plane file config): each is a
+   `{name, url}` pair. This is where brave/context7 are "provisioned" — as **config, not code** (they
+   are named nowhere in the Rust binary; the v2 rework removed all per-provider hardcoding). Adding or
+   removing a server is a config change.
+2. **Select the tools** per tier in `review.<tier>.tools` (the runner's allowlist): each entry is a
+   built-in name or an `mcp__`-anchored regex over the discovered `mcp__<server>__<tool>` names.
+
+**Remote-transport-only, by design.** Every declared server is an already-running **remote HTTP** MCP
+endpoint, reached over streamable-HTTP by URL. LCI **never spawns a local stdio MCP subprocess** — that
+path was removed in [ADR-0026](0026-native-review-agent.md) and stays gone; "local MCP" is not a
+supported transport. This is enforced, not just conventional: `mcp_servers[].url` is validated to be
+`http(s)://` at config load, so a `stdio:`/bare-command declaration fails fast. ("Remote" here is a
+transport statement — an in-cluster `*.svc.cluster.local` HTTP URL is still remote-transport; it is not
+a claim about the network path, which is described next.)
+
 ### Concrete mechanism (implementation, ticket #255)
 
 The control plane acts as an MCP client against **already-deployed, in-cluster** MCP servers — today
