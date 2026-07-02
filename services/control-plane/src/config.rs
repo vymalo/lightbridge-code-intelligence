@@ -51,12 +51,20 @@ pub struct ReviewSection {
     pub label_findings: Option<String>,
     /// Label added when the review has ≥1 `error`-severity finding (e.g. `bug`).
     pub label_error: Option<String>,
+    /// Skip the automatic fast-tier review when the PR author is a bot (RFC-0003). The `@mention`
+    /// deep-review path is unaffected. Defaults to enabled when unset.
+    pub skip_bot_authored_prs: Option<bool>,
 }
 
 impl ReviewSection {
     /// Reactions are on unless explicitly disabled.
     pub fn reactions_enabled(&self) -> bool {
         self.reactions.unwrap_or(true)
+    }
+
+    /// Bot-authored PRs skip the automatic fast-tier review unless explicitly disabled (RFC-0003).
+    pub fn skip_bot_authored_prs(&self) -> bool {
+        self.skip_bot_authored_prs.unwrap_or(true)
     }
 }
 

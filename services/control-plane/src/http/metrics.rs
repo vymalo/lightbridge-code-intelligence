@@ -60,6 +60,12 @@ pub fn task_created() {
     counter!("lci_tasks_created_total").increment(1);
 }
 
+/// An `opened` PR whose automatic fast-tier review was skipped because the author is a bot
+/// (RFC-0003, `review.skip_bot_authored_prs`). Distinct from the approval-gate skip.
+pub fn review_skipped_bot_author() {
+    counter!("lci_review_skipped_bot_author_total").increment(1);
+}
+
 /// A dispatch attempt outcome: `launched` or `failed`. Callers pass string literals so this is
 /// zero-allocation.
 pub fn dispatch_outcome(outcome: &'static str) {
