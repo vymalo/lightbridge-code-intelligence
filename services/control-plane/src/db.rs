@@ -947,6 +947,10 @@ pub struct NewTask {
     /// turn, no retrieval) or `"deep"` (`@mention` — full retrieval, multi-turn). The runner reads it
     /// from the task context. Index tasks don't set it (the column defaults to `deep`, ignored).
     pub tier: String,
+    /// GitHub id of the `@mention` comment that triggered this task (ADR-0068), so the lifecycle
+    /// reactions target the triggering comment. `None` for the automatic `pull_request opened` review
+    /// (no trigger comment → the reactions land on the PR body) and for index tasks.
+    pub trigger_comment_id: Option<i64>,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -1034,8 +1038,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, tier, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, {INITIAL_TASK_STATUS_SQL}) \
+         target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -1051,6 +1055,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.head_sha)
     .bind(task.run_epoch)
     .bind(&task.tier)
+    .bind(task.trigger_comment_id)
     .fetch_optional(pool)
     .await?;
 
@@ -1083,8 +1088,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
             "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-             target_id, command_text, base_sha, head_sha, tier, run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+             target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -1101,6 +1106,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(&task.base_sha)
         .bind(&task.head_sha)
         .bind(&task.tier)
+        .bind(task.trigger_comment_id)
         .fetch_one(pool)
         .await;
         match result {
@@ -1722,6 +1728,9 @@ pub struct TaskContextRow {
     pub tier: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    /// The `@mention` comment that triggered this task (ADR-0068), or `None` for the automatic
+    /// `pull_request opened` review. When `Some`, the lifecycle reactions target this comment.
+    pub trigger_comment_id: Option<i64>,
 }
 
 /// Load a task's execution context, or `None` if no such task exists. INNER JOIN on `repositories`:
@@ -1732,7 +1741,8 @@ pub async fn get_task_context(
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
-                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha \
+                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha, \
+                t.trigger_comment_id \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )
@@ -2029,6 +2039,7 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0,
             tier: "fast".to_string(),
+            trigger_comment_id: None,
         }
     }
 
@@ -2224,6 +2235,66 @@ mod tests {
         );
     }
 
+    /// ADR-0068: the verdict path. A clean review enqueues a 👍 reaction targeting the @mention comment
+    /// (a `comment_id` in the payload) and — crucially — **no** `review` intent, so the reconciler posts
+    /// nothing but the reaction. A review with findings enqueues 👎 on the PR body (no `comment_id`).
+    #[sqlx::test]
+    async fn verdict_reaction_targets_trigger_and_clean_pass_enqueues_no_review(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let clean = create_task(&pool, &pr_task(repo_id, "clean"))
+            .await
+            .unwrap()
+            .expect("clean task");
+        let dirty = create_task(&pool, &pr_task(repo_id, "dirty"))
+            .await
+            .unwrap()
+            .expect("dirty task");
+
+        // Clean pass: 👍 on the @mention comment, no review intent.
+        let t_clean = crate::outbox::Target {
+            task_id: Some(clean),
+            installation_id: 99,
+            owner: "o",
+            repo: "r",
+        };
+        crate::outbox::enqueue_reaction(&pool, &t_clean, 7, "+1", Some(555))
+            .await
+            .unwrap();
+
+        // Findings: 👎 on the PR body (no comment_id).
+        let t_dirty = crate::outbox::Target {
+            task_id: Some(dirty),
+            installation_id: 99,
+            owner: "o",
+            repo: "r",
+        };
+        crate::outbox::enqueue_reaction(&pool, &t_dirty, 8, "-1", None)
+            .await
+            .unwrap();
+
+        let rows = claim_outbox_batch(&pool, 10).await.unwrap();
+        // Only the two reaction intents exist — the clean pass enqueued NO review.
+        assert_eq!(rows.len(), 2, "two reactions, and NO review intent");
+        assert!(
+            rows.iter().all(|r| r.kind == "reaction"),
+            "the clean pass posts a reaction only — never a review"
+        );
+
+        let clean_row = rows.iter().find(|r| r.task_id == Some(clean)).unwrap();
+        assert_eq!(clean_row.payload["content"], "+1", "clean → 👍");
+        assert_eq!(
+            clean_row.payload["comment_id"], 555,
+            "clean 👍 targets the @mention comment (ADR-0068)"
+        );
+
+        let dirty_row = rows.iter().find(|r| r.task_id == Some(dirty)).unwrap();
+        assert_eq!(dirty_row.payload["content"], "-1", "findings → 👎");
+        assert!(
+            dirty_row.payload.get("comment_id").is_none(),
+            "an auto review's 👎 targets the PR body, not a comment"
+        );
+    }
+
     /// #219 review: the failure-notice gate must treat a still-in-flight review intent as "responding",
     /// so a transiently-backing-off review doesn't let a misleading apology race ahead of it — but a
     /// dead-lettered (`failed`) review must NOT suppress the notice (then the review truly won't land).
@@ -2281,6 +2352,7 @@ mod tests {
             head_sha: None,
             run_epoch: 0,
             tier: "deep".to_string(),
+            trigger_comment_id: None,
         };
         let issue_id = create_task(&pool, &issue)
             .await
@@ -2349,6 +2421,7 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
             tier: "deep".to_string(),
+            trigger_comment_id: None,
         };
 
         let first = create_explicit_task(&pool, &mention("h1")).await.unwrap();
@@ -2540,6 +2613,7 @@ mod tests {
                     head_sha: None,
                     run_epoch: 0,
                     tier: "deep".to_string(),
+                    trigger_comment_id: None,
                 },
             )
             .await
@@ -3117,6 +3191,7 @@ mod tests {
                 head_sha: Some("head2".to_string()),
                 run_epoch: 0,
                 tier: "deep".to_string(),
+                trigger_comment_id: Some(918_273),
             },
         )
         .await
@@ -3128,6 +3203,13 @@ mod tests {
         assert_eq!(
             deep_ctx.tier, "deep",
             "an @mention review is the DEEP tier (ADR-0062)"
+        );
+        // ADR-0068: the trigger comment id round-trips through create → get_task_context, so the
+        // lifecycle reactions can target the @mention comment.
+        assert_eq!(
+            deep_ctx.trigger_comment_id,
+            Some(918_273),
+            "the @mention trigger comment id is persisted and loaded (ADR-0068)"
         );
 
         assert!(
