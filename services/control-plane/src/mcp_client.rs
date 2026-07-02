@@ -31,7 +31,10 @@ pub struct McpTool {
 }
 
 /// Connect to a streamable-HTTP MCP server, bounded by `timeout`.
-async fn connect(base_url: &str, timeout: Duration) -> anyhow::Result<RunningService<RoleClient, ClientInfo>> {
+async fn connect(
+    base_url: &str,
+    timeout: Duration,
+) -> anyhow::Result<RunningService<RoleClient, ClientInfo>> {
     let transport = StreamableHttpClientTransport::from_uri(base_url.to_string());
     let client_info = ClientInfo::new(
         ClientCapabilities::default(),

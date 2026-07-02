@@ -49,11 +49,30 @@ pub struct KnowledgeToolsSection {
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Short, unique identifier, e.g. `brave-search`, `context7`. Must not contain `__` (would break
-    /// the `mcp__<name>__<tool>` prefix's unambiguous split).
+    /// the `mcp__<name>__<tool>` prefix's unambiguous split) — enforced at deserialize, so a
+    /// misconfigured name fails config load loud rather than silently misrouting calls at runtime.
+    #[serde(deserialize_with = "deserialize_mcp_server_name")]
     pub name: String,
     /// Streamable-HTTP MCP endpoint, e.g.
     /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`.
     pub url: String,
+}
+
+/// Reject a server `name` containing `__`: `parse_knowledge_tool_name`
+/// (`services/control-plane/src/http/internal.rs`) splits `mcp__<name>__<tool>` on the FIRST `__`
+/// after the prefix, so a name with its own `__` would silently misroute every call to that server.
+fn deserialize_mcp_server_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    if name.contains("__") {
+        return Err(serde::de::Error::custom(format!(
+            "mcp server name {name:?} must not contain \"__\" — it would break the \
+             mcp__<name>__<tool> prefix's unambiguous split"
+        )));
+    }
+    Ok(name)
 }
 
 /// Embedding-store safety. The `code_chunks.embedding` column is a fixed-width `vector(N)`; changing
@@ -175,4 +194,28 @@ pub fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
         return Ok(None);
     }
     lightbridge_config::load::<FileConfig>(path).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_server_name_with_double_underscore_fails_at_deserialize() {
+        let json =
+            r#"{"knowledge_tools":{"mcp_servers":[{"name":"context-7__eu","url":"http://x"}]}}"#;
+        let err = serde_json::from_str::<FileConfig>(json)
+            .expect_err("a `__`-containing server name must fail parsing");
+        assert!(
+            err.to_string().contains("__"),
+            "error names the problem: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_name_without_double_underscore_parses() {
+        let json = r#"{"knowledge_tools":{"mcp_servers":[{"name":"context7","url":"http://x"}]}}"#;
+        let config: FileConfig = serde_json::from_str(json).expect("valid name parses");
+        assert_eq!(config.knowledge_tools.mcp_servers[0].name, "context7");
+    }
 }

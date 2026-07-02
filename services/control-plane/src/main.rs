@@ -89,8 +89,9 @@ pub struct AppState {
     /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
     /// (else defaults). Held here so the webhook + internal handlers can react/label.
     pub review: Arc<config::ReviewSection>,
-    /// Deep-tier external-knowledge MCP endpoints (ADR-0066): `web_search` / `context7_lookup`.
-    /// Each URL is independently optional — unset disables that tool's internal route (503).
+    /// Configured external-knowledge MCP servers (ADR-0066), dynamically discovered + called as the
+    /// `mcp_tools` mediated tool. Empty by default — no servers means no tools discovered, a safe
+    /// degrade. Available to any tier; gated purely by the runner's per-tier `review.tools` allowlist.
     pub knowledge_tools: Arc<config::KnowledgeToolsSection>,
     /// The GitHub App's handle (e.g. `lightbridge-assistant`), from `GITHUB_APP_HANDLE`. A PR comment
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR

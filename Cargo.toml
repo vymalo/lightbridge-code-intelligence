@@ -55,9 +55,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Neo4j (Bolt) structural graph; the control plane owns the write (trust boundary, ADR-0002/0019).
 neo4rs = "0.8"
-# MCP client (ADR-0066): calls the already-deployed, in-cluster brave-search/context7 MCP servers
-# as the deep tier's external-knowledge tools. `reqwest` feature pulls rustls (matches the workspace
-# TLS policy above), not native-tls.
+# MCP client (ADR-0066): calls whatever in-cluster MCP servers are configured
+# (knowledge_tools.mcp_servers, e.g. brave-search/context7) as the review agent's dynamically
+# discovered external-knowledge tools. `reqwest` feature pulls rustls (matches the workspace TLS
+# policy above), not native-tls.
 rmcp = { version = "2", default-features = false, features = [
     "client",
     "reqwest",

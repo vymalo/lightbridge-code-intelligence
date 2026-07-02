@@ -630,10 +630,6 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
-/// Model-facing refusal for `web_search`/`context7_lookup` on a fast-tier run (ADR-0066): the
-/// per-tier `review.tools` allowlist already keeps these off the offered set, so this only fires on
-/// a hallucinated call — but it must still fire, not silently execute (belt to the allowlist's
-/// suspenders; the control plane re-checks the same thing server-side, ADR-0002).
 /// Wrap an external-knowledge result as explicitly untrusted data (ADR-0066), at the point the model
 /// actually reads it — not just in the tool's upfront description, which may be many tokens back by
 /// the time the result is consumed.
