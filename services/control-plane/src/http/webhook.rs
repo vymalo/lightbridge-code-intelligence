@@ -180,6 +180,20 @@ async fn handle_pull_request(
                 return;
             }
             let pr = &payload["pull_request"];
+            // RFC-0003: skip the automatic fast-tier review for bot-authored PRs (Dependabot, Renovate,
+            // another GitHub App, or ourselves) — mechanical diffs burn LLM budget on low-signal
+            // comments and risk bot-on-bot feedback loops. The `@mention` deep-review path is
+            // untouched: a human can still ask for a full review on the same PR.
+            if should_skip_bot_review(state.review.skip_bot_authored_prs(), pr) {
+                tracing::info!(
+                    delivery_id,
+                    pr = pr_number,
+                    repository_id,
+                    "PR author is a bot; skipping automatic fast-tier review"
+                );
+                crate::http::metrics::review_skipped_bot_author();
+                return;
+            }
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -498,6 +512,28 @@ async fn approved_or_skip(
     }
 }
 
+/// Detects a bot-authored PR (RFC-0003) from the `opened` payload's `pull_request.user` object: the
+/// GitHub API's own `type == "Bot"` field, with a `[bot]` login-suffix backstop for the cases where
+/// `type` is absent or unexpected. No extra GitHub API call — both fields already ride the `opened`
+/// payload. Absent/garbled signals **fail open** (treated as human) — never silently drop a real PR's
+/// automatic review.
+fn pr_author_is_bot(pull_request: &serde_json::Value) -> bool {
+    let user = &pull_request["user"];
+    if user["type"].as_str() == Some("Bot") {
+        return true;
+    }
+    user["login"]
+        .as_str()
+        .is_some_and(|login| login.ends_with("[bot]"))
+}
+
+/// The gate decision (RFC-0003): skip the automatic fast-tier review iff the knob is enabled AND the
+/// PR author is a bot. Split from `pr_author_is_bot` so the config interaction is unit-testable on
+/// its own.
+fn should_skip_bot_review(skip_bot_authored_prs: bool, pull_request: &serde_json::Value) -> bool {
+    skip_bot_authored_prs && pr_author_is_bot(pull_request)
+}
+
 /// `installation` events: `created` (the App was installed on an account) registers the selected
 /// repos as **pending** approval; `deleted` (uninstalled) disables them. Repos default to pending so
 /// nothing runs until an admin approves (Epic #75). The installation payload's repo objects carry no
@@ -761,5 +797,49 @@ mod tests {
     #[test]
     fn rejects_a_tampered_signature() {
         assert!(!verify_signature(b"secret", b"payload", "sha256=deadbeef"));
+    }
+
+    #[test]
+    fn pr_author_is_bot_detects_type_bot() {
+        let pr = serde_json::json!({ "user": { "login": "dependabot[bot]", "type": "Bot" } });
+        assert!(pr_author_is_bot(&pr));
+    }
+
+    #[test]
+    fn pr_author_is_bot_backstops_on_login_suffix() {
+        // `type` absent/unexpected but the login still carries the `[bot]` suffix.
+        let pr = serde_json::json!({ "user": { "login": "renovate[bot]", "type": "User" } });
+        assert!(pr_author_is_bot(&pr));
+        let pr = serde_json::json!({ "user": { "login": "some-app[bot]" } });
+        assert!(pr_author_is_bot(&pr));
+    }
+
+    #[test]
+    fn pr_author_is_bot_treats_human_as_not_bot() {
+        let pr = serde_json::json!({ "user": { "login": "octocat", "type": "User" } });
+        assert!(!pr_author_is_bot(&pr));
+    }
+
+    #[test]
+    fn pr_author_is_bot_fails_open_on_garbled_payload() {
+        // No `type`, no `[bot]` login, or no `user` at all — never silently drop a real PR.
+        assert!(!pr_author_is_bot(&serde_json::json!({})));
+        assert!(!pr_author_is_bot(
+            &serde_json::json!({ "user": { "login": "octocat" } })
+        ));
+        assert!(!pr_author_is_bot(&serde_json::json!({ "user": {} })));
+    }
+
+    #[test]
+    fn should_skip_bot_review_only_when_enabled_and_bot() {
+        let bot_pr = serde_json::json!({ "user": { "login": "dependabot[bot]", "type": "Bot" } });
+        let human_pr = serde_json::json!({ "user": { "login": "octocat", "type": "User" } });
+
+        assert!(should_skip_bot_review(true, &bot_pr));
+        // Knob disabled → auto-review proceeds exactly as today, even for a bot author.
+        assert!(!should_skip_bot_review(false, &bot_pr));
+        // Human author is never skipped, knob on or off.
+        assert!(!should_skip_bot_review(true, &human_pr));
+        assert!(!should_skip_bot_review(false, &human_pr));
     }
 }
