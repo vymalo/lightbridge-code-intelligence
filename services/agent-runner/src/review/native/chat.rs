@@ -23,7 +23,10 @@ use crate::ratelimit::{self, RateLimitSnapshot};
 /// assistant turns we echo back) and for the assistant reply we parse out of a response — hence the
 /// optional fields: a `tool` message carries `tool_call_id` + `content`; an assistant turn that calls
 /// tools carries `tool_calls` and often no `content`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Eq` is deliberately *not* derived: [`ToolCall::extra_content`] holds an opaque
+/// `serde_json::Value` (which is only `PartialEq`) so a provider's round-trip blob can ride along.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,12 +71,23 @@ impl ChatMessage {
 
 /// A tool call the model wants the loop to execute. `arguments` is a JSON-encoded **string** (per the
 /// OpenAI spec), not an object — the dispatcher parses it against the tool's parameter schema.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type", default = "function_kind")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Provider-specific state attached to the call that MUST be echoed back **verbatim** on the next
+    /// turn. Gemini 3 puts its `thought_signature` here as `{"google":{"thought_signature":"…"}}`: the
+    /// model emits it on a `tool_calls` turn and then **rejects the follow-up request with a 400** if it
+    /// is missing ("Function call is missing a thought_signature in functionCall parts"). We never
+    /// inspect it — it is an opaque round-trip blob, preserved on parse and re-serialized on the
+    /// echo-back — so any OpenAI-compatible provider that hangs required state off `extra_content` keeps
+    /// working without a client change. `None` (and omitted from the wire) for providers that don't use
+    /// it, and for the non-first calls of a parallel batch (Gemini only signs the first). See
+    /// <https://ai.google.dev/gemini-api/docs/thought-signatures>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -304,6 +318,11 @@ struct StreamToolCall {
     id: Option<String>,
     #[serde(default)]
     function: Option<StreamFn>,
+    /// Provider round-trip blob (Gemini's `thought_signature` envelope). Streamed on the tool-call
+    /// delta — captured verbatim so it survives into the reassembled [`ToolCall::extra_content`] and is
+    /// echoed back on the next turn. Arrives whole (not split like `arguments`), so last-writer-wins.
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +339,8 @@ struct ToolCallAcc {
     id: String,
     name: String,
     arguments: String,
+    /// Provider round-trip blob (Gemini `thought_signature`), captured verbatim from the delta.
+    extra_content: Option<serde_json::Value>,
 }
 
 /// Retry/backoff policy for one chat turn (ADR-0039). Retries fire **only** on transient failures
@@ -771,6 +792,9 @@ impl ChatClient {
                         if let Some(id) = tc.id {
                             acc.id = id;
                         }
+                        if let Some(ec) = tc.extra_content {
+                            acc.extra_content = Some(ec);
+                        }
                         if let Some(f) = tc.function {
                             if let Some(n) = f.name {
                                 acc.name.push_str(&n);
@@ -803,6 +827,7 @@ impl ChatClient {
                     name: a.name,
                     arguments: a.arguments,
                 },
+                extra_content: a.extra_content,
             })
             .collect();
 
@@ -1552,11 +1577,123 @@ mod tests {
                     name: "submit_findings".to_string(),
                     arguments: "{}".to_string(),
                 },
+                extra_content: None,
             }],
             tool_call_id: None,
         };
         let round: ChatMessage =
             serde_json::from_value(serde_json::to_value(&assistant).unwrap()).unwrap();
         assert_eq!(round, assistant);
+    }
+
+    // Gemini 3 attaches an opaque `thought_signature` to each tool call under
+    // `extra_content.google.thought_signature`, then **400s the *next* request** if it isn't echoed
+    // back verbatim ("Function call is missing a thought_signature in functionCall parts" — RunID
+    // 0a210c73). The client must parse the blob off the response tool call and re-serialize it
+    // unchanged when that assistant turn is sent again. Verifies both halves.
+    #[tokio::test]
+    async fn tool_call_extra_content_is_captured_and_echoed_back() {
+        let server = MockServer::start().await;
+        let signature = serde_json::json!({ "google": { "thought_signature": "abc123==" } });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{}" },
+                            "extra_content": { "google": { "thought_signature": "abc123==" } }
+                        }]
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "gemini-3-pro");
+        let out = client
+            .complete(
+                &[ChatMessage::user("hi")],
+                &[search_tool()],
+                ChatParams::default(),
+            )
+            .await
+            .expect("complete");
+
+        // Parsed off the response verbatim.
+        assert_eq!(out.message.tool_calls[0].extra_content.as_ref(), Some(&signature));
+
+        // And re-serialized verbatim when the assistant turn is echoed back into the next request —
+        // the exact round-trip Gemini requires (missing → 400).
+        let echoed = serde_json::to_value(&out.message).unwrap();
+        assert_eq!(echoed["tool_calls"][0]["extra_content"], signature);
+    }
+
+    // A tool call with no provider blob (any non-Gemini provider, or the non-first call of a Gemini
+    // parallel batch, which Gemini leaves unsigned) must NOT emit `extra_content: null` — the field is
+    // simply absent from the wire, so it can't inject a spurious `null` a strict gateway might reject.
+    #[test]
+    fn tool_call_without_extra_content_omits_the_field() {
+        let call = ToolCall {
+            id: "c".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+            extra_content: None,
+        };
+        let v = serde_json::to_value(&call).unwrap();
+        assert!(
+            v.get("extra_content").is_none(),
+            "None must be omitted, not serialized as null"
+        );
+    }
+
+    // Streaming: Gemini streams the `thought_signature` envelope on the tool-call delta. It must be
+    // captured into the reassembled `ToolCall::extra_content` (alongside the fragmented arguments) so
+    // it survives the echo-back, exactly as the non-stream path does.
+    #[tokio::test]
+    async fn stream_captures_tool_call_extra_content() {
+        let server = MockServer::start().await;
+        let events = [
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig=="}}}]}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        let mut sse = String::new();
+        for e in &events {
+            sse.push_str(&format!("data: {e}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            ChatClient::new(&format!("{}/v1", server.uri()), "key", "gemini-3-pro").with_stream(true);
+        let out = client
+            .complete(
+                &[ChatMessage::user("hi")],
+                &[search_tool()],
+                ChatParams::default(),
+            )
+            .await
+            .expect("stream completes");
+
+        assert_eq!(
+            out.message.tool_calls[0].extra_content,
+            Some(serde_json::json!({ "google": { "thought_signature": "sig==" } }))
+        );
     }
 }

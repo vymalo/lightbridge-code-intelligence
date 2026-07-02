@@ -644,6 +644,7 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             },
+            extra_content: None,
         }
     }
 
