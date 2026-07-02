@@ -1,16 +1,17 @@
-//! A thin MCP client for calling the already-deployed, in-cluster brave-search + context7 MCP
-//! servers (ADR-0066): the deep review tier's `web_search`/`context7_lookup` mediated tools. Those
-//! servers hold their own upstream provider credentials (Brave/Context7 API keys); this module only
-//! needs their in-cluster Service URL, reached over plain HTTP within the cluster (no OAuth).
+//! A thin MCP client for calling already-deployed, in-cluster MCP servers (ADR-0066), configured
+//! via [`crate::config::McpServerConfig`] — not hardcoded to any specific provider. Those servers
+//! hold their own upstream provider credentials; this module only needs their in-cluster Service
+//! URL, reached over plain HTTP within the cluster (no OAuth).
 //!
-//! One connection per call — these are occasional, on-demand deep-review lookups, not a hot path,
+//! One connection per call — these are occasional, on-demand review-time lookups, not a hot path,
 //! so there is no session pool to manage or expire.
 
 use std::time::Duration;
 
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
+use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::ServiceExt;
+use rmcp::{RoleClient, ServiceExt};
 
 /// Hard ceiling on the text handed back to the agent: an upstream server is untrusted input
 /// (ADR-0066) and could return an adversarially huge payload — cap it the same way `read_file` caps
@@ -21,6 +22,53 @@ pub const RESULT_CAP: usize = 32 * 1024;
 /// should always be fast, so it gets its own short, fixed budget rather than reusing the call's.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A tool a discovered MCP server exposes, as returned to the agent-runner for it to fold into the
+/// live tool schema — no compile-time knowledge of any specific server's tools needed.
+pub struct McpTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Connect to a streamable-HTTP MCP server, bounded by `timeout`.
+async fn connect(base_url: &str, timeout: Duration) -> anyhow::Result<RunningService<RoleClient, ClientInfo>> {
+    let transport = StreamableHttpClientTransport::from_uri(base_url.to_string());
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new("lightbridge-control-plane", env!("CARGO_PKG_VERSION")),
+    );
+    tokio::time::timeout(timeout, client_info.serve(transport))
+        .await
+        .map_err(|_| anyhow::anyhow!("connecting to the MCP server timed out"))?
+        .map_err(|error| anyhow::anyhow!("connecting to the MCP server failed: {error}"))
+}
+
+/// Bounded shutdown (see the comment at the call site in [`call_tool`] for why `close_with_timeout`
+/// rather than `cancel`, which has no timeout of its own).
+async fn disconnect(mut client: RunningService<RoleClient, ClientInfo>) {
+    let _ = client.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+}
+
+/// List the tools a remote MCP server exposes.
+pub async fn list_tools(base_url: &str, timeout: Duration) -> anyhow::Result<Vec<McpTool>> {
+    let client = connect(base_url, timeout).await?;
+    let result = tokio::time::timeout(timeout, client.list_tools(Default::default()))
+        .await
+        .map_err(|_| anyhow::anyhow!("listing tools timed out"));
+    disconnect(client).await;
+    let result = result?.map_err(|error| anyhow::anyhow!("listing tools failed: {error}"))?;
+    Ok(result
+        .tools
+        .into_iter()
+        .map(|t| McpTool {
+            name: t.name.to_string(),
+            description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+            input_schema: serde_json::to_value(t.input_schema.as_ref())
+                .unwrap_or_else(|_| serde_json::json!({"type": "object"})),
+        })
+        .collect())
+}
+
 /// Call one tool on a remote streamable-HTTP MCP server and return its concatenated text content,
 /// capped to [`RESULT_CAP`] bytes (valid-UTF-8 truncation, never mid-codepoint).
 pub async fn call_tool(
@@ -29,17 +77,11 @@ pub async fn call_tool(
     arguments: serde_json::Value,
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    let transport = StreamableHttpClientTransport::from_uri(base_url.to_string());
-    let client_info = ClientInfo::new(
-        ClientCapabilities::default(),
-        Implementation::new("lightbridge-control-plane", env!("CARGO_PKG_VERSION")),
-    );
-    let mut client = tokio::time::timeout(timeout, client_info.serve(transport))
-        .await
-        .map_err(|_| anyhow::anyhow!("connecting to {tool_name}'s MCP server timed out"))??;
+    let client = connect(base_url, timeout).await?;
 
     let arguments = arguments.as_object().cloned().unwrap_or_default();
-    let call = client.call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments));
+    let call = client
+        .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments));
     let result = tokio::time::timeout(timeout, call)
         .await
         .map_err(|_| anyhow::anyhow!("{tool_name} call timed out"));
@@ -47,12 +89,19 @@ pub async fn call_tool(
     // stalled-but-connected upstream (accepts the TCP connection, never completes/responds) can hang
     // this past `timeout` for an unbounded time (up to the OS TCP timeout). `close_with_timeout` caps
     // it explicitly; best-effort either way, so a shutdown timeout doesn't mask the actual result.
-    let _ = client.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+    disconnect(client).await;
     let result = result?.map_err(|error| anyhow::anyhow!("{tool_name} call failed: {error}"))?;
 
     if result.is_error == Some(true) {
         let text = collect_text(&result.content);
-        anyhow::bail!("{tool_name} returned an error: {}", if text.is_empty() { "(no detail)".to_string() } else { text });
+        anyhow::bail!(
+            "{tool_name} returned an error: {}",
+            if text.is_empty() {
+                "(no detail)".to_string()
+            } else {
+                text
+            }
+        );
     }
 
     let text = collect_text(&result.content);

@@ -232,19 +232,19 @@ pub enum ReviewTool {
     ReportProgress,
     #[serde(rename = "abort")]
     Abort,
-    /// Deep-tier external knowledge (ADR-0066): a web search, mediated by the control plane
-    /// (in-cluster brave-search MCP). Query in, never a URL.
-    #[serde(rename = "web_search")]
-    WebSearch,
-    /// Deep-tier external knowledge (ADR-0066): curated library docs, mediated by the control plane
-    /// (in-cluster context7 MCP). Library name in, never a raw library id or URL.
-    #[serde(rename = "context7_lookup")]
-    Context7Lookup,
+    /// External-knowledge MCP tools (ADR-0066), mediated by the control plane: whatever the
+    /// configured MCP servers (e.g. brave-search, context7) currently expose, discovered
+    /// dynamically at run start — never a hardcoded per-provider tool. A single sentinel rather
+    /// than one variant per downstream tool, since the actual set isn't known at compile time.
+    /// Available to any tier; unlike the rest of this enum, it's not a single dispatchable tool but
+    /// a whole discoverable set gated the same way as everything else — via this allowlist.
+    #[serde(rename = "mcp_tools")]
+    McpTools,
 }
 
 impl ReviewTool {
     /// Every variant, in the canonical tool order — the operator-facing list of valid `tools` values.
-    pub const ALL: [ReviewTool; 12] = [
+    pub const ALL: [ReviewTool; 11] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
@@ -255,8 +255,7 @@ impl ReviewTool {
         ReviewTool::Finish,
         ReviewTool::ReportProgress,
         ReviewTool::Abort,
-        ReviewTool::WebSearch,
-        ReviewTool::Context7Lookup,
+        ReviewTool::McpTools,
     ];
 
     /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
@@ -272,8 +271,7 @@ impl ReviewTool {
             ReviewTool::Finish => "finish",
             ReviewTool::ReportProgress => "report_progress",
             ReviewTool::Abort => "abort",
-            ReviewTool::WebSearch => "web_search",
-            ReviewTool::Context7Lookup => "context7_lookup",
+            ReviewTool::McpTools => "mcp_tools",
         }
     }
 }

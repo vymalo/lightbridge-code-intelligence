@@ -189,9 +189,17 @@ pub struct SymbolHit {
     pub start_line: i64,
 }
 
-/// Result of a deep-tier external-knowledge tool call (ADR-0066): `web_search` / `context7_lookup`.
-/// Plain text, already size-capped control-plane-side — untrusted content, framed as such before
-/// it reaches the model (see `review::native::tools`).
+/// One tool a discovered MCP server exposes (ADR-0066), as the control plane reports it — already
+/// prefixed `mcp__<server>__<tool>` and ready to fold into the live tool schema.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscoveredTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Result of a knowledge-tool call (ADR-0066). Plain text, already size-capped control-plane-side —
+/// untrusted content, framed as such before it reaches the model (see `review::native::tools`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KnowledgeToolResult {
     pub text: String,
@@ -546,52 +554,52 @@ impl ControlPlaneClient {
         Ok(hits)
     }
 
-    /// `POST /internal/tasks/{id}/knowledge/web-search` — deep-tier external knowledge (ADR-0066),
-    /// mediated web search. The control plane proxies this to the in-cluster brave-search MCP server
-    /// and returns plain text; a fast-tier task id is rejected server-side (403).
-    pub async fn web_search(&self, task_id: Uuid, query: &str) -> anyhow::Result<String> {
+    /// `GET /internal/tasks/{id}/knowledge/tools` — discover every tool the currently-configured MCP
+    /// servers expose (ADR-0066). Called once at run start (not compiled in — any server the control
+    /// plane is configured with shows up with zero runner code changes). Empty when no servers are
+    /// configured, never an error, so a review still runs normally with no external-knowledge tools.
+    pub async fn list_knowledge_tools(&self, task_id: Uuid) -> anyhow::Result<Vec<DiscoveredTool>> {
         use anyhow::Context;
-        let url = format!("{}/internal/tasks/{task_id}/knowledge/web-search", self.base_url);
-        let body: KnowledgeToolResult = self
+        let url = format!("{}/internal/tasks/{task_id}/knowledge/tools", self.base_url);
+        let tools = self
             .http
-            .post(&url)
+            .get(&url)
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "query": query }))
             .send()
             .await
-            .context("web_search request")?
+            .context("knowledge-tool discovery request")?
             .error_for_status()
-            .context("control plane rejected the web_search call")?
+            .context("control plane rejected knowledge-tool discovery")?
             .json()
             .await
-            .context("parsing web_search result")?;
-        Ok(body.text)
+            .context("parsing discovered knowledge tools")?;
+        Ok(tools)
     }
 
-    /// `POST /internal/tasks/{id}/knowledge/context7` — deep-tier external knowledge (ADR-0066),
-    /// mediated Context7 library-docs lookup. `topic` narrows the docs to a specific question; the
-    /// control plane defaults it when absent.
-    pub async fn context7_lookup(
+    /// `POST /internal/tasks/{id}/knowledge/call` — dispatch a call to a previously-discovered
+    /// knowledge tool (ADR-0066). `tool` is the prefixed name from `list_knowledge_tools`
+    /// (`mcp__<server>__<tool>`); `arguments` is forwarded verbatim.
+    pub async fn call_knowledge_tool(
         &self,
         task_id: Uuid,
-        library: &str,
-        topic: Option<&str>,
+        tool: &str,
+        arguments: serde_json::Value,
     ) -> anyhow::Result<String> {
         use anyhow::Context;
-        let url = format!("{}/internal/tasks/{task_id}/knowledge/context7", self.base_url);
+        let url = format!("{}/internal/tasks/{task_id}/knowledge/call", self.base_url);
         let body: KnowledgeToolResult = self
             .http
             .post(&url)
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "library": library, "topic": topic }))
+            .json(&serde_json::json!({ "tool": tool, "arguments": arguments }))
             .send()
             .await
-            .context("context7_lookup request")?
+            .context("knowledge-tool call request")?
             .error_for_status()
-            .context("control plane rejected the context7_lookup call")?
+            .context("control plane rejected the knowledge-tool call")?
             .json()
             .await
-            .context("parsing context7_lookup result")?;
+            .context("parsing knowledge-tool result")?;
         Ok(body.text)
     }
 

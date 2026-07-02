@@ -265,16 +265,16 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/graph/query",
             post(internal::graph_query),
         )
-        // Deep-tier external-knowledge tools (ADR-0066): mediated `web_search` + `context7_lookup`,
-        // proxying to the already-deployed in-cluster brave-search/context7 MCP servers. Gated
-        // server-side to `deep`-tier tasks inside each handler (not just the runner's allowlist).
+        // External-knowledge MCP tools (ADR-0066): dynamically discover + call whatever's in
+        // `knowledge_tools.mcp_servers` — no per-provider route. Available to any tier; gated purely
+        // by the runner's per-tier `review.tools` allowlist, like every other mediated tool.
         .route(
-            "/internal/tasks/{id}/knowledge/web-search",
-            post(internal::web_search),
+            "/internal/tasks/{id}/knowledge/tools",
+            get(internal::list_knowledge_tools),
         )
         .route(
-            "/internal/tasks/{id}/knowledge/context7",
-            post(internal::context7_lookup),
+            "/internal/tasks/{id}/knowledge/call",
+            post(internal::call_knowledge_tool),
         )
         // The agent run transcript (ADR-0034): the runner submits it at run end.
         .route(

@@ -26,22 +26,34 @@ pub struct FileConfig {
     pub knowledge_tools: KnowledgeToolsSection,
 }
 
-/// Deep-tier external-knowledge tools (ADR-0066): `web_search` (brave-search MCP) and
-/// `context7_lookup` (context7 MCP). Both already-deployed, in-cluster MCP servers
-/// (`converse-mcp` namespace) hold their own upstream provider credentials — the control plane
-/// only needs their in-cluster Service URL, reached over plain in-cluster HTTP (no OAuth, no
-/// secrets held here). Each URL is independently `Option`al: unset disables that one tool's
-/// internal endpoint (503), so a partial rollout (e.g. context7 wired, web_search not yet) degrades
-/// per-tool rather than all-or-nothing.
+/// External-knowledge MCP servers (ADR-0066) the review agent can dynamically discover and call as
+/// the `mcp_tools` mediated tool, on **either** tier — availability is governed purely by the
+/// normal per-tier `review.<tier>.tools` allowlist ([`crate::db`] doesn't gate this; there is no
+/// tier check here or in the internal handlers). Each entry is an already-deployed, in-cluster MCP
+/// server (e.g. `converse-mcp` namespace) that holds its own upstream provider credentials — the
+/// control plane only needs its in-cluster Service URL, reached over plain in-cluster HTTP (no
+/// OAuth, no secrets held here). Empty by default: no servers configured means no tools discovered,
+/// a safe degrade rather than an error. Adding a new server (any MCP server, not just
+/// brave-search/context7) is a config change, not a code change.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KnowledgeToolsSection {
-    /// Streamable-HTTP MCP endpoint for the brave-search server, e.g.
-    /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`. `None` disables `web_search`.
-    pub web_search_mcp_url: Option<String>,
-    /// Streamable-HTTP MCP endpoint for the context7 server, e.g.
-    /// `http://context7.converse-mcp.svc.cluster.local:8080/mcp`. `None` disables `context7_lookup`.
-    pub context7_mcp_url: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// One configured MCP server. Its tools are exposed to the agent prefixed `mcp__<name>__<tool>` so
+/// names can't collide across servers and the control plane can route a call back without a
+/// separate lookup table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Short, unique identifier, e.g. `brave-search`, `context7`. Must not contain `__` (would break
+    /// the `mcp__<name>__<tool>` prefix's unambiguous split).
+    pub name: String,
+    /// Streamable-HTTP MCP endpoint, e.g.
+    /// `http://brave-search.converse-mcp.svc.cluster.local:8080/mcp`.
+    pub url: String,
 }
 
 /// Embedding-store safety. The `code_chunks.embedding` column is a fixed-width `vector(N)`; changing

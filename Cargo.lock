@@ -336,6 +336,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "futures",
  "hex",
  "hmac",
  "jsonwebtoken",

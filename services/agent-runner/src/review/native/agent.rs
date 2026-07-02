@@ -32,7 +32,7 @@ use super::tools::{
     VECTOR_SEMANTIC_SEARCH,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
-use crate::bootstrap::config::ReviewConfig;
+use crate::bootstrap::config::{ReviewConfig, ReviewTool};
 use crate::clone::PrDiff;
 use crate::indexer::embeddings::EmbeddingsClient;
 
@@ -292,7 +292,6 @@ pub async fn run_native_agent(
         embedder,
         task_id,
         checkout_root,
-        fast_tier: review.fast,
     };
     // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
     // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
@@ -308,6 +307,31 @@ pub async fn run_native_agent(
     if let Some(allow) = review.tools.as_ref() {
         let set: HashSet<&str> = allow.iter().map(|t| t.as_str()).collect();
         defs.retain(|t| set.contains(t.function.name.as_str()));
+    }
+    // External-knowledge MCP tools (ADR-0066): discovered dynamically from the control plane, never
+    // hardcoded here — offered on ANY tier whose allowlist includes the `mcp_tools` sentinel, or
+    // whose allowlist is unset (the built-in default = the full surface, same as every other tool).
+    // A discovery failure (no servers configured, one unreachable, network hiccup) degrades to "no
+    // external-knowledge tools this run" — never fails the review.
+    let mcp_tools_allowed = review
+        .tools
+        .as_ref()
+        .is_none_or(|allow| allow.contains(&ReviewTool::McpTools));
+    if mcp_tools_allowed {
+        match tools.client.list_knowledge_tools(task_id).await {
+            Ok(discovered) if !discovered.is_empty() => {
+                tracing::info!(task_id = %task_id, count = discovered.len(), "discovered external-knowledge tools");
+                defs.extend(
+                    discovered
+                        .into_iter()
+                        .map(|t| ToolDef::function(t.name, t.description, t.input_schema)),
+                );
+            }
+            Ok(_) => {} // no servers configured — nothing to add, not an error
+            Err(error) => {
+                tracing::warn!(%error, task_id = %task_id, "knowledge-tool discovery failed; continuing without external-knowledge tools");
+            }
+        }
     }
     // Reduced tool set for the wind-down tail (#137): write/finish/abort only, retrieval/read_file
     // dropped so the model can no longer keep investigating once the budget is nearly spent. Derived
@@ -1052,10 +1076,13 @@ fn normalize_repo_path(path: &str) -> String {
 /// excluded (it posts), and the write/terminal tools (`add_review_comment` / `add_comment` / `finish` /
 /// `abort`) are excluded by design so their ordering and buffer semantics are preserved.
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(
-        name,
-        VECTOR_SEMANTIC_SEARCH | GRAPH_FIND_SYMBOL | GRAPH_GET_CALLERS | READ_FILE
-    )
+    // Discovered external-knowledge tools (ADR-0066) are read-only lookups too — safe to batch
+    // alongside the built-in retrieval tools.
+    name.starts_with(super::tools::MCP_TOOL_PREFIX)
+        || matches!(
+            name,
+            VECTOR_SEMANTIC_SEARCH | GRAPH_FIND_SYMBOL | GRAPH_GET_CALLERS | READ_FILE
+        )
 }
 
 /// The retrieval tools (vector + graph search) — the `max_searches` budget category (ADR-0042).
@@ -1669,6 +1696,7 @@ mod tests {
             GRAPH_FIND_SYMBOL,
             GRAPH_GET_CALLERS,
             READ_FILE,
+            "mcp__brave-search__brave_web_search",
         ] {
             assert!(is_read_only_tool(t), "{t} should be read-only");
         }
@@ -2376,6 +2404,83 @@ mod tests {
             !set.iter().any(|n| n == super::super::tools::ADD_COMMENT),
             "a tool left off the allowlist is not offered: {set:?}"
         );
+    }
+
+    // ADR-0066: discovered external-knowledge tools are dynamically merged into the offered set —
+    // not hardcoded here, and not deep-tier-only (unlike the allowlist test above, this uses the
+    // built-in default surface, `review.tools: None`, same as any tier that hasn't restricted it).
+    #[tokio::test]
+    async fn discovers_and_offers_mcp_tools_dynamically() {
+        let chat = MockServer::start().await;
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let user_text = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RecordingScript {
+                calls: Arc::new(AtomicUsize::new(0)),
+                offered: offered.clone(),
+                user_text: user_text.clone(),
+                response: tool_call_reply("finish", r#"{"summary":"Looked fine."}"#),
+            })
+            .mount(&chat)
+            .await;
+        let emb = MockServer::start().await;
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/tasks/{}/knowledge/tools", Uuid::nil())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "name": "mcp__brave-search__brave_web_search",
+                    "description": "Search the web.",
+                    "input_schema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
+                }
+            ])))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+
+        let review = review_config(format!("{}/v1", chat.uri())); // fast: false, tools: None
+        let cpc = ControlPlaneClient::new(cp.uri(), "tok");
+        let embc = EmbeddingsClient::new(&emb.uri(), "key", "model");
+        let diff = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n fn x() {}\n+// changed\n".to_string(),
+            files: vec!["a.rs".to_string()],
+        };
+        run_native_agent(
+            &review,
+            "review",
+            Some(&diff),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &cpc,
+            &embc,
+            Uuid::nil(),
+            std::path::Path::new("/tmp"),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("run finishes cleanly");
+
+        let offered = offered.lock().unwrap();
+        assert!(
+            offered[0]
+                .iter()
+                .any(|n| n == "mcp__brave-search__brave_web_search"),
+            "discovered tool folded into the offered set: {:?}",
+            offered[0]
+        );
+        // The built-in surface is still there alongside it.
+        assert!(offered[0].iter().any(|n| n == VECTOR_SEMANTIC_SEARCH));
     }
 
     // Two-tier review (ADR-0062): the fast tier removes retrieval from the OFFERED set, but a model
