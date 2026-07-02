@@ -17,6 +17,10 @@ use rmcp::ServiceExt;
 /// the checkout (`services/agent-runner/src/review/native/tools.rs`).
 pub const RESULT_CAP: usize = 32 * 1024;
 
+/// Cap on graceful-shutdown time after a call. Independent of the caller's `timeout` — shutdown
+/// should always be fast, so it gets its own short, fixed budget rather than reusing the call's.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Call one tool on a remote streamable-HTTP MCP server and return its concatenated text content,
 /// capped to [`RESULT_CAP`] bytes (valid-UTF-8 truncation, never mid-codepoint).
 pub async fn call_tool(
@@ -30,7 +34,7 @@ pub async fn call_tool(
         ClientCapabilities::default(),
         Implementation::new("lightbridge-control-plane", env!("CARGO_PKG_VERSION")),
     );
-    let client = tokio::time::timeout(timeout, client_info.serve(transport))
+    let mut client = tokio::time::timeout(timeout, client_info.serve(transport))
         .await
         .map_err(|_| anyhow::anyhow!("connecting to {tool_name}'s MCP server timed out"))??;
 
@@ -39,8 +43,11 @@ pub async fn call_tool(
     let result = tokio::time::timeout(timeout, call)
         .await
         .map_err(|_| anyhow::anyhow!("{tool_name} call timed out"));
-    // Best-effort: don't let a slow/failed shutdown mask the actual result.
-    let _ = client.cancel().await;
+    // Bounded shutdown: `cancel()` awaits the transport's close with NO timeout of its own — a
+    // stalled-but-connected upstream (accepts the TCP connection, never completes/responds) can hang
+    // this past `timeout` for an unbounded time (up to the OS TCP timeout). `close_with_timeout` caps
+    // it explicitly; best-effort either way, so a shutdown timeout doesn't mask the actual result.
+    let _ = client.close_with_timeout(SHUTDOWN_TIMEOUT).await;
     let result = result?.map_err(|error| anyhow::anyhow!("{tool_name} call failed: {error}"))?;
 
     if result.is_error == Some(true) {

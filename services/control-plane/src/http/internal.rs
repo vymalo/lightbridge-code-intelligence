@@ -616,16 +616,28 @@ fn extract_library_id(text: &str) -> Option<&str> {
             continue;
         }
         let rest = &text[i..];
+        // Stop at whitespace/closing punctuation, OR right before a 4th slash — `/org/project/version`
+        // (3 slashes) is the longest valid shape, so a 4th slash means this is a longer path (e.g. an
+        // adjacent file/URL fragment in the surrounding prose), not a library id.
         // NOT `.`: real ids contain dots (e.g. `/vercel/next.js`, `/vinta/awesome-python.com`).
-        let end = rest
-            .char_indices()
-            .skip(1)
-            .find(|(_, c)| c.is_whitespace() || matches!(c, ')' | ']' | ',' | '"' | '\'' | ';'))
-            .map(|(idx, _)| idx)
-            .unwrap_or(rest.len());
+        let mut slashes = 0;
+        let mut end = rest.len();
+        for (idx, c) in rest.char_indices() {
+            if c == '/' {
+                slashes += 1;
+                if slashes > 3 {
+                    end = idx;
+                    break;
+                }
+            } else if idx > 0 && (c.is_whitespace() || matches!(c, ')' | ']' | ',' | '"' | '\'' | ';'))
+            {
+                end = idx;
+                break;
+            }
+        }
         let candidate = &rest[..end];
-        // At least `/org/project` — two slashes, non-trivial length.
-        if candidate.matches('/').count() >= 2 && candidate.len() > 2 {
+        // Exactly `/org/project` or `/org/project/version` — 2 or 3 slashes, non-trivial length.
+        if (2..=3).contains(&candidate.matches('/').count()) && candidate.len() > 2 {
             return Some(candidate);
         }
     }
@@ -679,6 +691,7 @@ pub async fn web_search(
         return (StatusCode::SERVICE_UNAVAILABLE, "web_search is not configured").into_response();
     };
     if req.query.trim().is_empty() {
+        crate::http::metrics::knowledge_tool_call("web_search", "invalid_request");
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
     match crate::mcp_client::call_tool(
@@ -735,6 +748,7 @@ pub async fn context7_lookup(
             .into_response();
     };
     if req.library.trim().is_empty() {
+        crate::http::metrics::knowledge_tool_call("context7_lookup", "invalid_request");
         return (StatusCode::BAD_REQUEST, "empty library").into_response();
     }
     // query-docs needs a question, not just a library name — the topic doubles as one; absent a
@@ -1350,5 +1364,15 @@ mod tests {
         assert_eq!(extract_library_id("no good match found"), None);
         assert_eq!(extract_library_id("/just-one-segment stops here"), None);
         assert_eq!(extract_library_id(""), None);
+    }
+
+    #[test]
+    fn extract_library_id_caps_at_three_segments() {
+        // A 4-segment path is not a valid `/org/project[/version]` id — truncate to the first 3
+        // segments (2 slashes) rather than swallowing the whole longer path.
+        assert_eq!(
+            extract_library_id("/facebook/react/some/extra/path"),
+            Some("/facebook/react/some")
+        );
     }
 }

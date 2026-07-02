@@ -68,8 +68,9 @@ pub fn review_skipped_bot_author() {
 
 /// A deep-tier external-knowledge tool call (ADR-0066): `tool` is `web_search` or
 /// `context7_lookup`; `outcome` is `ok`, `error` (upstream/network failure), `rejected` (fast-tier
-/// task, server-side gate), or `not_configured` (the tool's MCP URL is unset). Both are `&'static
-/// str` (callers pass literals), so this is zero-allocation.
+/// task, server-side gate), `not_configured` (the tool's MCP URL is unset), or `invalid_request`
+/// (empty query/library). Both are `&'static str` (callers pass literals), so this is
+/// zero-allocation.
 pub fn knowledge_tool_call(tool: &'static str, outcome: &'static str) {
     counter!("lci_knowledge_tool_calls_total", "tool" => tool, "outcome" => outcome).increment(1);
 }
