@@ -1625,7 +1625,10 @@ mod tests {
             .expect("complete");
 
         // Parsed off the response verbatim.
-        assert_eq!(out.message.tool_calls[0].extra_content.as_ref(), Some(&signature));
+        assert_eq!(
+            out.message.tool_calls[0].extra_content.as_ref(),
+            Some(&signature)
+        );
 
         // And re-serialized verbatim when the assistant turn is echoed back into the next request —
         // the exact round-trip Gemini requires (missing → 400).
@@ -1680,8 +1683,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            ChatClient::new(&format!("{}/v1", server.uri()), "key", "gemini-3-pro").with_stream(true);
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "gemini-3-pro")
+            .with_stream(true);
         let out = client
             .complete(
                 &[ChatMessage::user("hi")],
@@ -1694,6 +1697,58 @@ mod tests {
         assert_eq!(
             out.message.tool_calls[0].extra_content,
             Some(serde_json::json!({ "google": { "thought_signature": "sig==" } }))
+        );
+    }
+
+    // The signature usually arrives on the *first* tool-call delta (with `id`/`name`), while later
+    // deltas carry only `arguments` fragments and omit `extra_content` entirely. A later delta must not
+    // clobber the captured signature. This also covers a provider that emits an explicit
+    // `"extra_content": null` on a follow-up chunk: `Option<Value>` deserializes JSON `null` to `None`
+    // (serde_json's `deserialize_option` maps `null` → none), so the `if let Some(ec)` guard skips it —
+    // no defensive `is_null()` check needed (gemini-code-assist review on #262). Regression guard.
+    #[tokio::test]
+    async fn stream_extra_content_survives_later_deltas() {
+        let server = MockServer::start().await;
+        let events = [
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"pa"},"extra_content":{"google":{"thought_signature":"sig=="}}}]}}]}),
+            // A follow-up delta: more argument bytes, and an explicit null extra_content.
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"x\"}"},"extra_content":null}]}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        let mut sse = String::new();
+        for e in &events {
+            sse.push_str(&format!("data: {e}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "gemini-3-pro")
+            .with_stream(true);
+        let out = client
+            .complete(
+                &[ChatMessage::user("hi")],
+                &[search_tool()],
+                ChatParams::default(),
+            )
+            .await
+            .expect("stream completes");
+
+        // Arguments reassembled across the two deltas, and the signature from delta 1 is intact.
+        let call = &out.message.tool_calls[0];
+        assert_eq!(call.function.arguments, r#"{"path":"x"}"#);
+        assert_eq!(
+            call.extra_content,
+            Some(serde_json::json!({ "google": { "thought_signature": "sig==" } })),
+            "a later delta (incl. explicit null) must not clobber the captured signature"
         );
     }
 }
