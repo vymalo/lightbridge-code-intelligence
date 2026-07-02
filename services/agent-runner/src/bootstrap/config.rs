@@ -321,9 +321,12 @@ impl<'de> Deserialize<'de> for ReviewToolSelector {
         if let Some(pattern) = s.strip_prefix(crate::review::native::tools::MCP_TOOL_PREFIX) {
             // Anchor to a FULL match and keep the `mcp__` prefix in the compiled regex, so
             // `mcp__brave-search__brave_web_search` matches exactly that discovered name and
-            // `mcp__context7__.*` matches all of context7's — never a partial/substring hit.
+            // `mcp__context7__.*` matches all of context7's — never a partial/substring hit. The
+            // user's remainder is wrapped in a NON-CAPTURING GROUP so a top-level alternation binds
+            // INSIDE the anchors: without it, `mcp__brave__foo|bar` would parse as
+            // `(^mcp__brave__foo)|(bar$)` and match any tool ending in `bar` on ANY server.
             let anchored = format!(
-                "^{}{}$",
+                "^{}(?:{})$",
                 regex::escape(crate::review::native::tools::MCP_TOOL_PREFIX),
                 pattern
             );
@@ -1148,6 +1151,35 @@ mod tests {
         };
         assert!(exact.is_match("mcp__brave-search__brave_web_search"));
         assert!(!exact.is_match("mcp__brave-search__brave_web_search_extra"));
+    }
+
+    // A top-level alternation must bind INSIDE the anchors (the non-capturing-group wrap): without
+    // it, `mcp__brave-search__foo|bar` would parse as `(^mcp__brave-search__foo)|(bar$)` and match
+    // ANY server's tool ending in `bar`, plus the bare string `bar`. With the wrap the alternation
+    // stays contained — it can never leak past the `^mcp__…$` anchors to another server.
+    #[test]
+    fn mcp_tool_selector_alternation_stays_within_anchors() {
+        // Raw (unparenthesized) alternation: `^mcp__(?:brave-search__foo|bar)$` — so the two
+        // alternatives are `mcp__brave-search__foo` and `mcp__bar`, NEVER `…evil…bar` or bare `bar`.
+        let raw: Vec<ReviewToolSelector> =
+            serde_json::from_value(serde_json::json!(["mcp__brave-search__foo|bar"])).unwrap();
+        let ReviewToolSelector::Mcp(p) = &raw[0] else {
+            panic!("expected mcp selector");
+        };
+        assert!(p.is_match("mcp__brave-search__foo"));
+        assert!(!p.is_match("mcp__evil-server__grabbar")); // the bug this wrap fixes
+        assert!(!p.is_match("bar")); // ditto
+
+        // The form an operator actually writes to pick two tools on ONE server — parenthesized —
+        // matches both and still can't escape the server prefix.
+        let grouped: Vec<ReviewToolSelector> =
+            serde_json::from_value(serde_json::json!(["mcp__brave-search__(foo|bar)"])).unwrap();
+        let ReviewToolSelector::Mcp(g) = &grouped[0] else {
+            panic!("expected mcp selector");
+        };
+        assert!(g.is_match("mcp__brave-search__foo"));
+        assert!(g.is_match("mcp__brave-search__bar"));
+        assert!(!g.is_match("mcp__evil-server__grabbar"));
     }
 
     // A malformed regex in an `mcp__` selector fails the config at parse time (fail-closed).
